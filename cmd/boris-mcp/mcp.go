@@ -71,6 +71,7 @@ func errorName(err error) string {
 func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, error) {
 	ctx, cancel := context.WithTimeout(ctx, cfg.SyncTimeout)
 	defer cancel()
+	fmt.Fprintln(a.stderr, "Syncing tools...")
 	client, err := a.newMCPClient(ctx, cfg, cfg.SyncTimeout)
 	if err != nil {
 		return nil, err
