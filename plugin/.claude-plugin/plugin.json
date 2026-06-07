@@ -1,0 +1,13 @@
+{
+  "name": "boris-mcp",
+  "description": "Adds the BORIS MCP infrastructure-context skill. Lets agents query the remote BORIS MCP server (AWS AgentCore) via the local boris-mcp CLI for AWS account/org topology, deployed resources, relationships, and prior decisions before making changes.",
+  "version": "0.1.0",
+  "keywords": [
+    "aws",
+    "infrastructure",
+    "mcp",
+    "agentcore",
+    "context",
+    "boris"
+  ]
+}
