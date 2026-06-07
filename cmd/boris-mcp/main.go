@@ -465,7 +465,8 @@ func (a *app) cmdInit(flags globalFlags, args []string) int {
 	if oldURL != "" && oldURL != fileCfg.URL {
 		_ = os.Remove(cfg.ToolsPath)
 	}
-	if code := a.cmdSync(flags); code != 0 {
+	refreshInstructions := !interactive
+	if code := a.cmdSyncWithRefresh(flags, refreshInstructions); code != 0 {
 		return code
 	}
 	if interactive && reader != nil {
@@ -475,6 +476,10 @@ func (a *app) cmdInit(flags globalFlags, args []string) int {
 }
 
 func (a *app) cmdSync(flags globalFlags) int {
+	return a.cmdSyncWithRefresh(flags, true)
+}
+
+func (a *app) cmdSyncWithRefresh(flags globalFlags, refreshInstructions bool) int {
 	cfg, _, err := a.requireConfig(flags)
 	if err != nil {
 		return a.fail(flags, exitConfig, "not_configured", err.Error())
@@ -488,8 +493,10 @@ func (a *app) cmdSync(flags globalFlags) int {
 		return a.fail(flags, code, errorName(err), err.Error())
 	}
 	fmt.Fprintf(a.stderr, "Synced %d tools to %s\n", len(cache.Tools), cfg.ToolsPath)
-	for _, result := range refreshExistingInstructions(cache) {
-		printRefreshResult(a.stderr, result)
+	if refreshInstructions {
+		for _, result := range refreshExistingInstructions(cache) {
+			printRefreshResult(a.stderr, result)
+		}
 	}
 	return 0
 }
@@ -905,6 +912,7 @@ func writeFileWithBackup(path string, content []byte) installFileResult {
 		if err := os.WriteFile(backup, old, 0o600); err != nil {
 			return installFileResult{}
 		}
+		pruneOldBackups(path, backup)
 		result.Backup = backup
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return installFileResult{}
@@ -922,6 +930,19 @@ func writeFileWithBackup(path string, content []byte) installFileResult {
 func backupPath(path string) string {
 	stamp := time.Now().UTC().Format("20060102T150405Z")
 	return fmt.Sprintf("%s.bak-%s", path, stamp)
+}
+
+func pruneOldBackups(path, keep string) {
+	matches, err := filepath.Glob(path + ".bak-*")
+	if err != nil {
+		return
+	}
+	for _, match := range matches {
+		if match == keep {
+			continue
+		}
+		_ = os.Remove(match)
+	}
 }
 
 func printInstallResult(w io.Writer, result installResult) {

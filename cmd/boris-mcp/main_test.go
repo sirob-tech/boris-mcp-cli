@@ -385,6 +385,32 @@ func TestInstallClaudeCodeGlobalWritesReferenceAndBackup(t *testing.T) {
 	}
 }
 
+func TestWriteFileWithBackupKeepsOnlyLatestBackup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "BORIS.md")
+	oldBackup := path + ".bak-20260607T000000Z"
+	if err := os.WriteFile(path, []byte("v1\n"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := os.WriteFile(oldBackup, []byte("older\n"), 0o600); err != nil {
+		t.Fatalf("write old backup: %v", err)
+	}
+	result := writeFileWithBackup(path, []byte("v2\n"))
+	if !result.Changed || result.Backup == "" {
+		t.Fatalf("expected changed file with backup, got: %#v", result)
+	}
+	backups, err := filepath.Glob(path + ".bak-*")
+	if err != nil {
+		t.Fatalf("glob backups: %v", err)
+	}
+	if len(backups) != 1 || backups[0] != result.Backup {
+		t.Fatalf("expected only latest backup %q, got %#v", result.Backup, backups)
+	}
+	if _, err := os.Stat(oldBackup); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old backup should be pruned, stat err: %v", err)
+	}
+}
+
 func TestInstallCodexProjectWritesAgentsReference(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
@@ -628,6 +654,9 @@ func TestInitPromptsForDetectedHarnessesDefaultYes(t *testing.T) {
 	}
 	if strings.Count(stderr.String(), "Install BORIS instructions for") != 3 {
 		t.Fatalf("expected separate prompts for three harnesses, got: %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Refreshed BORIS instructions") {
+		t.Fatalf("interactive init should not refresh instructions before install prompts, got: %s", stderr.String())
 	}
 }
 
