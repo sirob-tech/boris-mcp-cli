@@ -369,24 +369,24 @@ func fileExists(path string) bool {
 func borisInstructionsMarkdown(cache *toolCache) string {
 	return `# BORIS MCP Infrastructure Context
 
-Use the local ` + "`boris-mcp`" + ` CLI when a task needs live context about infrastructure, deployed resources, repository/code relationships, dependencies, topology, or prior decisions and memory. Do not use it for general cloud or programming knowledge when the answer does not depend on this environment.
+Use the local ` + "`bmcp`" + ` CLI when a task needs live context about infrastructure, deployed resources, repository/code relationships, dependencies, topology, or prior decisions and memory. Do not use it for general cloud or programming knowledge when the answer does not depend on this environment.
 
 Before the first BORIS call in a session, run:
 
 ` + "```bash" + `
-boris-mcp doctor
+bmcp doctor
 ` + "```" + `
 
-If ` + "`doctor`" + ` fails on config, tell the user to run ` + "`boris-mcp init`" + `. The BORIS MCP server requires AWS credentials for any account in the AWS Organization; if auth is unavailable, use the normal environment credential workflow available in this harness or explain the credential requirement to the user.
+If ` + "`doctor`" + ` fails on config, tell the user to run ` + "`bmcp init`" + `. The BORIS MCP server requires AWS credentials for any account in the AWS Organization; if auth is unavailable, use the normal environment credential workflow available in this harness or explain the credential requirement to the user.
 
 Useful commands:
 
-- ` + "`boris-mcp list`" + `: list available remote tools.
-- ` + "`boris-mcp describe <tool>`" + `: show tool schema and examples.
-- ` + "`boris-mcp <tool> --arg value`" + `: call a tool with CLI flags.
-- ` + "`boris-mcp call <tool> '{\"arg\":\"value\"}'`" + `: call a tool with JSON.
-- ` + "`boris-mcp --pretty <tool> ...`" + `: pretty-print JSON output when the tool returns JSON.
-- ` + "`boris-mcp --raw <tool> ...`" + `: show the original MCP tool envelope for debugging.
+- ` + "`bmcp list`" + `: list available remote tools.
+- ` + "`bmcp describe <tool>`" + `: show tool schema and examples.
+- ` + "`bmcp <tool> --arg value`" + `: call a tool with CLI flags.
+- ` + "`bmcp call <tool> '{\"arg\":\"value\"}'`" + `: call a tool with JSON.
+- ` + "`bmcp --pretty <tool> ...`" + `: pretty-print JSON output when the tool returns JSON.
+- ` + "`bmcp --raw <tool> ...`" + `: show the original MCP tool envelope for debugging.
 
 Tools available when these instructions were generated:
 
@@ -395,17 +395,17 @@ Tools available when these instructions were generated:
 To refresh this tool list after BORIS changes, run:
 
 ` + "```bash" + `
-boris-mcp sync
+bmcp sync
 ` + "```" + `
 
-` + "`boris-mcp sync`" + ` refreshes the local tool cache and updates any existing BORIS instruction files it finds.
+` + "`bmcp sync`" + ` refreshes the local tool cache and updates any existing BORIS instruction files it finds.
 
 BORIS unwraps MCP text envelopes internally, so normal tool calls print the useful payload directly. Summarize the relevant facts and mention if the tool returned an error.`
 }
 
 func renderInstructionToolList(cache *toolCache) string {
 	if cache == nil || len(cache.Tools) == 0 {
-		return "- No tools were available in the local BORIS cache. Run `boris-mcp sync`, then reinstall or sync instructions."
+		return "- No tools were available in the local BORIS cache. Run `bmcp sync`, then reinstall or sync instructions."
 	}
 	var b strings.Builder
 	if !cache.LastSync.IsZero() {

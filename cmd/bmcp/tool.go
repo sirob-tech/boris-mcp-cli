@@ -158,7 +158,7 @@ func (t tool) Validate(input map[string]any) error {
 	s := t.schema()
 	for _, r := range s.Required {
 		if _, ok := input[r]; !ok {
-			return fmt.Errorf("Missing required argument: %s\nExpected type: %s\nExample: boris-mcp call %s '{\"%s\":...}'", r, typeName(s.Properties[r].Type), displayToolName(t.Name), r)
+			return fmt.Errorf("Missing required argument: %s\nExpected type: %s\nExample: bmcp call %s '{\"%s\":...}'", r, typeName(s.Properties[r].Type), displayToolName(t.Name), r)
 		}
 	}
 	for name, val := range input {
@@ -337,8 +337,8 @@ func (t tool) Describe(w io.Writer) {
 		}
 	}
 	displayName := displayToolName(t.Name)
-	fmt.Fprintf(w, "\nJSON call:\n  boris-mcp call %s '{%s}'\n", displayName, exampleJSONArgs(s))
-	fmt.Fprintf(w, "\nSubcommand:\n  boris-mcp %s%s\n", displayName, exampleFlags(s))
+	fmt.Fprintf(w, "\nJSON call:\n  bmcp call %s '{%s}'\n", displayName, exampleJSONArgs(s))
+	fmt.Fprintf(w, "\nSubcommand:\n  bmcp %s%s\n", displayName, exampleFlags(s))
 }
 
 func renderToolList(w io.Writer, tools []tool) {

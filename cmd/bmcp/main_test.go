@@ -88,7 +88,7 @@ func TestValidateURL(t *testing.T) {
 
 func TestInitParsesPostCommandFlags(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("BORIS_MCP_HOME", home)
+	t.Setenv("BMCP_HOME", home)
 	t.Setenv("HOME", t.TempDir())
 	var stdout, stderr bytes.Buffer
 	a := &app{
@@ -115,7 +115,7 @@ func TestInitParsesPostCommandFlags(t *testing.T) {
 
 func TestInitPromptSaysAWSProfileIsOptional(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("BORIS_MCP_HOME", home)
+	t.Setenv("BMCP_HOME", home)
 	t.Setenv("HOME", t.TempDir())
 	var stdout, stderr bytes.Buffer
 	a := &app{
@@ -137,7 +137,7 @@ func TestInitPromptSaysAWSProfileIsOptional(t *testing.T) {
 }
 
 func TestMissingConfigNonInteractiveFailsFast(t *testing.T) {
-	t.Setenv("BORIS_MCP_HOME", t.TempDir())
+	t.Setenv("BMCP_HOME", t.TempDir())
 	var stdout, stderr bytes.Buffer
 	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
 	code := a.run([]string{"--non-interactive", "list"})
@@ -147,7 +147,7 @@ func TestMissingConfigNonInteractiveFailsFast(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout should be empty, got %q", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "boris-mcp init --url <url>") {
+	if !strings.Contains(stderr.String(), "bmcp init --url <url>") {
 		t.Fatalf("missing remediation in stderr: %s", stderr.String())
 	}
 }
@@ -307,7 +307,7 @@ func TestResolveToolRejectsAmbiguousDisplayAlias(t *testing.T) {
 
 func TestDynamicHelpUsesDisplayAlias(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("BORIS_MCP_HOME", home)
+	t.Setenv("BMCP_HOME", home)
 	cfg := configFile{URL: "http://localhost:8787/mcp"}
 	applyDefaults(&cfg)
 	if err := writeConfig(filepath.Join(home, "config.toml"), cfg); err != nil {
@@ -336,17 +336,17 @@ func TestDynamicHelpUsesDisplayAlias(t *testing.T) {
 	if !strings.Contains(stdout.String(), "search_aws") || strings.Contains(stdout.String(), "tools___search_aws\n") {
 		t.Fatalf("help should use display alias in heading, got:\n%s", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "boris-mcp call search_aws") {
+	if !strings.Contains(stdout.String(), "bmcp call search_aws") {
 		t.Fatalf("help should use alias in call example, got:\n%s", stdout.String())
 	}
-	if !strings.Contains(stdout.String(), "boris-mcp search_aws --query") {
+	if !strings.Contains(stdout.String(), "bmcp search_aws --query") {
 		t.Fatalf("help should use alias in subcommand example, got:\n%s", stdout.String())
 	}
 }
 
 func TestDescribeUsesDisplayAlias(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("BORIS_MCP_HOME", home)
+	t.Setenv("BMCP_HOME", home)
 	cfg := configFile{URL: "http://localhost:8787/mcp"}
 	applyDefaults(&cfg)
 	if err := writeConfig(filepath.Join(home, "config.toml"), cfg); err != nil {
@@ -372,7 +372,7 @@ func TestDescribeUsesDisplayAlias(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "boris-mcp call search_aws") {
+	if !strings.Contains(stdout.String(), "bmcp call search_aws") {
 		t.Fatalf("describe should use alias examples, got:\n%s", stdout.String())
 	}
 }
@@ -402,13 +402,13 @@ func TestInstallClaudeCodeGlobalWritesReferenceAndBackup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read BORIS.md: %v", err)
 	}
-	if !strings.Contains(string(instructions), "boris-mcp doctor") {
+	if !strings.Contains(string(instructions), "bmcp doctor") {
 		t.Fatalf("missing BORIS guidance: %s", instructions)
 	}
 	if !strings.Contains(string(instructions), "Tools available when these instructions were generated") || !strings.Contains(string(instructions), "`search_aws`: Semantic search") {
 		t.Fatalf("missing dynamic tool catalog: %s", instructions)
 	}
-	if strings.Contains(string(instructions), "boris-mcp --non-interactive") {
+	if strings.Contains(string(instructions), "bmcp --non-interactive") {
 		t.Fatalf("instructions should not prefer non-interactive calls: %s", instructions)
 	}
 	claude, err := os.ReadFile(claudePath)
@@ -542,8 +542,8 @@ func TestSyncRefreshesExistingInstructions(t *testing.T) {
 
 func setupInstallCatalog(t *testing.T, home string, tools []tool) string {
 	t.Helper()
-	borisHome := filepath.Join(home, ".boris-mcp")
-	t.Setenv("BORIS_MCP_HOME", borisHome)
+	borisHome := filepath.Join(home, ".bmcp")
+	t.Setenv("BMCP_HOME", borisHome)
 	if err := os.MkdirAll(borisHome, 0o700); err != nil {
 		t.Fatalf("mkdir boris home: %v", err)
 	}
@@ -642,8 +642,8 @@ func TestToolCallPrettyFormatsUnwrappedJSONThroughCLI(t *testing.T) {
 func TestInitPromptsForDetectedHarnessesDefaultYes(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	borisHome := filepath.Join(home, ".boris-mcp")
-	t.Setenv("BORIS_MCP_HOME", borisHome)
+	borisHome := filepath.Join(home, ".bmcp")
+	t.Setenv("BMCP_HOME", borisHome)
 	var stdout, stderr bytes.Buffer
 	a := &app{
 		stdin:       strings.NewReader("\n\n"),
@@ -686,7 +686,7 @@ func TestInitPromptsForDetectedHarnessesDefaultYes(t *testing.T) {
 func TestInitNonInteractiveSkipsHarnessPrompts(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	t.Setenv("BORIS_MCP_HOME", filepath.Join(home, ".boris-mcp"))
+	t.Setenv("BMCP_HOME", filepath.Join(home, ".bmcp"))
 	var stdout, stderr bytes.Buffer
 	a := &app{
 		stdin:       strings.NewReader(""),
@@ -841,7 +841,7 @@ func TestValidateInputErrors(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "Missing required argument: service") {
 		t.Fatalf("missing required error mismatch: %v", err)
 	}
-	if !strings.Contains(err.Error(), "boris-mcp call deploy_service") {
+	if !strings.Contains(err.Error(), "bmcp call deploy_service") {
 		t.Fatalf("missing required example should use display alias: %v", err)
 	}
 	err = tl.Validate(map[string]any{"service": "api", "enviroment": "prod"})
@@ -889,7 +889,7 @@ func TestGeneratedInstructionsDoNotDependOnJQ(t *testing.T) {
 	if !strings.Contains(got, "unwraps MCP text envelopes internally") {
 		t.Fatalf("instructions should explain internal unwrapping: %s", got)
 	}
-	if !strings.Contains(got, "`boris-mcp --raw <tool> ...`") {
+	if !strings.Contains(got, "`bmcp --raw <tool> ...`") {
 		t.Fatalf("instructions should mention raw debugging mode: %s", got)
 	}
 }

@@ -37,17 +37,17 @@ type effectiveConfig struct {
 }
 
 func defaultEffective(flags globalFlags) effectiveConfig {
-	home := os.Getenv("BORIS_MCP_HOME")
+	home := os.Getenv("BMCP_HOME")
 	if home == "" {
 		if userHome, err := os.UserHomeDir(); err == nil {
-			home = filepath.Join(userHome, ".boris-mcp")
+			home = filepath.Join(userHome, ".bmcp")
 		}
 	}
 	return effectiveConfig{
 		Home: home, ConfigPath: filepath.Join(home, "config.toml"), ToolsPath: filepath.Join(home, "tools.json"),
 		URL: flags.url, Profile: flags.profile, Region: flags.region, Service: flags.service,
 		SyncTTL: defaultTTL, ConnectTimeout: defaultConnect, SyncTimeout: defaultSync, CallTimeout: defaultCall,
-		NonInteractive: flags.nonInteractive || truthy(os.Getenv("BORIS_MCP_NON_INTERACTIVE")),
+		NonInteractive: flags.nonInteractive || truthy(os.Getenv("BMCP_NON_INTERACTIVE")),
 	}
 }
 
@@ -59,27 +59,27 @@ func (a *app) loadEffective(flags globalFlags, require bool) (effectiveConfig, b
 		return cfg, false, err
 	}
 	if require && !exists {
-		return cfg, false, errors.New("BORIS MCP is not configured.\nRun interactively: boris-mcp init\nOr non-interactively: boris-mcp init --url <url>")
+		return cfg, false, errors.New("BORIS MCP is not configured.\nRun interactively: bmcp init\nOr non-interactively: bmcp init --url <url>")
 	}
 	if !exists {
 		applyDefaults(&fileCfg)
 	}
 	if flags.url == "" {
-		cfg.URL = firstNonEmpty(os.Getenv("BORIS_MCP_URL"), fileCfg.URL)
+		cfg.URL = firstNonEmpty(os.Getenv("BMCP_URL"), fileCfg.URL)
 	}
 	if flags.profile == "" {
-		cfg.Profile = firstNonEmpty(os.Getenv("BORIS_MCP_PROFILE"), os.Getenv("AWS_PROFILE"), fileCfg.AWSProfile)
+		cfg.Profile = firstNonEmpty(os.Getenv("BMCP_PROFILE"), os.Getenv("AWS_PROFILE"), fileCfg.AWSProfile)
 	}
 	if flags.region == "" {
-		cfg.Region = firstNonEmpty(os.Getenv("BORIS_MCP_REGION"), fileCfg.Region)
+		cfg.Region = firstNonEmpty(os.Getenv("BMCP_REGION"), fileCfg.Region)
 	}
 	if flags.service == "" {
-		cfg.Service = firstNonEmpty(os.Getenv("BORIS_MCP_SERVICE"), fileCfg.Service)
+		cfg.Service = firstNonEmpty(os.Getenv("BMCP_SERVICE"), fileCfg.Service)
 	}
-	cfg.SyncTTL = durationFromEnv("BORIS_MCP_SYNC_TTL", fileCfg.SyncTTL)
-	cfg.ConnectTimeout = durationFromEnv("BORIS_MCP_CONNECT_TIMEOUT", fileCfg.ConnectTimeout)
-	cfg.SyncTimeout = durationFromEnv("BORIS_MCP_SYNC_TIMEOUT", fileCfg.SyncTimeout)
-	cfg.CallTimeout = durationFromEnv("BORIS_MCP_CALL_TIMEOUT", fileCfg.CallTimeout)
+	cfg.SyncTTL = durationFromEnv("BMCP_SYNC_TTL", fileCfg.SyncTTL)
+	cfg.ConnectTimeout = durationFromEnv("BMCP_CONNECT_TIMEOUT", fileCfg.ConnectTimeout)
+	cfg.SyncTimeout = durationFromEnv("BMCP_SYNC_TIMEOUT", fileCfg.SyncTimeout)
+	cfg.CallTimeout = durationFromEnv("BMCP_CALL_TIMEOUT", fileCfg.CallTimeout)
 	if cfg.Service == "" {
 		cfg.Service = "bedrock-agentcore"
 	}
@@ -104,11 +104,11 @@ func (a *app) requireConfig(flags globalFlags) (effectiveConfig, bool, error) {
 				return cfg, exists, err
 			}
 		} else {
-			return cfg, false, errors.New("BORIS MCP is not configured.\nRun interactively: boris-mcp init\nOr non-interactively: boris-mcp init --url <url>")
+			return cfg, false, errors.New("BORIS MCP is not configured.\nRun interactively: bmcp init\nOr non-interactively: bmcp init --url <url>")
 		}
 	}
 	if cfg.URL == "" {
-		return cfg, exists, errors.New("BORIS MCP is not configured.\nRun interactively: boris-mcp init\nOr non-interactively: boris-mcp init --url <url>")
+		return cfg, exists, errors.New("BORIS MCP is not configured.\nRun interactively: bmcp init\nOr non-interactively: bmcp init --url <url>")
 	}
 	if err := validateURL(cfg.URL, flags.allowHTTP); err != nil {
 		return cfg, exists, err

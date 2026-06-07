@@ -66,7 +66,7 @@ func (a *app) run(args []string) int {
 
 func (a *app) cmdInit(flags globalFlags, args []string) int {
 	if len(args) != 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: boris-mcp init [--url <url>] [--profile <profile>]")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp init [--url <url>] [--profile <profile>]")
 	}
 	cfg, exists, err := a.loadEffective(flags, false)
 	if err != nil {
@@ -104,7 +104,7 @@ func (a *app) cmdInit(flags globalFlags, args []string) int {
 			}
 		}
 	} else if !exists && flags.url == "" {
-		return a.fail(flags, exitConfig, "not_configured", "BORIS MCP is not configured.\nRun interactively: boris-mcp init\nOr non-interactively: boris-mcp init --url <url>")
+		return a.fail(flags, exitConfig, "not_configured", "BORIS MCP is not configured.\nRun interactively: bmcp init\nOr non-interactively: bmcp init --url <url>")
 	}
 
 	if flags.url != "" {
@@ -136,7 +136,7 @@ func (a *app) cmdInit(flags globalFlags, args []string) int {
 	if err := writeConfig(cfg.ConfigPath, fileCfg); err != nil {
 		return a.fail(flags, exitConfig, "config_write_failed", err.Error())
 	}
-	fmt.Fprintf(a.stderr, "Saved config: %s\nRun `boris-mcp init` again to change it.\n", cfg.ConfigPath)
+	fmt.Fprintf(a.stderr, "Saved config: %s\nRun `bmcp init` again to change it.\n", cfg.ConfigPath)
 	if oldURL != "" && oldURL != fileCfg.URL {
 		_ = os.Remove(cfg.ToolsPath)
 	}
@@ -156,13 +156,13 @@ func (a *app) cmdHelp(flags globalFlags, args []string) int {
 }
 
 func (a *app) cmdVersion(flags globalFlags, args []string) int {
-	fmt.Fprintf(a.stdout, "boris-mcp %s\ncommit: %s\nbuilt: %s\n", version, buildCommit, buildDate)
+	fmt.Fprintf(a.stdout, "bmcp %s\ncommit: %s\nbuilt: %s\n", version, buildCommit, buildDate)
 	return 0
 }
 
 func (a *app) cmdSync(flags globalFlags, args []string) int {
 	if len(args) != 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: boris-mcp sync")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp sync")
 	}
 	return a.cmdSyncWithRefresh(flags, true)
 }
@@ -191,7 +191,7 @@ func (a *app) cmdSyncWithRefresh(flags globalFlags, refreshInstructions bool) in
 
 func (a *app) cmdList(flags globalFlags, args []string) int {
 	if len(args) != 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: boris-mcp list")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp list")
 	}
 	cfg, _, err := a.requireConfig(flags)
 	if err != nil {
@@ -208,7 +208,7 @@ func (a *app) cmdList(flags globalFlags, args []string) int {
 
 func (a *app) cmdDescribe(flags globalFlags, args []string) int {
 	if len(args) != 1 {
-		return a.fail(flags, exitValidation, "usage", "usage: boris-mcp describe <tool>")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp describe <tool>")
 	}
 	cfg, _, err := a.requireConfig(flags)
 	if err != nil {
@@ -228,7 +228,7 @@ func (a *app) cmdDescribe(flags globalFlags, args []string) int {
 
 func (a *app) cmdCall(flags globalFlags, args []string) int {
 	if len(args) < 1 || len(args) > 2 {
-		return a.fail(flags, exitValidation, "usage", "usage: boris-mcp call <tool> ['{\"arg\":\"value\"}']")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp call <tool> ['{\"arg\":\"value\"}']")
 	}
 	payload := ""
 	if len(args) == 2 {
@@ -333,7 +333,7 @@ func (a *app) cmdDynamic(flags globalFlags, name string, args []string) int {
 
 func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 	if len(args) != 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: boris-mcp doctor")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp doctor")
 	}
 	cfg, exists, err := a.loadEffective(flags, false)
 	checks := []map[string]any{}
@@ -404,7 +404,7 @@ func (a *app) cmdInstall(flags globalFlags, args []string) int {
 		return a.fail(flags, exitValidation, "usage", "--scope must be user or project")
 	}
 	if len(harnesses) == 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: boris-mcp install <claude-code|codex|cursor|all> [--scope user|project]")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp install <claude-code|codex|cursor|all> [--scope user|project]")
 	}
 	if len(harnesses) == 1 && harnesses[0] == "all" {
 		harnesses = []string{"claude-code", "codex", "cursor"}
@@ -421,15 +421,15 @@ func (a *app) cmdInstall(flags globalFlags, args []string) int {
 
 func usage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
-  boris-mcp init [--url <url>] [--profile <profile>]
-  boris-mcp install <claude-code|codex|cursor|all> [--scope user|project]
-  boris-mcp sync
-  boris-mcp doctor
-  boris-mcp list|ls
-  boris-mcp describe|d <tool>
-  boris-mcp call <tool> ['{"arg":"value"}']
-  boris-mcp <exact_tool_name> --arg value
-  boris-mcp version
+  bmcp init [--url <url>] [--profile <profile>]
+  bmcp install <claude-code|codex|cursor|all> [--scope user|project]
+  bmcp sync
+  bmcp doctor
+  bmcp list|ls
+  bmcp describe|d <tool>
+  bmcp call <tool> ['{"arg":"value"}']
+  bmcp <exact_tool_name> --arg value
+  bmcp version
 
 Global flags:
   --url, -u <url>              Override BORIS MCP URL

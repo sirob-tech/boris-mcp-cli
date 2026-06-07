@@ -1,21 +1,42 @@
-# boris-mcp
+# bmcp
 
 B.O.R.I.S. MCP to CLI converter.
 
-`boris-mcp` lets local AI coding agents query the remote BORIS MCP server hosted
+`bmcp` lets local AI coding agents query the remote BORIS MCP server hosted
 on AWS AgentCore through a regular CLI. It handles SigV4 auth, tool discovery,
 schema caching, validation, and MCP text-envelope unwrapping.
+
+## Why this exists
+
+The MCP protocol is brittle in real-world use, especially when the server is
+behind real auth. Wrapping the remote MCP server as a CLI bypasses several
+rough edges at once:
+
+- **Auth and transport are handled once, in one place.** SigV4 signing, region
+  inference, and the AWS credential chain live in this binary instead of
+  inside each harness's MCP client.
+- **One-step config and install.** `bmcp init` saves config; `bmcp install
+  <claude-code|codex|cursor|all>` drops a small instructions file into each
+  harness. No per-harness MCP server registration to maintain.
+- **No separate skill to distribute.** The installer emits a single `BORIS.md`
+  whose contents are generated from the live tool catalog, so updating agent
+  guidance for a new tool is `bmcp sync` — not a new release of a Claude
+  skill, Cursor rule, or Codex prompt.
+- **Cheaper context.** Native MCP clients load every tool's full JSON schema
+  into the agent's context on every turn. With `bmcp` the agent sees a short
+  tool list up front and calls `bmcp describe <tool>` only when it actually
+  needs the schema — one tool at a time, on demand.
 
 ## Build
 
 ```bash
-go build -o boris-mcp ./cmd/boris-mcp
+go build -o bmcp ./cmd/bmcp
 ```
 
 Put the binary somewhere on `PATH`, for example:
 
 ```bash
-ln -s "$(pwd)/boris-mcp" ~/.local/bin/boris-mcp
+ln -s "$(pwd)/bmcp" ~/.local/bin/bmcp
 ```
 
 ## Configure
@@ -23,7 +44,7 @@ ln -s "$(pwd)/boris-mcp" ~/.local/bin/boris-mcp
 Run first-time setup:
 
 ```bash
-boris-mcp init --url <boris-mcp-url> --profile <aws-profile>
+bmcp init --url <url> --profile <aws-profile>
 ```
 
 `--profile` is optional; if omitted, the AWS SDK default credential chain is
@@ -46,31 +67,31 @@ Additional configuration flags:
 Check setup:
 
 ```bash
-boris-mcp doctor
+bmcp doctor
 ```
 
 ## Install Agent Instructions
 
 The installer does not register BORIS as a local MCP server. It writes
-instructions that teach agents to call the existing `boris-mcp` CLI and include
-the currently synced BORIS tool catalog. Run `boris-mcp init` first so the
+instructions that teach agents to call the existing `bmcp` CLI and include
+the currently synced BORIS tool catalog. Run `bmcp init` first so the
 installer has config and a tool catalog to read.
 
 User-global install is the default:
 
 ```bash
-boris-mcp install claude-code
-boris-mcp install codex
-boris-mcp install cursor
-boris-mcp install all
+bmcp install claude-code
+bmcp install codex
+bmcp install cursor
+bmcp install all
 ```
 
 Project-local install:
 
 ```bash
-boris-mcp install claude-code --scope project
-boris-mcp install codex --scope project
-boris-mcp install cursor --scope project
+bmcp install claude-code --scope project
+bmcp install codex --scope project
+bmcp install cursor --scope project
 ```
 
 User-scope targets:
@@ -91,7 +112,7 @@ Existing files are modified in place. When a file changes, a timestamped
 Refresh tools and installed instructions:
 
 ```bash
-boris-mcp sync
+bmcp sync
 ```
 
 `sync` refreshes the local tool cache and updates any existing BORIS instruction
@@ -100,10 +121,10 @@ files it finds, without installing new harnesses.
 ## Use
 
 ```bash
-boris-mcp list
-boris-mcp describe <tool>
-boris-mcp <tool> --arg value
-boris-mcp call <tool> '{"arg":"value"}'
+bmcp list
+bmcp describe <tool>
+bmcp <tool> --arg value
+bmcp call <tool> '{"arg":"value"}'
 ```
 
 Successful tool calls unwrap MCP text envelopes internally and print the useful

@@ -1,4 +1,4 @@
-module github.com/sirob-tech/boris-mcp
+module github.com/sirob-tech/boris-mcp-cli
 
 go 1.24
 
