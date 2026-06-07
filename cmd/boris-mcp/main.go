@@ -46,10 +46,14 @@ var (
 )
 
 type app struct {
-	stdin  io.Reader
-	stdout io.Writer
-	stderr io.Writer
-	now    func() time.Time
+	stdin         io.Reader
+	stdout        io.Writer
+	stderr        io.Writer
+	now           func() time.Time
+	syncToolsFunc func(context.Context, effectiveConfig) (*toolCache, error)
+	callToolFunc  func(context.Context, effectiveConfig, string, map[string]any) ([]byte, error)
+	lookPath      func(string) (string, error)
+	interactive   func() bool
 }
 
 type globalFlags struct {
@@ -59,10 +63,10 @@ type globalFlags struct {
 	service        string
 	jsonOut        bool
 	pretty         bool
+	raw            bool
 	nonInteractive bool
 	verbose        bool
 	allowHTTP      bool
-	noSync         bool
 }
 
 type configFile struct {
@@ -181,13 +185,13 @@ func (a *app) run(args []string) int {
 		fmt.Fprintf(a.stdout, "boris-mcp %s\ncommit: %s\nbuilt: %s\n", version, buildCommit, buildDate)
 		return 0
 	case "init":
-		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs, true)
+		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs)
 		if err != nil {
 			return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 		}
 		return a.cmdInit(flags, cmdArgs)
 	case "sync":
-		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs, false)
+		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs)
 		if err != nil {
 			return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 		}
@@ -196,7 +200,7 @@ func (a *app) run(args []string) int {
 		}
 		return a.cmdSync(flags)
 	case "doctor":
-		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs, false)
+		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs)
 		if err != nil {
 			return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 		}
@@ -205,7 +209,7 @@ func (a *app) run(args []string) int {
 		}
 		return a.cmdDoctor(flags)
 	case "list", "ls":
-		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs, false)
+		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs)
 		if err != nil {
 			return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 		}
@@ -214,7 +218,7 @@ func (a *app) run(args []string) int {
 		}
 		return a.cmdList(flags)
 	case "describe", "d":
-		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs, false)
+		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs)
 		if err != nil {
 			return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 		}
@@ -223,7 +227,7 @@ func (a *app) run(args []string) int {
 		}
 		return a.cmdDescribe(flags, cmdArgs[0])
 	case "call":
-		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs, false)
+		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs)
 		if err != nil {
 			return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 		}
@@ -235,6 +239,8 @@ func (a *app) run(args []string) int {
 			payload = cmdArgs[1]
 		}
 		return a.cmdCall(flags, cmdArgs[0], payload, true)
+	case "install":
+		return a.cmdInstall(flags, cmdArgs)
 	default:
 		return a.cmdDynamic(flags, cmd, cmdArgs)
 	}
@@ -265,14 +271,14 @@ func parseGlobalFlags(args []string) (globalFlags, []string, error) {
 			flags.jsonOut = true
 		case arg == "--pretty":
 			flags.pretty = true
+		case arg == "--raw":
+			flags.raw = true
 		case arg == "--non-interactive":
 			flags.nonInteractive = true
 		case arg == "--verbose":
 			flags.verbose = true
 		case arg == "--allow-http":
 			flags.allowHTTP = true
-		case arg == "--no-sync":
-			flags.noSync = true
 		case arg == "--url" || arg == "-u":
 			v, err := next(arg)
 			if err != nil {
@@ -312,7 +318,7 @@ func parseGlobalFlags(args []string) (globalFlags, []string, error) {
 	return flags, rest, nil
 }
 
-func parsePostCommandFlags(flags globalFlags, args []string, allowNoSync bool) (globalFlags, []string, error) {
+func parsePostCommandFlags(flags globalFlags, args []string) (globalFlags, []string, error) {
 	var rest []string
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
@@ -336,14 +342,14 @@ func parsePostCommandFlags(flags globalFlags, args []string, allowNoSync bool) (
 			flags.jsonOut = true
 		case arg == "--pretty":
 			flags.pretty = true
+		case arg == "--raw":
+			flags.raw = true
 		case arg == "--non-interactive":
 			flags.nonInteractive = true
 		case arg == "--verbose":
 			flags.verbose = true
 		case arg == "--allow-http":
 			flags.allowHTTP = true
-		case arg == "--no-sync" && allowNoSync:
-			flags.noSync = true
 		case arg == "--url" || arg == "-u":
 			v, err := next(arg)
 			if err != nil {
@@ -385,7 +391,7 @@ func parsePostCommandFlags(flags globalFlags, args []string, allowNoSync bool) (
 
 func (a *app) cmdInit(flags globalFlags, args []string) int {
 	if len(args) != 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: boris-mcp init [--url <url>] [--profile <profile>] [--no-sync]")
+		return a.fail(flags, exitValidation, "usage", "usage: boris-mcp init [--url <url>] [--profile <profile>]")
 	}
 	cfg, exists, err := a.loadEffective(flags, false)
 	if err != nil {
@@ -395,10 +401,11 @@ func (a *app) cmdInit(flags globalFlags, args []string) int {
 		cfg = defaultEffective(flags)
 	}
 
-	interactive := isInteractive() && !cfg.NonInteractive
+	interactive := a.isInteractive() && !cfg.NonInteractive
+	var reader *bufio.Reader
 	fileCfg, _ := readConfig(cfg.ConfigPath)
 	if interactive {
-		reader := bufio.NewReader(a.stdin)
+		reader = bufio.NewReader(a.stdin)
 		fmt.Fprintf(a.stderr, "BORIS MCP URL")
 		if cfg.URL != "" {
 			fmt.Fprintf(a.stderr, " [%s]", sanitizeURL(cfg.URL))
@@ -458,10 +465,13 @@ func (a *app) cmdInit(flags globalFlags, args []string) int {
 	if oldURL != "" && oldURL != fileCfg.URL {
 		_ = os.Remove(cfg.ToolsPath)
 	}
-	if flags.noSync {
-		return 0
+	if code := a.cmdSync(flags); code != 0 {
+		return code
 	}
-	return a.cmdSync(flags)
+	if interactive && reader != nil {
+		a.promptInstallDetectedHarnesses(reader, flags)
+	}
+	return 0
 }
 
 func (a *app) cmdSync(flags globalFlags) int {
@@ -478,6 +488,9 @@ func (a *app) cmdSync(flags globalFlags) int {
 		return a.fail(flags, code, errorName(err), err.Error())
 	}
 	fmt.Fprintf(a.stderr, "Synced %d tools to %s\n", len(cache.Tools), cfg.ToolsPath)
+	for _, result := range refreshExistingInstructions(cache) {
+		printRefreshResult(a.stderr, result)
+	}
 	return 0
 }
 
@@ -565,6 +578,9 @@ func (a *app) cmdCall(flags globalFlags, name string, payload string, readStdin 
 		}
 		return a.fail(flags, code, errorName(err), err.Error())
 	}
+	if !flags.raw {
+		result = unwrapMCPTextEnvelope(result)
+	}
 	if flags.pretty {
 		var pretty bytes.Buffer
 		if json.Indent(&pretty, result, "", "  ") == nil {
@@ -649,9 +665,420 @@ func (a *app) cmdDoctor(flags globalFlags) int {
 	return 0
 }
 
+type installFileResult struct {
+	Path    string
+	Backup  string
+	Changed bool
+}
+
+type installResult struct {
+	Harness string
+	Scope   string
+	Files   []installFileResult
+}
+
+func (a *app) promptInstallDetectedHarnesses(reader *bufio.Reader, flags globalFlags) {
+	for _, harness := range a.detectHarnesses() {
+		if !promptYesNo(reader, a.stderr, fmt.Sprintf("Install BORIS instructions for %s? [Y/n]: ", harnessDisplayName(harness)), true) {
+			continue
+		}
+		result, err := a.installHarnessWithCatalog(flags, harness, "user")
+		if err != nil {
+			fmt.Fprintf(a.stderr, "Could not install %s instructions: %s\n", harnessDisplayName(harness), err)
+			continue
+		}
+		printInstallResult(a.stderr, result)
+	}
+}
+
+func (a *app) detectHarnesses() []string {
+	known := []struct {
+		name string
+		bin  string
+		dir  string
+	}{
+		{name: "claude-code", bin: "claude", dir: ".claude"},
+		{name: "codex", bin: "codex", dir: ".codex"},
+		{name: "cursor", bin: "cursor", dir: ".cursor"},
+	}
+	var detected []string
+	for _, h := range known {
+		if a.hasCommand(h.bin) || userDirExists(h.dir) {
+			detected = append(detected, h.name)
+		}
+	}
+	return detected
+}
+
+func (a *app) hasCommand(name string) bool {
+	lookPath := a.lookPath
+	if lookPath == nil {
+		lookPath = exec.LookPath
+	}
+	_, err := lookPath(name)
+	return err == nil
+}
+
+func userDirExists(name string) bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(home, name))
+	return err == nil && info.IsDir()
+}
+
+func promptYesNo(reader *bufio.Reader, w io.Writer, question string, defaultYes bool) bool {
+	fmt.Fprint(w, question)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return defaultYes
+	}
+	answer := strings.ToLower(strings.TrimSpace(line))
+	if answer == "" {
+		return defaultYes
+	}
+	return answer == "y" || answer == "yes"
+}
+
+func (a *app) cmdInstall(flags globalFlags, args []string) int {
+	scope := "user"
+	var harnesses []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--scope":
+			if i+1 >= len(args) {
+				return a.fail(flags, exitValidation, "usage", "--scope requires a value: user or project")
+			}
+			i++
+			scope = args[i]
+		case strings.HasPrefix(arg, "--scope="):
+			scope = strings.TrimPrefix(arg, "--scope=")
+		case strings.HasPrefix(arg, "-"):
+			return a.fail(flags, exitValidation, "usage", "unknown install flag: "+arg)
+		default:
+			harnesses = append(harnesses, arg)
+		}
+	}
+	if scope != "user" && scope != "project" {
+		return a.fail(flags, exitValidation, "usage", "--scope must be user or project")
+	}
+	if len(harnesses) == 0 {
+		return a.fail(flags, exitValidation, "usage", "usage: boris-mcp install <claude-code|codex|cursor|all> [--scope user|project]")
+	}
+	if len(harnesses) == 1 && harnesses[0] == "all" {
+		harnesses = []string{"claude-code", "codex", "cursor"}
+	}
+	for _, harness := range harnesses {
+		result, err := a.installHarnessWithCatalog(flags, harness, scope)
+		if err != nil {
+			return a.fail(flags, exitValidation, "install_failed", err.Error())
+		}
+		printInstallResult(a.stderr, result)
+	}
+	return 0
+}
+
+func (a *app) installHarnessWithCatalog(flags globalFlags, harness, scope string) (installResult, error) {
+	cfg, _, err := a.requireConfig(flags)
+	if err != nil {
+		return installResult{}, err
+	}
+	cache, err := a.cacheForCatalog(flags, cfg, true)
+	if err != nil {
+		return installResult{}, err
+	}
+	return a.installHarness(harness, scope, cache)
+}
+
+func (a *app) installHarness(harness, scope string, cache *toolCache) (installResult, error) {
+	switch harness {
+	case "claude", "claude-code":
+		return installClaudeCode(scope, cache)
+	case "codex":
+		return installCodex(scope, cache)
+	case "cursor":
+		return installCursor(scope, cache)
+	default:
+		return installResult{}, fmt.Errorf("unknown harness: %s", harness)
+	}
+}
+
+func installClaudeCode(scope string, cache *toolCache) (installResult, error) {
+	base, err := installBase(scope, ".claude")
+	if err != nil {
+		return installResult{}, err
+	}
+	refFile := "CLAUDE.md"
+	instructionPath := filepath.Join(base, "BORIS.md")
+	result := installResult{Harness: "claude-code", Scope: scope}
+	result.Files = append(result.Files, writeInstructionFile(instructionPath, borisInstructionsMarkdown(cache)))
+	result.Files = append(result.Files, appendInstructionRef(filepath.Join(base, refFile), "@BORIS.md"))
+	return result, firstInstallErr(result.Files)
+}
+
+func installCodex(scope string, cache *toolCache) (installResult, error) {
+	base, err := installBase(scope, ".codex")
+	if err != nil {
+		return installResult{}, err
+	}
+	result := installResult{Harness: "codex", Scope: scope}
+	result.Files = append(result.Files, writeInstructionFile(filepath.Join(base, "BORIS.md"), borisInstructionsMarkdown(cache)))
+	result.Files = append(result.Files, appendInstructionRef(filepath.Join(base, "AGENTS.md"), "@BORIS.md"))
+	return result, firstInstallErr(result.Files)
+}
+
+func installCursor(scope string, cache *toolCache) (installResult, error) {
+	base, err := installBase(scope, ".cursor")
+	if err != nil {
+		return installResult{}, err
+	}
+	result := installResult{Harness: "cursor", Scope: scope}
+	result.Files = append(result.Files, writeInstructionFile(filepath.Join(base, "rules", "boris.mdc"), borisCursorRule(cache)))
+	return result, firstInstallErr(result.Files)
+}
+
+func installBase(scope, userSubdir string) (string, error) {
+	if scope == "project" {
+		return os.Getwd()
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, userSubdir), nil
+}
+
+func firstInstallErr(results []installFileResult) error {
+	for _, r := range results {
+		if r.Path == "" {
+			return errors.New("install failed")
+		}
+	}
+	return nil
+}
+
+func writeInstructionFile(path, content string) installFileResult {
+	return writeFileWithBackup(path, []byte(ensureTrailingNewline(content)))
+}
+
+func ensureTrailingNewline(s string) string {
+	if strings.HasSuffix(s, "\n") {
+		return s
+	}
+	return s + "\n"
+}
+
+func appendInstructionRef(path, ref string) installFileResult {
+	old, err := os.ReadFile(path)
+	if err == nil {
+		for _, line := range strings.Split(string(old), "\n") {
+			if strings.TrimSpace(line) == ref {
+				return installFileResult{Path: path, Changed: false}
+			}
+		}
+		content := string(old)
+		if content != "" && !strings.HasSuffix(content, "\n") {
+			content += "\n"
+		}
+		content += ref + "\n"
+		return writeFileWithBackup(path, []byte(content))
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return installFileResult{}
+	}
+	return writeFileWithBackup(path, []byte(ref+"\n"))
+}
+
+func writeFileWithBackup(path string, content []byte) installFileResult {
+	result := installFileResult{Path: path}
+	old, err := os.ReadFile(path)
+	if err == nil {
+		if bytes.Equal(old, content) {
+			return result
+		}
+		backup := backupPath(path)
+		if err := os.MkdirAll(filepath.Dir(backup), 0o700); err != nil {
+			return installFileResult{}
+		}
+		if err := os.WriteFile(backup, old, 0o600); err != nil {
+			return installFileResult{}
+		}
+		result.Backup = backup
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return installFileResult{}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return installFileResult{}
+	}
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		return installFileResult{}
+	}
+	result.Changed = true
+	return result
+}
+
+func backupPath(path string) string {
+	stamp := time.Now().UTC().Format("20060102T150405Z")
+	return fmt.Sprintf("%s.bak-%s", path, stamp)
+}
+
+func printInstallResult(w io.Writer, result installResult) {
+	fmt.Fprintf(w, "Installed BORIS instructions for %s (%s scope):\n", harnessDisplayName(result.Harness), result.Scope)
+	for _, file := range result.Files {
+		if file.Changed {
+			fmt.Fprintf(w, "  wrote %s\n", file.Path)
+			if file.Backup != "" {
+				fmt.Fprintf(w, "  backup %s\n", file.Backup)
+			}
+		} else {
+			fmt.Fprintf(w, "  unchanged %s\n", file.Path)
+		}
+	}
+}
+
+func printRefreshResult(w io.Writer, result installResult) {
+	changed := false
+	for _, file := range result.Files {
+		changed = changed || file.Changed
+	}
+	if !changed {
+		return
+	}
+	fmt.Fprintf(w, "Refreshed BORIS instructions for %s (%s scope):\n", harnessDisplayName(result.Harness), result.Scope)
+	for _, file := range result.Files {
+		if !file.Changed {
+			continue
+		}
+		fmt.Fprintf(w, "  wrote %s\n", file.Path)
+		if file.Backup != "" {
+			fmt.Fprintf(w, "  backup %s\n", file.Backup)
+		}
+	}
+}
+
+func refreshExistingInstructions(cache *toolCache) []installResult {
+	var results []installResult
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		refresh := []struct {
+			harness string
+			path    string
+			content string
+		}{
+			{harness: "claude-code", path: filepath.Join(home, ".claude", "BORIS.md"), content: borisInstructionsMarkdown(cache)},
+			{harness: "codex", path: filepath.Join(home, ".codex", "BORIS.md"), content: borisInstructionsMarkdown(cache)},
+			{harness: "cursor", path: filepath.Join(home, ".cursor", "rules", "boris.mdc"), content: borisCursorRule(cache)},
+		}
+		for _, item := range refresh {
+			if fileExists(item.path) {
+				results = append(results, installResult{Harness: item.harness, Scope: "user", Files: []installFileResult{writeInstructionFile(item.path, item.content)}})
+			}
+		}
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		projectBORIS := filepath.Join(cwd, "BORIS.md")
+		if fileExists(projectBORIS) {
+			results = append(results, installResult{Harness: "claude-code/codex", Scope: "project", Files: []installFileResult{writeInstructionFile(projectBORIS, borisInstructionsMarkdown(cache))}})
+		}
+		projectCursor := filepath.Join(cwd, ".cursor", "rules", "boris.mdc")
+		if fileExists(projectCursor) {
+			results = append(results, installResult{Harness: "cursor", Scope: "project", Files: []installFileResult{writeInstructionFile(projectCursor, borisCursorRule(cache))}})
+		}
+	}
+	return results
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func harnessDisplayName(harness string) string {
+	switch harness {
+	case "claude", "claude-code":
+		return "Claude Code"
+	case "codex":
+		return "Codex"
+	case "cursor":
+		return "Cursor"
+	case "claude-code/codex":
+		return "Claude Code/Codex"
+	default:
+		return harness
+	}
+}
+
+func borisInstructionsMarkdown(cache *toolCache) string {
+	return `# BORIS MCP Infrastructure Context
+
+Use the local ` + "`boris-mcp`" + ` CLI when a task needs live context about infrastructure, deployed resources, repository/code relationships, dependencies, topology, or prior decisions and memory. Do not use it for general cloud or programming knowledge when the answer does not depend on this environment.
+
+Before the first BORIS call in a session, run:
+
+` + "```bash" + `
+boris-mcp doctor
+` + "```" + `
+
+If ` + "`doctor`" + ` fails on config, tell the user to run ` + "`boris-mcp init`" + `. The BORIS MCP server requires AWS credentials for any account in the AWS Organization; if auth is unavailable, use the normal environment credential workflow available in this harness or explain the credential requirement to the user.
+
+Useful commands:
+
+- ` + "`boris-mcp list`" + `: list available remote tools.
+- ` + "`boris-mcp describe <tool>`" + `: show tool schema and examples.
+- ` + "`boris-mcp <tool> --arg value`" + `: call a tool with CLI flags.
+- ` + "`boris-mcp call <tool> '{\"arg\":\"value\"}'`" + `: call a tool with JSON.
+- ` + "`boris-mcp --pretty <tool> ...`" + `: pretty-print JSON output when the tool returns JSON.
+- ` + "`boris-mcp --raw <tool> ...`" + `: show the original MCP tool envelope for debugging.
+
+Tools available when these instructions were generated:
+
+` + renderInstructionToolList(cache) + `
+
+To refresh this tool list after BORIS changes, run:
+
+` + "```bash" + `
+boris-mcp sync
+` + "```" + `
+
+` + "`boris-mcp sync`" + ` refreshes the local tool cache and updates any existing BORIS instruction files it finds.
+
+BORIS unwraps MCP text envelopes internally, so normal tool calls print the useful payload directly. Summarize the relevant facts and mention if the tool returned an error.`
+}
+
+func renderInstructionToolList(cache *toolCache) string {
+	if cache == nil || len(cache.Tools) == 0 {
+		return "- No tools were available in the local BORIS cache. Run `boris-mcp sync`, then reinstall or sync instructions."
+	}
+	var b strings.Builder
+	if !cache.LastSync.IsZero() {
+		fmt.Fprintf(&b, "_Synced: %s_\n\n", cache.LastSync.UTC().Format(time.RFC3339))
+	}
+	for _, t := range cache.Tools {
+		desc := normalizeWhitespace(t.Description)
+		if desc == "" {
+			fmt.Fprintf(&b, "- `%s`\n", displayToolName(t.Name))
+			continue
+		}
+		fmt.Fprintf(&b, "- `%s`: %s\n", displayToolName(t.Name), desc)
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func borisCursorRule(cache *toolCache) string {
+	return `---
+description: Use BORIS for infrastructure, code, dependency, and memory context
+alwaysApply: true
+---
+
+` + borisInstructionsMarkdown(cache)
+}
+
 func usage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
   boris-mcp init [--url <url>] [--profile <profile>]
+  boris-mcp install <claude-code|codex|cursor|all> [--scope user|project]
   boris-mcp sync
   boris-mcp doctor
   boris-mcp list|ls
@@ -667,6 +1094,7 @@ Global flags:
   --service <service>          Override SigV4 service
   --json                       Emit structured errors
   --pretty                     Pretty-print successful tool JSON
+  --raw                        Emit raw MCP tool envelopes
   --non-interactive            Disable prompts and SSO login
   --verbose                    Emit diagnostics to stderr
 `)
@@ -756,7 +1184,7 @@ func (a *app) requireConfig(flags globalFlags) (effectiveConfig, bool, error) {
 		return cfg, exists, err
 	}
 	if !exists {
-		if isInteractive() && !cfg.NonInteractive {
+		if a.isInteractive() && !cfg.NonInteractive {
 			if code := a.cmdInit(flags, nil); code != 0 {
 				return cfg, false, errors.New("first-run setup failed")
 			}
@@ -920,6 +1348,9 @@ func writeCache(path string, cache *toolCache) error {
 }
 
 func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, error) {
+	if a.syncToolsFunc != nil {
+		return a.syncToolsFunc(ctx, cfg)
+	}
 	ctx, cancel := context.WithTimeout(ctx, cfg.SyncTimeout)
 	defer cancel()
 	client, err := a.newMCPClient(ctx, cfg, cfg.SyncTimeout)
@@ -946,6 +1377,9 @@ func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, e
 }
 
 func (a *app) callTool(ctx context.Context, cfg effectiveConfig, name string, input map[string]any) ([]byte, error) {
+	if a.callToolFunc != nil {
+		return a.callToolFunc(ctx, cfg, name, input)
+	}
 	ctx, cancel := context.WithTimeout(ctx, cfg.CallTimeout)
 	defer cancel()
 	client, err := a.newMCPClient(ctx, cfg, cfg.CallTimeout)
@@ -1141,6 +1575,24 @@ func normalizeMCPResponse(contentType string, body []byte) []byte {
 		return body
 	}
 	return last
+}
+
+func unwrapMCPTextEnvelope(raw []byte) []byte {
+	var envelope struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return raw
+	}
+	for _, item := range envelope.Content {
+		if item.Type == "text" && item.Text != "" {
+			return []byte(item.Text)
+		}
+	}
+	return raw
 }
 
 type authError struct{ error }
@@ -1706,6 +2158,13 @@ func truthy(v string) bool {
 	default:
 		return false
 	}
+}
+
+func (a *app) isInteractive() bool {
+	if a.interactive != nil {
+		return a.interactive()
+	}
+	return isInteractive()
 }
 
 func isInteractive() bool {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,9 +42,19 @@ func TestValidateURL(t *testing.T) {
 func TestInitParsesPostCommandFlags(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("BORIS_MCP_HOME", home)
+	t.Setenv("HOME", t.TempDir())
 	var stdout, stderr bytes.Buffer
-	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
-	code := a.run([]string{"init", "--url", "http://localhost:8787/mcp", "--no-sync"})
+	a := &app{
+		stdin:  strings.NewReader(""),
+		stdout: &stdout,
+		stderr: &stderr,
+		now:    time.Now,
+		syncToolsFunc: func(context.Context, effectiveConfig) (*toolCache, error) {
+			return &toolCache{Tools: []tool{}}, nil
+		},
+		lookPath: func(string) (string, error) { return "", os.ErrNotExist },
+	}
+	code := a.run([]string{"init", "--url", "http://localhost:8787/mcp"})
 	if code != 0 {
 		t.Fatalf("init exit code %d, stderr: %s", code, stderr.String())
 	}
@@ -59,9 +70,19 @@ func TestInitParsesPostCommandFlags(t *testing.T) {
 func TestInitPromptSaysAWSProfileIsOptional(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("BORIS_MCP_HOME", home)
+	t.Setenv("HOME", t.TempDir())
 	var stdout, stderr bytes.Buffer
-	a := &app{stdin: strings.NewReader("\n\n"), stdout: &stdout, stderr: &stderr, now: time.Now}
-	code := a.run([]string{"init", "--url", "http://localhost:8787/mcp", "--no-sync"})
+	a := &app{
+		stdin:  strings.NewReader("\n\n"),
+		stdout: &stdout,
+		stderr: &stderr,
+		now:    time.Now,
+		syncToolsFunc: func(context.Context, effectiveConfig) (*toolCache, error) {
+			return &toolCache{Tools: []tool{}}, nil
+		},
+		lookPath: func(string) (string, error) { return "", os.ErrNotExist },
+	}
+	code := a.run([]string{"init", "--url", "http://localhost:8787/mcp"})
 	if code != 0 {
 		t.Fatalf("init exit code %d, stderr: %s", code, stderr.String())
 	}
@@ -311,6 +332,392 @@ func TestDescribeUsesDisplayAlias(t *testing.T) {
 	}
 }
 
+func TestInstallClaudeCodeGlobalWritesReferenceAndBackup(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{
+		Name:        "tools___search_aws",
+		Description: "Semantic search across indexed infrastructure, code, and dependency context.",
+	}})
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	claudePath := filepath.Join(claudeDir, "CLAUDE.md")
+	if err := os.WriteFile(claudePath, []byte("existing instructions\n"), 0o644); err != nil {
+		t.Fatalf("write claude: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	code := a.run([]string{"install", "claude-code"})
+	if code != 0 {
+		t.Fatalf("install exit code %d, stderr: %s", code, stderr.String())
+	}
+	instructions, err := os.ReadFile(filepath.Join(claudeDir, "BORIS.md"))
+	if err != nil {
+		t.Fatalf("read BORIS.md: %v", err)
+	}
+	if !strings.Contains(string(instructions), "boris-mcp doctor") {
+		t.Fatalf("missing BORIS guidance: %s", instructions)
+	}
+	if !strings.Contains(string(instructions), "Tools available when these instructions were generated") || !strings.Contains(string(instructions), "`search_aws`: Semantic search") {
+		t.Fatalf("missing dynamic tool catalog: %s", instructions)
+	}
+	if strings.Contains(string(instructions), "boris-mcp --non-interactive") {
+		t.Fatalf("instructions should not prefer non-interactive calls: %s", instructions)
+	}
+	claude, err := os.ReadFile(claudePath)
+	if err != nil {
+		t.Fatalf("read CLAUDE.md: %v", err)
+	}
+	if !strings.Contains(string(claude), "@BORIS.md") {
+		t.Fatalf("CLAUDE.md should reference BORIS.md: %s", claude)
+	}
+	backups, err := filepath.Glob(claudePath + ".bak-*")
+	if err != nil {
+		t.Fatalf("glob backups: %v", err)
+	}
+	if len(backups) != 1 {
+		t.Fatalf("expected one backup, got %#v; stderr: %s", backups, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "backup "+backups[0]) {
+		t.Fatalf("stderr should mention backup, got: %s", stderr.String())
+	}
+}
+
+func TestInstallCodexProjectWritesAgentsReference(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___graph_query", Description: "Read-only topology queries."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	code := a.run([]string{"install", "codex", "--scope", "project"})
+	if code != 0 {
+		t.Fatalf("install exit code %d, stderr: %s", code, stderr.String())
+	}
+	agents, err := os.ReadFile(filepath.Join(dir, "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("read AGENTS.md: %v", err)
+	}
+	if strings.TrimSpace(string(agents)) != "@BORIS.md" {
+		t.Fatalf("unexpected AGENTS.md: %s", agents)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "BORIS.md")); err != nil {
+		t.Fatalf("BORIS.md should exist: %v", err)
+	}
+}
+
+func TestInstallCursorGlobalWritesRule(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___dependency_search", Description: "Search dependency metadata."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	code := a.run([]string{"install", "cursor"})
+	if code != 0 {
+		t.Fatalf("install exit code %d, stderr: %s", code, stderr.String())
+	}
+	rule, err := os.ReadFile(filepath.Join(home, ".cursor", "rules", "boris.mdc"))
+	if err != nil {
+		t.Fatalf("read cursor rule: %v", err)
+	}
+	if !strings.Contains(string(rule), "alwaysApply: true") || !strings.Contains(string(rule), "`dependency_search`: Search dependency metadata.") {
+		t.Fatalf("unexpected cursor rule: %s", rule)
+	}
+}
+
+func TestSyncRefreshesExistingInstructions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___old_tool", Description: "Old description."}})
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(claudeDir, "BORIS.md"), []byte("old instructions\n"), 0o644); err != nil {
+		t.Fatalf("write old instructions: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:  strings.NewReader(""),
+		stdout: &stdout,
+		stderr: &stderr,
+		now:    time.Now,
+		syncToolsFunc: func(context.Context, effectiveConfig) (*toolCache, error) {
+			cache := &toolCache{
+				Version:  1,
+				URL:      "http://localhost:8787/mcp",
+				LastSync: time.Now(),
+				Tools: []tool{{
+					Name:        "tools___new_tool",
+					Description: "Newly synced infrastructure context.",
+					SchemaHash:  "sha256:new",
+				}},
+			}
+			if err := writeCache(filepath.Join(borisHome, "tools.json"), cache); err != nil {
+				t.Fatalf("write cache: %v", err)
+			}
+			return cache, nil
+		},
+	}
+	code := a.run([]string{"sync"})
+	if code != 0 {
+		t.Fatalf("sync exit code %d, stderr: %s", code, stderr.String())
+	}
+	instructions, err := os.ReadFile(filepath.Join(claudeDir, "BORIS.md"))
+	if err != nil {
+		t.Fatalf("read refreshed instructions: %v", err)
+	}
+	if !strings.Contains(string(instructions), "`new_tool`: Newly synced infrastructure context.") {
+		t.Fatalf("instructions were not refreshed: %s", instructions)
+	}
+	if !strings.Contains(stderr.String(), "Refreshed BORIS instructions") {
+		t.Fatalf("stderr should mention refresh, got: %s", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, ".codex", "BORIS.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("sync should not install new codex instructions, stat err: %v", err)
+	}
+}
+
+func setupInstallCatalog(t *testing.T, home string, tools []tool) string {
+	t.Helper()
+	borisHome := filepath.Join(home, ".boris-mcp")
+	t.Setenv("BORIS_MCP_HOME", borisHome)
+	if err := os.MkdirAll(borisHome, 0o700); err != nil {
+		t.Fatalf("mkdir boris home: %v", err)
+	}
+	cfg := configFile{URL: "http://localhost:8787/mcp"}
+	applyDefaults(&cfg)
+	if err := writeConfig(filepath.Join(borisHome, "config.toml"), cfg); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	for i := range tools {
+		if tools[i].InputSchema == nil {
+			tools[i].InputSchema = json.RawMessage(`{"type":"object","properties":{}}`)
+		}
+		if tools[i].SchemaHash == "" {
+			tools[i].SchemaHash = schemaHash(tools[i].InputSchema)
+		}
+	}
+	cache := &toolCache{
+		Version:  1,
+		URL:      cfg.URL,
+		LastSync: time.Now(),
+		Tools:    tools,
+	}
+	if err := writeCache(filepath.Join(borisHome, "tools.json"), cache); err != nil {
+		t.Fatalf("write cache: %v", err)
+	}
+	return borisHome
+}
+
+func TestToolCallUnwrapsEnvelopeByDefaultThroughCLI(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:  strings.NewReader(""),
+		stdout: &stdout,
+		stderr: &stderr,
+		now:    time.Now,
+		callToolFunc: func(_ context.Context, _ effectiveConfig, name string, input map[string]any) ([]byte, error) {
+			if name != "tools___search_aws" {
+				t.Fatalf("tool name mismatch: %s", name)
+			}
+			return []byte(`{"isError":false,"content":[{"type":"text","text":"{\"ok\":true}"}]}`), nil
+		},
+	}
+	code := a.run([]string{"search_aws"})
+	if code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if stdout.String() != "{\"ok\":true}\n" {
+		t.Fatalf("unexpected stdout: %q", stdout.String())
+	}
+}
+
+func TestToolCallRawPreservesEnvelopeThroughCLI(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	var stdout, stderr bytes.Buffer
+	envelope := `{"isError":false,"content":[{"type":"text","text":"{\"ok\":true}"}]}`
+	a := &app{
+		stdin:  strings.NewReader(""),
+		stdout: &stdout,
+		stderr: &stderr,
+		now:    time.Now,
+		callToolFunc: func(context.Context, effectiveConfig, string, map[string]any) ([]byte, error) {
+			return []byte(envelope), nil
+		},
+	}
+	code := a.run([]string{"--raw", "search_aws"})
+	if code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if strings.TrimSpace(stdout.String()) != envelope {
+		t.Fatalf("unexpected raw stdout: %q", stdout.String())
+	}
+}
+
+func TestToolCallPrettyFormatsUnwrappedJSONThroughCLI(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:  strings.NewReader(""),
+		stdout: &stdout,
+		stderr: &stderr,
+		now:    time.Now,
+		callToolFunc: func(context.Context, effectiveConfig, string, map[string]any) ([]byte, error) {
+			return []byte(`{"content":[{"type":"text","text":"{\"ok\":true}"}]}`), nil
+		},
+	}
+	code := a.run([]string{"--pretty", "search_aws"})
+	if code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if stdout.String() != "{\n  \"ok\": true\n}\n" {
+		t.Fatalf("unexpected pretty stdout: %q", stdout.String())
+	}
+}
+
+func TestInitPromptsForDetectedHarnessesDefaultYes(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := filepath.Join(home, ".boris-mcp")
+	t.Setenv("BORIS_MCP_HOME", borisHome)
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:       strings.NewReader("\n\n"),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		interactive: func() bool { return true },
+		lookPath: func(name string) (string, error) {
+			if name == "claude" || name == "codex" || name == "cursor" {
+				return "/bin/" + name, nil
+			}
+			return "", os.ErrNotExist
+		},
+		syncToolsFunc: func(context.Context, effectiveConfig) (*toolCache, error) {
+			return &toolCache{
+				Version:  1,
+				URL:      "http://localhost:8787/mcp",
+				LastSync: time.Now(),
+				Tools:    []tool{{Name: "tools___search_aws", Description: "Search."}},
+			}, nil
+		},
+	}
+	code := a.run([]string{"init", "--url", "http://localhost:8787/mcp"})
+	if code != 0 {
+		t.Fatalf("init exit code %d, stderr: %s", code, stderr.String())
+	}
+	for _, path := range []string{
+		filepath.Join(home, ".claude", "BORIS.md"),
+		filepath.Join(home, ".codex", "BORIS.md"),
+		filepath.Join(home, ".cursor", "rules", "boris.mdc"),
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected install path %s: %v", path, err)
+		}
+	}
+	if strings.Count(stderr.String(), "Install BORIS instructions for") != 3 {
+		t.Fatalf("expected separate prompts for three harnesses, got: %s", stderr.String())
+	}
+}
+
+func TestInitNonInteractiveSkipsHarnessPrompts(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("BORIS_MCP_HOME", filepath.Join(home, ".boris-mcp"))
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		interactive: func() bool { return true },
+		lookPath:    func(string) (string, error) { return "/bin/claude", nil },
+		syncToolsFunc: func(context.Context, effectiveConfig) (*toolCache, error) {
+			return &toolCache{Version: 1, URL: "http://localhost:8787/mcp", LastSync: time.Now()}, nil
+		},
+	}
+	code := a.run([]string{"--non-interactive", "init", "--url", "http://localhost:8787/mcp"})
+	if code != 0 {
+		t.Fatalf("init exit code %d, stderr: %s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Install BORIS instructions") {
+		t.Fatalf("non-interactive init should not prompt, got: %s", stderr.String())
+	}
+	if _, err := os.Stat(filepath.Join(home, ".claude", "BORIS.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("non-interactive init should not install instructions, stat err: %v", err)
+	}
+}
+
+func TestDetectHarnessesUsesConfigDirectories(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".cursor"), 0o700); err != nil {
+		t.Fatalf("mkdir cursor: %v", err)
+	}
+	a := &app{lookPath: func(string) (string, error) { return "", os.ErrNotExist }}
+	got := a.detectHarnesses()
+	if len(got) != 1 || got[0] != "cursor" {
+		t.Fatalf("detectHarnesses mismatch: %#v", got)
+	}
+}
+
+func TestInstallAllAndReferenceIdempotency(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	code := a.run([]string{"install", "all"})
+	if code != 0 {
+		t.Fatalf("install exit code %d, stderr: %s", code, stderr.String())
+	}
+	code = a.run([]string{"install", "claude-code"})
+	if code != 0 {
+		t.Fatalf("second install exit code %d, stderr: %s", code, stderr.String())
+	}
+	claude, err := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md"))
+	if err != nil {
+		t.Fatalf("read CLAUDE.md: %v", err)
+	}
+	if strings.Count(string(claude), "@BORIS.md") != 1 {
+		t.Fatalf("CLAUDE.md should contain one reference, got: %s", claude)
+	}
+	for _, path := range []string{
+		filepath.Join(home, ".codex", "BORIS.md"),
+		filepath.Join(home, ".cursor", "rules", "boris.mdc"),
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected install path %s: %v", path, err)
+		}
+	}
+}
+
+func TestInstallRejectsInvalidScopeAndUnknownHarness(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	if code := a.run([]string{"install", "codex", "--scope", "team"}); code != exitValidation {
+		t.Fatalf("invalid scope exit code %d, stderr: %s", code, stderr.String())
+	}
+	stderr.Reset()
+	if code := a.run([]string{"install", "unknown"}); code != exitValidation {
+		t.Fatalf("unknown harness exit code %d, stderr: %s", code, stderr.String())
+	}
+}
+
 func hasIndentedContinuation(s string) bool {
 	for _, line := range strings.Split(s, "\n") {
 		if strings.HasPrefix(line, "          ") && strings.TrimSpace(line) != "" && !strings.Contains(line, "graph_query") && !strings.Contains(line, "x_amz_bedrock_agentcore_search") {
@@ -397,6 +804,42 @@ func TestNormalizeSSE(t *testing.T) {
 	got := normalizeMCPResponse("text/event-stream", body)
 	if string(got) != `{"jsonrpc":"2.0","id":1,"result":{"ok":true}}` {
 		t.Fatalf("unexpected SSE payload: %s", got)
+	}
+}
+
+func TestUnwrapMCPTextEnvelope(t *testing.T) {
+	raw := []byte(`{"isError":false,"content":[{"type":"text","text":"{\"ok\":true}"}]}`)
+	got := unwrapMCPTextEnvelope(raw)
+	if string(got) != `{"ok":true}` {
+		t.Fatalf("unexpected unwrapped payload: %s", got)
+	}
+}
+
+func TestUnwrapMCPTextEnvelopeFallsBackToRaw(t *testing.T) {
+	raw := []byte(`{"content":[{"type":"image","data":"abc"}]}`)
+	got := unwrapMCPTextEnvelope(raw)
+	if !bytes.Equal(got, raw) {
+		t.Fatalf("expected raw fallback, got: %s", got)
+	}
+}
+
+func TestGeneratedInstructionsDoNotDependOnJQ(t *testing.T) {
+	cache := &toolCache{LastSync: time.Now(), Tools: []tool{{Name: "tools___search_aws", Description: "Find infrastructure context."}}}
+	got := borisInstructionsMarkdown(cache)
+	if strings.Contains(got, "jq") {
+		t.Fatalf("instructions should not depend on jq: %s", got)
+	}
+	if !strings.Contains(got, "requires AWS credentials for any account in the AWS Organization") {
+		t.Fatalf("instructions should explain AWS credential requirement: %s", got)
+	}
+	if strings.Contains(got, "refresh AWS SSO") || strings.Contains(got, "Do not try to fix auth") {
+		t.Fatalf("instructions should not prescribe auth remediation: %s", got)
+	}
+	if !strings.Contains(got, "unwraps MCP text envelopes internally") {
+		t.Fatalf("instructions should explain internal unwrapping: %s", got)
+	}
+	if !strings.Contains(got, "`boris-mcp --raw <tool> ...`") {
+		t.Fatalf("instructions should mention raw debugging mode: %s", got)
 	}
 }
 
