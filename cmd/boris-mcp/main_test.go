@@ -5,12 +5,59 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
 )
+
+type fakeMCP struct {
+	tools      []tool
+	callResult []byte
+}
+
+func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
+	body, _ := io.ReadAll(req.Body)
+	var rpc jsonRPCRequest
+	_ = json.Unmarshal(body, &rpc)
+	header := http.Header{"Content-Type": {"application/json"}}
+	respond := func(payload string) (*http.Response, error) {
+		return &http.Response{StatusCode: 200, Header: header, Body: io.NopCloser(strings.NewReader(payload))}, nil
+	}
+	switch rpc.Method {
+	case "initialize":
+		return respond(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"test","version":"0"}}}`)
+	case "notifications/initialized":
+		return respond("")
+	case "tools/list":
+		toolsOut := make([]map[string]any, 0, len(m.tools))
+		for _, t := range m.tools {
+			toolsOut = append(toolsOut, map[string]any{
+				"name":        t.Name,
+				"description": t.Description,
+				"inputSchema": json.RawMessage(nonEmptySchema(t.InputSchema)),
+			})
+		}
+		result, _ := json.Marshal(map[string]any{"tools": toolsOut})
+		env, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 2, "result": json.RawMessage(result)})
+		return respond(string(env))
+	case "tools/call":
+		env, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 3, "result": json.RawMessage(m.callResult)})
+		return respond(string(env))
+	}
+	return respond(`{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"unexpected"}}`)
+}
+
+func staticCreds() credentialsFunc {
+	return func(context.Context, effectiveConfig) (aws.Credentials, string, error) {
+		return aws.Credentials{AccessKeyID: "AKIATEST", SecretAccessKey: "secret", Source: "test"}, "us-east-1", nil
+	}
+}
 
 func TestValidateURL(t *testing.T) {
 	cases := []struct {
@@ -45,14 +92,13 @@ func TestInitParsesPostCommandFlags(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	var stdout, stderr bytes.Buffer
 	a := &app{
-		stdin:  strings.NewReader(""),
-		stdout: &stdout,
-		stderr: &stderr,
-		now:    time.Now,
-		syncToolsFunc: func(context.Context, effectiveConfig) (*toolCache, error) {
-			return &toolCache{Tools: []tool{}}, nil
-		},
-		lookPath: func(string) (string, error) { return "", os.ErrNotExist },
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		httpClient:  &fakeMCP{},
+		credentials: staticCreds(),
+		lookPath:    func(string) (string, error) { return "", os.ErrNotExist },
 	}
 	code := a.run([]string{"init", "--url", "http://localhost:8787/mcp"})
 	if code != 0 {
@@ -73,14 +119,13 @@ func TestInitPromptSaysAWSProfileIsOptional(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	var stdout, stderr bytes.Buffer
 	a := &app{
-		stdin:  strings.NewReader("\n\n"),
-		stdout: &stdout,
-		stderr: &stderr,
-		now:    time.Now,
-		syncToolsFunc: func(context.Context, effectiveConfig) (*toolCache, error) {
-			return &toolCache{Tools: []tool{}}, nil
-		},
-		lookPath: func(string) (string, error) { return "", os.ErrNotExist },
+		stdin:       strings.NewReader("\n\n"),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		httpClient:  &fakeMCP{},
+		credentials: staticCreds(),
+		lookPath:    func(string) (string, error) { return "", os.ErrNotExist },
 	}
 	code := a.run([]string{"init", "--url", "http://localhost:8787/mcp"})
 	if code != 0 {
@@ -457,7 +502,7 @@ func TestInstallCursorGlobalWritesRule(t *testing.T) {
 func TestSyncRefreshesExistingInstructions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___old_tool", Description: "Old description."}})
+	setupInstallCatalog(t, home, []tool{{Name: "tools___old_tool", Description: "Old description."}})
 	claudeDir := filepath.Join(home, ".claude")
 	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
 		t.Fatalf("mkdir claude: %v", err)
@@ -471,22 +516,10 @@ func TestSyncRefreshesExistingInstructions(t *testing.T) {
 		stdout: &stdout,
 		stderr: &stderr,
 		now:    time.Now,
-		syncToolsFunc: func(context.Context, effectiveConfig) (*toolCache, error) {
-			cache := &toolCache{
-				Version:  1,
-				URL:      "http://localhost:8787/mcp",
-				LastSync: time.Now(),
-				Tools: []tool{{
-					Name:        "tools___new_tool",
-					Description: "Newly synced infrastructure context.",
-					SchemaHash:  "sha256:new",
-				}},
-			}
-			if err := writeCache(filepath.Join(borisHome, "tools.json"), cache); err != nil {
-				t.Fatalf("write cache: %v", err)
-			}
-			return cache, nil
-		},
+		httpClient: &fakeMCP{tools: []tool{
+			{Name: "tools___new_tool", Description: "Newly synced infrastructure context."},
+		}},
+		credentials: staticCreds(),
 	}
 	code := a.run([]string{"sync"})
 	if code != 0 {
@@ -545,16 +578,12 @@ func TestToolCallUnwrapsEnvelopeByDefaultThroughCLI(t *testing.T) {
 	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
 	var stdout, stderr bytes.Buffer
 	a := &app{
-		stdin:  strings.NewReader(""),
-		stdout: &stdout,
-		stderr: &stderr,
-		now:    time.Now,
-		callToolFunc: func(_ context.Context, _ effectiveConfig, name string, input map[string]any) ([]byte, error) {
-			if name != "tools___search_aws" {
-				t.Fatalf("tool name mismatch: %s", name)
-			}
-			return []byte(`{"isError":false,"content":[{"type":"text","text":"{\"ok\":true}"}]}`), nil
-		},
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		httpClient:  &fakeMCP{callResult: []byte(`{"isError":false,"content":[{"type":"text","text":"{\"ok\":true}"}]}`)},
+		credentials: staticCreds(),
 	}
 	code := a.run([]string{"search_aws"})
 	if code != 0 {
@@ -572,13 +601,12 @@ func TestToolCallRawPreservesEnvelopeThroughCLI(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	envelope := `{"isError":false,"content":[{"type":"text","text":"{\"ok\":true}"}]}`
 	a := &app{
-		stdin:  strings.NewReader(""),
-		stdout: &stdout,
-		stderr: &stderr,
-		now:    time.Now,
-		callToolFunc: func(context.Context, effectiveConfig, string, map[string]any) ([]byte, error) {
-			return []byte(envelope), nil
-		},
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		httpClient:  &fakeMCP{callResult: []byte(envelope)},
+		credentials: staticCreds(),
 	}
 	code := a.run([]string{"--raw", "search_aws"})
 	if code != 0 {
@@ -595,13 +623,12 @@ func TestToolCallPrettyFormatsUnwrappedJSONThroughCLI(t *testing.T) {
 	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
 	var stdout, stderr bytes.Buffer
 	a := &app{
-		stdin:  strings.NewReader(""),
-		stdout: &stdout,
-		stderr: &stderr,
-		now:    time.Now,
-		callToolFunc: func(context.Context, effectiveConfig, string, map[string]any) ([]byte, error) {
-			return []byte(`{"content":[{"type":"text","text":"{\"ok\":true}"}]}`), nil
-		},
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		httpClient:  &fakeMCP{callResult: []byte(`{"content":[{"type":"text","text":"{\"ok\":true}"}]}`)},
+		credentials: staticCreds(),
 	}
 	code := a.run([]string{"--pretty", "search_aws"})
 	if code != 0 {
@@ -630,14 +657,10 @@ func TestInitPromptsForDetectedHarnessesDefaultYes(t *testing.T) {
 			}
 			return "", os.ErrNotExist
 		},
-		syncToolsFunc: func(context.Context, effectiveConfig) (*toolCache, error) {
-			return &toolCache{
-				Version:  1,
-				URL:      "http://localhost:8787/mcp",
-				LastSync: time.Now(),
-				Tools:    []tool{{Name: "tools___search_aws", Description: "Search."}},
-			}, nil
-		},
+		httpClient: &fakeMCP{tools: []tool{
+			{Name: "tools___search_aws", Description: "Search."},
+		}},
+		credentials: staticCreds(),
 	}
 	code := a.run([]string{"init", "--url", "http://localhost:8787/mcp"})
 	if code != 0 {
@@ -672,9 +695,8 @@ func TestInitNonInteractiveSkipsHarnessPrompts(t *testing.T) {
 		now:         time.Now,
 		interactive: func() bool { return true },
 		lookPath:    func(string) (string, error) { return "/bin/claude", nil },
-		syncToolsFunc: func(context.Context, effectiveConfig) (*toolCache, error) {
-			return &toolCache{Version: 1, URL: "http://localhost:8787/mcp", LastSync: time.Now()}, nil
-		},
+		httpClient:  &fakeMCP{},
+		credentials: staticCreds(),
 	}
 	code := a.run([]string{"--non-interactive", "init", "--url", "http://localhost:8787/mcp"})
 	if code != 0 {
@@ -696,7 +718,7 @@ func TestDetectHarnessesUsesConfigDirectories(t *testing.T) {
 	}
 	a := &app{lookPath: func(string) (string, error) { return "", os.ErrNotExist }}
 	got := a.detectHarnesses()
-	if len(got) != 1 || got[0] != "cursor" {
+	if len(got) != 1 || got[0].name != "cursor" {
 		t.Fatalf("detectHarnesses mismatch: %#v", got)
 	}
 }
@@ -779,7 +801,7 @@ func TestParseToolFlags(t *testing.T) {
 			}
 		}`),
 	}
-	got, err := parseToolFlags(tl, []string{
+	got, err := tl.ParseFlags([]string{
 		"--service", "api",
 		"--replicas=3",
 		"--dry_run",
@@ -815,14 +837,14 @@ func TestValidateInputErrors(t *testing.T) {
 			"properties":{"service":{"type":"string"},"environment":{"type":"string"}}
 		}`),
 	}
-	err := validateInput(tl, map[string]any{})
+	err := tl.Validate(map[string]any{})
 	if err == nil || !strings.Contains(err.Error(), "Missing required argument: service") {
 		t.Fatalf("missing required error mismatch: %v", err)
 	}
 	if !strings.Contains(err.Error(), "boris-mcp call deploy_service") {
 		t.Fatalf("missing required example should use display alias: %v", err)
 	}
-	err = validateInput(tl, map[string]any{"service": "api", "enviroment": "prod"})
+	err = tl.Validate(map[string]any{"service": "api", "enviroment": "prod"})
 	if err == nil || !strings.Contains(err.Error(), "Did you mean: --environment?") {
 		t.Fatalf("unknown argument suggestion mismatch: %v", err)
 	}
@@ -881,7 +903,7 @@ func TestSchemaDiff(t *testing.T) {
 		Name:        "deploy_service",
 		InputSchema: json.RawMessage(`{"type":"object","required":["target_environment"],"properties":{"target_environment":{"type":"string"},"replicas":{"type":"number"}}}`),
 	}
-	diff := schemaDiff(oldTool, newTool)
+	diff := oldTool.Diff(newTool)
 	kinds := map[string]bool{}
 	for _, change := range diff {
 		kinds[change["kind"]] = true
