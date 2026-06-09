@@ -27,7 +27,48 @@ rough edges at once:
   tool list up front and calls `bmcp describe <tool>` only when it actually
   needs the schema — one tool at a time, on demand.
 
-## Build
+## Install
+
+### Homebrew
+
+```bash
+brew install sirob-tech/boris-mcp-cli/bmcp
+```
+
+Or tap first:
+
+```bash
+brew tap sirob-tech/boris-mcp-cli
+brew install bmcp
+```
+
+### Install script
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sirob-tech/boris-mcp-cli/main/install.sh | sh
+```
+
+Pin a version with `BMCP_VERSION=v0.1.0` or choose an install directory with
+`BMCP_INSTALL_DIR=/usr/local/bin`.
+
+### Manual download
+
+Download the tarball for your platform from
+[GitHub Releases](https://github.com/sirob-tech/boris-mcp-cli/releases) and
+verify it against `checksums.txt`:
+
+```text
+bmcp-darwin-amd64.tar.gz
+bmcp-darwin-arm64.tar.gz
+bmcp-linux-amd64.tar.gz
+bmcp-linux-arm64.tar.gz
+```
+
+Extract and place `bmcp` on your `PATH`.
+
+## Build from source
+
+For development:
 
 ```bash
 go build -o bmcp ./cmd/bmcp

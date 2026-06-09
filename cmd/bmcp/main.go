@@ -11,7 +11,6 @@ import (
 )
 
 const (
-	version        = "0.1.0"
 	defaultTTL     = 168 * time.Hour
 	defaultConnect = 30 * time.Second
 	defaultSync    = 60 * time.Second
@@ -26,6 +25,7 @@ const (
 )
 
 var (
+	version     = "0.1.0"
 	buildCommit = "unknown"
 	buildDate   = "unknown"
 )

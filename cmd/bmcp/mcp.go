@@ -129,7 +129,7 @@ func (a *app) newMCPClient(ctx context.Context, cfg effectiveConfig, timeout tim
 }
 
 func (c *mcpClient) initialize(ctx context.Context) (serverInfo, error) {
-	params := json.RawMessage(`{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"bmcp","version":"0.1.0"}}`)
+	params := json.RawMessage(fmt.Sprintf(`{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"bmcp","version":%q}}`, version))
 	body, err := c.rpc(ctx, jsonRPCRequest{JSONRPC: "2.0", ID: 1, Method: "initialize", Params: params}, true)
 	if err != nil {
 		return serverInfo{}, err
