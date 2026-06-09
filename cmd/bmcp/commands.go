@@ -279,6 +279,7 @@ func (a *app) runCall(flags globalFlags, name string, payload string, readStdin 
 	if err := t.Validate(input); err != nil {
 		return a.fail(flags, exitValidation, "tool_validation_failed", err.Error())
 	}
+	fmt.Fprintf(a.stderr, "Calling %s...\n", displayToolName(t.Name))
 	result, err := a.callTool(context.Background(), cfg, t.Name, input)
 	if err != nil {
 		code := exitSync

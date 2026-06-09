@@ -592,6 +592,9 @@ func TestToolCallUnwrapsEnvelopeByDefaultThroughCLI(t *testing.T) {
 	if stdout.String() != "{\"ok\":true}\n" {
 		t.Fatalf("unexpected stdout: %q", stdout.String())
 	}
+	if !strings.Contains(stderr.String(), "Calling search_aws...") {
+		t.Fatalf("stderr should show call progress, got: %s", stderr.String())
+	}
 }
 
 func TestToolCallRawPreservesEnvelopeThroughCLI(t *testing.T) {
