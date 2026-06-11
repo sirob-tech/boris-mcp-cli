@@ -50,8 +50,8 @@ brews:
   - name: bmcp
     repository:
       owner: sirob-tech
-      name: boris-mcp-cli
-      token: "{{ .Env.GITHUB_TOKEN }}"
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     directory: Formula
     homepage: https://github.com/sirob-tech/boris-mcp-cli
     description: BORIS MCP to CLI converter

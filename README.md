@@ -32,13 +32,13 @@ rough edges at once:
 ### Homebrew
 
 ```bash
-brew install sirob-tech/boris-mcp-cli/bmcp
+brew install sirob-tech/tap/bmcp
 ```
 
 Or tap first:
 
 ```bash
-brew tap sirob-tech/boris-mcp-cli
+brew tap sirob-tech/tap
 brew install bmcp
 ```
 
