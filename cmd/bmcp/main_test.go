@@ -456,7 +456,7 @@ func TestWriteFileWithBackupKeepsOnlyLatestBackup(t *testing.T) {
 	}
 }
 
-func TestInstallCodexProjectWritesAgentsReference(t *testing.T) {
+func TestInstallCodexProjectWritesInlineAgentsInstructions(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 	home := t.TempDir()
@@ -472,10 +472,40 @@ func TestInstallCodexProjectWritesAgentsReference(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read AGENTS.md: %v", err)
 	}
-	if strings.TrimSpace(string(agents)) != "@BORIS.md" {
+	if strings.Contains(string(agents), "@BORIS.md") {
+		t.Fatalf("AGENTS.md should not use a Codex include reference: %s", agents)
+	}
+	if !strings.Contains(string(agents), "<!-- BEGIN BMCP BORIS -->") ||
+		!strings.Contains(string(agents), "bmcp doctor") ||
+		!strings.Contains(string(agents), "`graph_query`: Read-only topology queries.") {
 		t.Fatalf("unexpected AGENTS.md: %s", agents)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "BORIS.md")); err != nil {
+		t.Fatalf("BORIS.md should exist: %v", err)
+	}
+}
+
+func TestInstallCodexGlobalInlinesAgentsInstructions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	code := a.run([]string{"install", "codex"})
+	if code != 0 {
+		t.Fatalf("install exit code %d, stderr: %s", code, stderr.String())
+	}
+	agents, err := os.ReadFile(filepath.Join(home, ".codex", "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("read AGENTS.md: %v", err)
+	}
+	if strings.Contains(string(agents), "@BORIS.md") {
+		t.Fatalf("AGENTS.md should not use a Codex include reference: %s", agents)
+	}
+	if !strings.Contains(string(agents), "bmcp doctor") || !strings.Contains(string(agents), "`search_aws`: Search.") {
+		t.Fatalf("missing inline BORIS guidance: %s", agents)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".codex", "BORIS.md")); err != nil {
 		t.Fatalf("BORIS.md should exist: %v", err)
 	}
 }
@@ -537,6 +567,49 @@ func TestSyncRefreshesExistingInstructions(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, ".codex", "BORIS.md")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("sync should not install new codex instructions, stat err: %v", err)
+	}
+}
+
+func TestSyncMigratesLegacyCodexAgentsReference(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___old_tool", Description: "Old description."}})
+	codexDir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(codexDir, 0o700); err != nil {
+		t.Fatalf("mkdir codex: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "BORIS.md"), []byte("old instructions\n"), 0o644); err != nil {
+		t.Fatalf("write old instructions: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(codexDir, "AGENTS.md"), []byte("personal instructions\n@BORIS.md\n"), 0o644); err != nil {
+		t.Fatalf("write legacy agents: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:  strings.NewReader(""),
+		stdout: &stdout,
+		stderr: &stderr,
+		now:    time.Now,
+		httpClient: &fakeMCP{tools: []tool{
+			{Name: "tools___new_tool", Description: "Newly synced infrastructure context."},
+		}},
+		credentials: staticCreds(),
+	}
+	code := a.run([]string{"sync"})
+	if code != 0 {
+		t.Fatalf("sync exit code %d, stderr: %s", code, stderr.String())
+	}
+	agents, err := os.ReadFile(filepath.Join(codexDir, "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("read AGENTS.md: %v", err)
+	}
+	if strings.Contains(string(agents), "@BORIS.md") {
+		t.Fatalf("legacy Codex reference should be removed: %s", agents)
+	}
+	if !strings.Contains(string(agents), "personal instructions") ||
+		!strings.Contains(string(agents), "<!-- BEGIN BMCP BORIS -->") ||
+		!strings.Contains(string(agents), "`new_tool`: Newly synced infrastructure context.") {
+		t.Fatalf("AGENTS.md was not migrated: %s", agents)
 	}
 }
 

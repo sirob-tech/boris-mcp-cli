@@ -34,9 +34,11 @@ type harness struct {
 }
 
 type harnessFile struct {
-	path      string
-	content   string
-	appendRef string
+	path         string
+	content      string
+	appendRef    string
+	managedBlock string
+	legacyRefs   []string
 }
 
 var harnesses = []harness{
@@ -54,9 +56,15 @@ var harnesses = []harness{
 		name: "codex", displayName: "Codex",
 		bin: "codex", userDir: ".codex",
 		files: func(base string, cache *toolCache) []harnessFile {
+			borisPath := filepath.Join(base, "BORIS.md")
 			return []harnessFile{
-				{path: filepath.Join(base, "BORIS.md"), content: borisInstructionsMarkdown(cache)},
-				{path: filepath.Join(base, "AGENTS.md"), appendRef: "@BORIS.md"},
+				{path: borisPath, content: borisInstructionsMarkdown(cache)},
+				{
+					path:         filepath.Join(base, "AGENTS.md"),
+					content:      borisInstructionsMarkdown(cache),
+					managedBlock: "BORIS",
+					legacyRefs:   []string{"@BORIS.md", "@" + borisPath},
+				},
 			}
 		},
 	},
@@ -94,12 +102,18 @@ func (f harnessFile) install() installFileResult {
 	if f.appendRef != "" {
 		return appendInstructionRef(f.path, f.appendRef)
 	}
+	if f.managedBlock != "" {
+		return writeManagedInstructionBlock(f.path, f.managedBlock, f.content, f.legacyRefs)
+	}
 	return writeInstructionFile(f.path, f.content)
 }
 
 func (f harnessFile) refresh() (installFileResult, bool) {
 	if f.appendRef != "" || !fileExists(f.path) {
 		return installFileResult{}, false
+	}
+	if f.managedBlock != "" {
+		return refreshManagedInstructionBlock(f.path, f.managedBlock, f.content, f.legacyRefs)
 	}
 	return writeInstructionFile(f.path, f.content), true
 }
@@ -237,6 +251,92 @@ func appendInstructionRef(path, ref string) installFileResult {
 		return installFileResult{}
 	}
 	return writeFileWithBackup(path, []byte(ref+"\n"))
+}
+
+func writeManagedInstructionBlock(path, name, content string, legacyRefs []string) installFileResult {
+	old, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return installFileResult{}
+		}
+		return writeFileWithBackup(path, []byte(managedInstructionBlock(name, content)+"\n"))
+	}
+	next := upsertManagedInstructionBlock(string(old), name, content, legacyRefs)
+	return writeFileWithBackup(path, []byte(next))
+}
+
+func refreshManagedInstructionBlock(path, name, content string, legacyRefs []string) (installFileResult, bool) {
+	old, err := os.ReadFile(path)
+	if err != nil {
+		return installFileResult{}, false
+	}
+	if !hasManagedInstructionBlock(string(old), name) && !hasLegacyInstructionRef(string(old), legacyRefs) {
+		return installFileResult{}, false
+	}
+	return writeFileWithBackup(path, []byte(upsertManagedInstructionBlock(string(old), name, content, legacyRefs))), true
+}
+
+func upsertManagedInstructionBlock(old, name, content string, legacyRefs []string) string {
+	block := managedInstructionBlock(name, content)
+	start, end := managedInstructionMarkers(name)
+	if startIndex := strings.Index(old, start); startIndex >= 0 {
+		if endIndex := strings.Index(old[startIndex:], end); endIndex >= 0 {
+			endIndex += startIndex + len(end)
+			next := old[:startIndex] + block + old[endIndex:]
+			return ensureTrailingNewline(next)
+		}
+	}
+
+	cleaned := removeLegacyInstructionRefs(old, legacyRefs)
+	cleaned = strings.TrimRight(cleaned, "\n")
+	if cleaned == "" {
+		return block + "\n"
+	}
+	return cleaned + "\n\n" + block + "\n"
+}
+
+func managedInstructionBlock(name, content string) string {
+	start, end := managedInstructionMarkers(name)
+	return start + "\n" + strings.TrimRight(content, "\n") + "\n" + end
+}
+
+func managedInstructionMarkers(name string) (string, string) {
+	return "<!-- BEGIN BMCP " + name + " -->", "<!-- END BMCP " + name + " -->"
+}
+
+func hasManagedInstructionBlock(content, name string) bool {
+	start, end := managedInstructionMarkers(name)
+	return strings.Contains(content, start) && strings.Contains(content, end)
+}
+
+func hasLegacyInstructionRef(content string, refs []string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		if containsLegacyInstructionRef(line, refs) {
+			return true
+		}
+	}
+	return false
+}
+
+func removeLegacyInstructionRefs(content string, refs []string) string {
+	var kept []string
+	for _, line := range strings.Split(content, "\n") {
+		if containsLegacyInstructionRef(line, refs) {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+func containsLegacyInstructionRef(line string, refs []string) bool {
+	line = strings.TrimSpace(line)
+	for _, ref := range refs {
+		if line == ref {
+			return true
+		}
+	}
+	return false
 }
 
 func writeFileWithBackup(path string, content []byte) installFileResult {

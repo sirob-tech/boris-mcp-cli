@@ -138,13 +138,13 @@ bmcp install cursor --scope project
 User-scope targets:
 
 - Claude Code: `~/.claude/BORIS.md`, referenced from `~/.claude/CLAUDE.md`
-- Codex: `~/.codex/BORIS.md`, referenced from `~/.codex/AGENTS.md`
+- Codex: `~/.codex/BORIS.md`, inlined into a managed block in `~/.codex/AGENTS.md`
 - Cursor: `~/.cursor/rules/boris.mdc`
 
 Project-scope targets:
 
 - Claude Code: `./BORIS.md`, referenced from `./CLAUDE.md`
-- Codex: `./BORIS.md`, referenced from `./AGENTS.md`
+- Codex: `./BORIS.md`, inlined into a managed block in `./AGENTS.md`
 - Cursor: `./.cursor/rules/boris.mdc`
 
 Existing files are modified in place. When a file changes, a timestamped
