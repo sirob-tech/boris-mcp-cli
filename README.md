@@ -16,7 +16,7 @@ rough edges at once:
   inference, and the AWS credential chain live in this binary instead of
   inside each harness's MCP client.
 - **One-step config and install.** `bmcp init` saves config; `bmcp install
-  <claude-code|codex|cursor|all>` drops a small instructions file into each
+  <claude-code|codex|cursor|kiro|all>` drops a small instructions file into each
   harness. No per-harness MCP server registration to maintain.
 - **No separate skill to distribute.** The installer emits a single `BORIS.md`
   whose contents are generated from the live tool catalog, so updating agent
@@ -95,8 +95,9 @@ interactive sessions offers to install agent instructions for detected
 harnesses.
 
 Harness detection checks for a known executable on `PATH` or an existing config
-directory such as `~/.claude`, `~/.codex`, or `~/.cursor`. Each detected harness
-is prompted separately and defaults to yes. Use `--non-interactive` to disable
+directory such as `~/.claude`, `~/.codex`, `~/.cursor`, or `~/.kiro`. Kiro is
+detected from either `kiro-cli` or `kiro` on `PATH`. Each detected harness is
+prompted separately and defaults to yes. Use `--non-interactive` to disable
 prompts.
 
 Additional configuration flags:
@@ -124,6 +125,7 @@ User-global install is the default:
 bmcp install claude-code
 bmcp install codex
 bmcp install cursor
+bmcp install kiro
 bmcp install all
 ```
 
@@ -133,6 +135,7 @@ Project-local install:
 bmcp install claude-code --scope project
 bmcp install codex --scope project
 bmcp install cursor --scope project
+bmcp install kiro --scope project
 ```
 
 User-scope targets:
@@ -140,12 +143,14 @@ User-scope targets:
 - Claude Code: `~/.claude/BORIS.md`, referenced from `~/.claude/CLAUDE.md`
 - Codex: `~/.codex/BORIS.md`, inlined into a managed block in `~/.codex/AGENTS.md`
 - Cursor: `~/.cursor/rules/boris.mdc`
+- Kiro: `~/.kiro/steering/boris.md`
 
 Project-scope targets:
 
 - Claude Code: `./BORIS.md`, referenced from `./CLAUDE.md`
 - Codex: `./BORIS.md`, inlined into a managed block in `./AGENTS.md`
 - Cursor: `./.cursor/rules/boris.mdc`
+- Kiro: `./.kiro/steering/boris.md`
 
 Existing files are modified in place. When a file changes, a timestamped
 `.bak-<timestamp>` backup is created and printed.

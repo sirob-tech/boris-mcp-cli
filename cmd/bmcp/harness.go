@@ -28,8 +28,9 @@ type installResult struct {
 type harness struct {
 	name        string
 	displayName string
-	bin         string
+	bins        []string
 	userDir     string
+	projectDir  string
 	files       func(base string, cache *toolCache) []harnessFile
 }
 
@@ -44,7 +45,7 @@ type harnessFile struct {
 var harnesses = []harness{
 	{
 		name: "claude-code", displayName: "Claude Code",
-		bin: "claude", userDir: ".claude",
+		bins: []string{"claude"}, userDir: ".claude",
 		files: func(base string, cache *toolCache) []harnessFile {
 			return []harnessFile{
 				{path: filepath.Join(base, "BORIS.md"), content: borisInstructionsMarkdown(cache)},
@@ -54,7 +55,7 @@ var harnesses = []harness{
 	},
 	{
 		name: "codex", displayName: "Codex",
-		bin: "codex", userDir: ".codex",
+		bins: []string{"codex"}, userDir: ".codex",
 		files: func(base string, cache *toolCache) []harnessFile {
 			borisPath := filepath.Join(base, "BORIS.md")
 			return []harnessFile{
@@ -70,10 +71,19 @@ var harnesses = []harness{
 	},
 	{
 		name: "cursor", displayName: "Cursor",
-		bin: "cursor", userDir: ".cursor",
+		bins: []string{"cursor"}, userDir: ".cursor",
 		files: func(base string, cache *toolCache) []harnessFile {
 			return []harnessFile{
 				{path: filepath.Join(base, "rules", "boris.mdc"), content: borisCursorRule(cache)},
+			}
+		},
+	},
+	{
+		name: "kiro", displayName: "Kiro",
+		bins: []string{"kiro-cli", "kiro"}, userDir: ".kiro", projectDir: ".kiro",
+		files: func(base string, cache *toolCache) []harnessFile {
+			return []harnessFile{
+				{path: filepath.Join(base, "steering", "boris.md"), content: borisInstructionsMarkdown(cache)},
 			}
 		},
 	},
@@ -135,11 +145,20 @@ func (a *app) promptInstallDetectedHarnesses(reader *bufio.Reader, flags globalF
 func (a *app) detectHarnesses() []harness {
 	var detected []harness
 	for _, h := range harnesses {
-		if a.hasCommand(h.bin) || userDirExists(h.userDir) {
+		if a.hasAnyCommand(h.bins) || userDirExists(h.userDir) {
 			detected = append(detected, h)
 		}
 	}
 	return detected
+}
+
+func (a *app) hasAnyCommand(names []string) bool {
+	for _, name := range names {
+		if a.hasCommand(name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *app) hasCommand(name string) bool {
@@ -190,7 +209,7 @@ func (a *app) installHarness(name, scope string, cache *toolCache) (installResul
 	if !ok {
 		return installResult{}, fmt.Errorf("unknown harness: %s", name)
 	}
-	base, err := installBase(scope, h.userDir)
+	base, err := installBase(scope, h.userDir, h.projectDir)
 	if err != nil {
 		return installResult{}, err
 	}
@@ -201,9 +220,16 @@ func (a *app) installHarness(name, scope string, cache *toolCache) (installResul
 	return result, firstInstallErr(result.Files)
 }
 
-func installBase(scope, userSubdir string) (string, error) {
+func installBase(scope, userSubdir, projectSubdir string) (string, error) {
 	if scope == "project" {
-		return os.Getwd()
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		if projectSubdir != "" {
+			return filepath.Join(cwd, projectSubdir), nil
+		}
+		return cwd, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -435,7 +461,15 @@ func refreshExistingInstructions(cache *toolCache) []installResult {
 			}
 			return filepath.Join(home, h.userDir)
 		}},
-		{"project", func(h harness) string { return cwd }},
+		{"project", func(h harness) string {
+			if cwd == "" {
+				return ""
+			}
+			if h.projectDir != "" {
+				return filepath.Join(cwd, h.projectDir)
+			}
+			return cwd
+		}},
 	}
 	for _, scope := range scopes {
 		for _, h := range harnesses {
