@@ -90,11 +90,25 @@ install() {
 }
 
 verify() {
-  if command -v "$BINARY_NAME" >/dev/null 2>&1; then
-    info "Verification: $($BINARY_NAME version | head -1)"
-  else
-    warn "Binary installed but not in PATH. Add to your shell profile:"
-    warn "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+  INSTALLED_BINARY="${INSTALL_DIR}/${BINARY_NAME}"
+  if [ ! -x "$INSTALLED_BINARY" ]; then
+    error "Installed binary is missing or not executable: $INSTALLED_BINARY"
+  fi
+
+  if ! INSTALLED_VERSION=$("$INSTALLED_BINARY" version 2>&1); then
+    error "Installed binary failed verification: $INSTALLED_BINARY"
+  fi
+  INSTALLED_VERSION=$(printf '%s\n' "$INSTALLED_VERSION" | sed -n '1p')
+  info "Verification: $INSTALLED_VERSION ($INSTALLED_BINARY)"
+
+  ACTIVE_BINARY=$(command -v "$BINARY_NAME" 2>/dev/null || true)
+  if [ -z "$ACTIVE_BINARY" ]; then
+    warn "Binary installed but not in PATH. Add its directory to your shell profile:"
+    warn "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+  elif [ ! "$ACTIVE_BINARY" -ef "$INSTALLED_BINARY" ]; then
+    warn "Another ${BINARY_NAME} takes precedence on PATH: $ACTIVE_BINARY"
+    warn "The newly installed binary is: $INSTALLED_BINARY"
+    warn "Remove the older installation or put ${INSTALL_DIR} before its directory on PATH."
   fi
 }
 
@@ -116,4 +130,6 @@ main() {
   info "Installation complete! Run '$BINARY_NAME init' to configure."
 }
 
-main
+if [ "${BMCP_INSTALLER_TEST_MODE:-0}" != "1" ]; then
+  main
+fi
