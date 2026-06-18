@@ -3,7 +3,6 @@
   "packages": {
     ".": {
       "release-type": "go",
-      "component": "bmcp",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
         "cmd/bmcp/main.go"
