@@ -51,6 +51,32 @@ curl -fsSL https://raw.githubusercontent.com/sirob-tech/boris-mcp-cli/main/insta
 Pin a version with `BMCP_VERSION=v0.1.0` or choose an install directory with
 `BMCP_INSTALL_DIR=/usr/local/bin`.
 
+### Avoid conflicting installations
+
+Use either Homebrew or the install script for routine upgrades. The install
+script defaults to `~/.local/bin`, while Homebrew installs under its own prefix.
+If both exist, whichever directory appears first on `PATH` wins, so a successful
+Homebrew upgrade may still leave an older install-script binary active.
+
+Check all installed copies and the active version with:
+
+```bash
+which -a bmcp
+bmcp version
+```
+
+When switching to Homebrew, remove a previous install-script copy and clear the
+shell command cache:
+
+```bash
+rm ~/.local/bin/bmcp
+hash -r
+```
+
+Only remove that path after confirming it is the old install-script copy. The
+install script verifies the exact binary it writes and warns when another copy
+takes precedence on `PATH`.
+
 ### Manual download
 
 Download the tarball for your platform from
