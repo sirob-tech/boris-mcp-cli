@@ -529,6 +529,46 @@ func TestInstallCursorGlobalWritesRule(t *testing.T) {
 	}
 }
 
+func TestInstallKiroGlobalWritesSteering(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___memory_search", Description: "Search prior decisions."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	code := a.run([]string{"install", "kiro"})
+	if code != 0 {
+		t.Fatalf("install exit code %d, stderr: %s", code, stderr.String())
+	}
+	steering, err := os.ReadFile(filepath.Join(home, ".kiro", "steering", "boris.md"))
+	if err != nil {
+		t.Fatalf("read Kiro steering: %v", err)
+	}
+	if !strings.Contains(string(steering), "bmcp doctor") || !strings.Contains(string(steering), "`memory_search`: Search prior decisions.") {
+		t.Fatalf("unexpected Kiro steering: %s", steering)
+	}
+}
+
+func TestInstallKiroProjectWritesSteering(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___graph_query", Description: "Read topology context."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	code := a.run([]string{"install", "kiro", "--scope", "project"})
+	if code != 0 {
+		t.Fatalf("install exit code %d, stderr: %s", code, stderr.String())
+	}
+	steering, err := os.ReadFile(filepath.Join(dir, ".kiro", "steering", "boris.md"))
+	if err != nil {
+		t.Fatalf("read Kiro steering: %v", err)
+	}
+	if !strings.Contains(string(steering), "`graph_query`: Read topology context.") {
+		t.Fatalf("unexpected Kiro steering: %s", steering)
+	}
+}
+
 func TestSyncRefreshesExistingInstructions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -567,6 +607,44 @@ func TestSyncRefreshesExistingInstructions(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, ".codex", "BORIS.md")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("sync should not install new codex instructions, stat err: %v", err)
+	}
+}
+
+func TestSyncRefreshesExistingKiroSteering(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___old_tool", Description: "Old description."}})
+	kiroDir := filepath.Join(home, ".kiro", "steering")
+	if err := os.MkdirAll(kiroDir, 0o700); err != nil {
+		t.Fatalf("mkdir kiro: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(kiroDir, "boris.md"), []byte("old instructions\n"), 0o644); err != nil {
+		t.Fatalf("write old instructions: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:  strings.NewReader(""),
+		stdout: &stdout,
+		stderr: &stderr,
+		now:    time.Now,
+		httpClient: &fakeMCP{tools: []tool{
+			{Name: "tools___new_tool", Description: "New Kiro context."},
+		}},
+		credentials: staticCreds(),
+	}
+	code := a.run([]string{"sync"})
+	if code != 0 {
+		t.Fatalf("sync exit code %d, stderr: %s", code, stderr.String())
+	}
+	steering, err := os.ReadFile(filepath.Join(kiroDir, "boris.md"))
+	if err != nil {
+		t.Fatalf("read refreshed steering: %v", err)
+	}
+	if !strings.Contains(string(steering), "`new_tool`: New Kiro context.") {
+		t.Fatalf("steering was not refreshed: %s", steering)
+	}
+	if !strings.Contains(stderr.String(), "Refreshed BORIS instructions for Kiro") {
+		t.Fatalf("stderr should mention Kiro refresh, got: %s", stderr.String())
 	}
 }
 
@@ -728,7 +806,7 @@ func TestInitPromptsForDetectedHarnessesDefaultYes(t *testing.T) {
 		now:         time.Now,
 		interactive: func() bool { return true },
 		lookPath: func(name string) (string, error) {
-			if name == "claude" || name == "codex" || name == "cursor" {
+			if name == "claude" || name == "codex" || name == "cursor" || name == "kiro-cli" {
 				return "/bin/" + name, nil
 			}
 			return "", os.ErrNotExist
@@ -746,13 +824,14 @@ func TestInitPromptsForDetectedHarnessesDefaultYes(t *testing.T) {
 		filepath.Join(home, ".claude", "BORIS.md"),
 		filepath.Join(home, ".codex", "BORIS.md"),
 		filepath.Join(home, ".cursor", "rules", "boris.mdc"),
+		filepath.Join(home, ".kiro", "steering", "boris.md"),
 	} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected install path %s: %v", path, err)
 		}
 	}
-	if strings.Count(stderr.String(), "Install BORIS instructions for") != 3 {
-		t.Fatalf("expected separate prompts for three harnesses, got: %s", stderr.String())
+	if strings.Count(stderr.String(), "Install BORIS instructions for") != 4 {
+		t.Fatalf("expected separate prompts for four harnesses, got: %s", stderr.String())
 	}
 	if strings.Contains(stderr.String(), "Refreshed BORIS instructions") {
 		t.Fatalf("interactive init should not refresh instructions before install prompts, got: %s", stderr.String())
@@ -799,6 +878,38 @@ func TestDetectHarnessesUsesConfigDirectories(t *testing.T) {
 	}
 }
 
+func TestDetectHarnessesUsesKiroCommandsAndConfigDirectory(t *testing.T) {
+	for _, command := range []string{"kiro-cli", "kiro"} {
+		t.Run(command, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			a := &app{lookPath: func(name string) (string, error) {
+				if name == command {
+					return "/bin/" + name, nil
+				}
+				return "", os.ErrNotExist
+			}}
+			got := a.detectHarnesses()
+			if len(got) != 1 || got[0].name != "kiro" {
+				t.Fatalf("detectHarnesses mismatch: %#v", got)
+			}
+		})
+	}
+
+	t.Run("config-dir", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		if err := os.MkdirAll(filepath.Join(home, ".kiro"), 0o700); err != nil {
+			t.Fatalf("mkdir kiro: %v", err)
+		}
+		a := &app{lookPath: func(string) (string, error) { return "", os.ErrNotExist }}
+		got := a.detectHarnesses()
+		if len(got) != 1 || got[0].name != "kiro" {
+			t.Fatalf("detectHarnesses mismatch: %#v", got)
+		}
+	})
+}
+
 func TestInstallAllAndReferenceIdempotency(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -823,6 +934,7 @@ func TestInstallAllAndReferenceIdempotency(t *testing.T) {
 	for _, path := range []string{
 		filepath.Join(home, ".codex", "BORIS.md"),
 		filepath.Join(home, ".cursor", "rules", "boris.mdc"),
+		filepath.Join(home, ".kiro", "steering", "boris.md"),
 	} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected install path %s: %v", path, err)

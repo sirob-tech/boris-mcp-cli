@@ -405,10 +405,10 @@ func (a *app) cmdInstall(flags globalFlags, args []string) int {
 		return a.fail(flags, exitValidation, "usage", "--scope must be user or project")
 	}
 	if len(harnesses) == 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: bmcp install <claude-code|codex|cursor|all> [--scope user|project]")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp install <claude-code|codex|cursor|kiro|all> [--scope user|project]")
 	}
 	if len(harnesses) == 1 && harnesses[0] == "all" {
-		harnesses = []string{"claude-code", "codex", "cursor"}
+		harnesses = []string{"claude-code", "codex", "cursor", "kiro"}
 	}
 	for _, harness := range harnesses {
 		result, err := a.installHarnessWithCatalog(flags, harness, scope)
@@ -423,7 +423,7 @@ func (a *app) cmdInstall(flags globalFlags, args []string) int {
 func usage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
   bmcp init [--url <url>] [--profile <profile>]
-  bmcp install <claude-code|codex|cursor|all> [--scope user|project]
+  bmcp install <claude-code|codex|cursor|kiro|all> [--scope user|project]
   bmcp sync
   bmcp doctor
   bmcp list|ls
