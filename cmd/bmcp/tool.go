@@ -179,6 +179,9 @@ func (t tool) ParseFlags(args []string) (map[string]any, error) {
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		if !strings.HasPrefix(arg, "--") {
+			if trimmed := strings.TrimSpace(arg); strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+				return nil, fmt.Errorf("unexpected JSON positional argument: %s\nTo pass JSON args, use the call subcommand:\n  bmcp call %s '%s'", arg, displayToolName(t.Name), arg)
+			}
 			return nil, fmt.Errorf("unexpected positional argument: %s", arg)
 		}
 		raw := strings.TrimPrefix(arg, "--")
@@ -498,9 +501,23 @@ func exampleJSONArgs(s schemaObject) string {
 func exampleFlags(s schemaObject) string {
 	parts := []string{}
 	for _, name := range propertyNames(s.Properties) {
-		parts = append(parts, fmt.Sprintf(" --%s %s", name, exampleValue(s.Properties[name])))
+		parts = append(parts, fmt.Sprintf(" --%s %s", name, exampleFlagValue(s.Properties[name])))
 	}
 	return strings.Join(parts, "")
+}
+
+// exampleFlagValue renders a shell-safe placeholder for the --flag form.
+// Object/array values must be single-quoted JSON so the example is
+// copy-pasteable (an unquoted "{}" is mangled by the shell).
+func exampleFlagValue(p schemaProperty) string {
+	switch typeName(p.Type) {
+	case "object":
+		return `'{"Key":"value"}'`
+	case "array":
+		return `'[]'`
+	default:
+		return exampleValue(p)
+	}
 }
 
 func exampleValue(p schemaProperty) string {
