@@ -1016,6 +1016,20 @@ func TestParseToolFlags(t *testing.T) {
 	}
 }
 
+func TestParseToolFlagsJSONPositionalSuggestsCall(t *testing.T) {
+	tl := tool{
+		Name:        "tools___call_aws_api",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"parameters":{"type":"object"}}}`),
+	}
+	_, err := tl.ParseFlags([]string{`{"account_id":"123"}`})
+	if err == nil {
+		t.Fatal("expected error for JSON positional argument")
+	}
+	if !strings.Contains(err.Error(), "bmcp call call_aws_api") {
+		t.Fatalf("expected suggestion to use the call subcommand, got: %v", err)
+	}
+}
+
 func TestValidateInputErrors(t *testing.T) {
 	tl := tool{
 		Name: "tools___deploy_service",
