@@ -70,6 +70,22 @@ var harnesses = []harness{
 		},
 	},
 	{
+		name: "opencode", displayName: "OpenCode",
+		bins: []string{"opencode"}, userDir: filepath.Join(".config", "opencode"),
+		files: func(base string, cache *toolCache) []harnessFile {
+			borisPath := filepath.Join(base, "BORIS.md")
+			return []harnessFile{
+				{path: borisPath, content: borisInstructionsMarkdown(cache)},
+				{
+					path:         filepath.Join(base, "AGENTS.md"),
+					content:      borisInstructionsMarkdown(cache),
+					managedBlock: "BORIS",
+					legacyRefs:   []string{"@BORIS.md", "@" + borisPath},
+				},
+			}
+		},
+	},
+	{
 		name: "cursor", displayName: "Cursor",
 		bins: []string{"cursor"}, userDir: ".cursor",
 		files: func(base string, cache *toolCache) []harnessFile {

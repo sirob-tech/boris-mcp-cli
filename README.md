@@ -16,8 +16,8 @@ rough edges at once:
   inference, and the AWS credential chain live in this binary instead of
   inside each harness's MCP client.
 - **One-step config and install.** `bmcp init` saves config; `bmcp install
-  <claude-code|codex|cursor|kiro|all>` drops a small instructions file into each
-  harness. No per-harness MCP server registration to maintain.
+  <claude-code|codex|opencode|cursor|kiro|all>` drops a small instructions file
+  into each harness. No per-harness MCP server registration to maintain.
 - **No separate skill to distribute.** The installer emits a single `BORIS.md`
   whose contents are generated from the live tool catalog, so updating agent
   guidance for a new tool is `bmcp sync` — not a new release of a Claude
@@ -121,8 +121,8 @@ interactive sessions offers to install agent instructions for detected
 harnesses.
 
 Harness detection checks for a known executable on `PATH` or an existing config
-directory such as `~/.claude`, `~/.codex`, `~/.cursor`, or `~/.kiro`. Kiro is
-detected from either `kiro-cli` or `kiro` on `PATH`. Each detected harness is
+directory such as `~/.claude`, `~/.codex`, `~/.config/opencode`, `~/.cursor`,
+or `~/.kiro`. Kiro is detected from either `kiro-cli` or `kiro` on `PATH`. Each detected harness is
 prompted separately and defaults to yes. Use `--non-interactive` to disable
 prompts.
 
@@ -150,6 +150,7 @@ User-global install is the default:
 ```bash
 bmcp install claude-code
 bmcp install codex
+bmcp install opencode
 bmcp install cursor
 bmcp install kiro
 bmcp install all
@@ -160,6 +161,7 @@ Project-local install:
 ```bash
 bmcp install claude-code --scope project
 bmcp install codex --scope project
+bmcp install opencode --scope project
 bmcp install cursor --scope project
 bmcp install kiro --scope project
 ```
@@ -168,6 +170,8 @@ User-scope targets:
 
 - Claude Code: `~/.claude/BORIS.md`, referenced from `~/.claude/CLAUDE.md`
 - Codex: `~/.codex/BORIS.md`, inlined into a managed block in `~/.codex/AGENTS.md`
+- OpenCode: `~/.config/opencode/BORIS.md`, inlined into a managed block in
+  `~/.config/opencode/AGENTS.md`
 - Cursor: `~/.cursor/rules/boris.mdc`
 - Kiro: `~/.kiro/steering/boris.md`
 
@@ -175,6 +179,8 @@ Project-scope targets:
 
 - Claude Code: `./BORIS.md`, referenced from `./CLAUDE.md`
 - Codex: `./BORIS.md`, inlined into a managed block in `./AGENTS.md`
+- OpenCode: `./BORIS.md`, inlined into a managed block in `./AGENTS.md`
+  (shared with Codex)
 - Cursor: `./.cursor/rules/boris.mdc`
 - Kiro: `./.kiro/steering/boris.md`
 
