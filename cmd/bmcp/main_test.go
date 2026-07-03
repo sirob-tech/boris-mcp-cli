@@ -510,6 +510,33 @@ func TestInstallCodexGlobalInlinesAgentsInstructions(t *testing.T) {
 	}
 }
 
+func TestInstallOpenCodeGlobalInlinesAgentsInstructions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	code := a.run([]string{"install", "opencode"})
+	if code != 0 {
+		t.Fatalf("install exit code %d, stderr: %s", code, stderr.String())
+	}
+	agents, err := os.ReadFile(filepath.Join(home, ".config", "opencode", "AGENTS.md"))
+	if err != nil {
+		t.Fatalf("read AGENTS.md: %v", err)
+	}
+	if strings.Contains(string(agents), "@BORIS.md") {
+		t.Fatalf("AGENTS.md should not use an include reference: %s", agents)
+	}
+	if !strings.Contains(string(agents), "<!-- BEGIN BMCP BORIS -->") ||
+		!strings.Contains(string(agents), "bmcp doctor") ||
+		!strings.Contains(string(agents), "`search_aws`: Search.") {
+		t.Fatalf("missing inline BORIS guidance: %s", agents)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config", "opencode", "BORIS.md")); err != nil {
+		t.Fatalf("BORIS.md should exist: %v", err)
+	}
+}
+
 func TestInstallCursorGlobalWritesRule(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -806,7 +833,7 @@ func TestInitPromptsForDetectedHarnessesDefaultYes(t *testing.T) {
 		now:         time.Now,
 		interactive: func() bool { return true },
 		lookPath: func(name string) (string, error) {
-			if name == "claude" || name == "codex" || name == "cursor" || name == "kiro-cli" {
+			if name == "claude" || name == "codex" || name == "opencode" || name == "cursor" || name == "kiro-cli" {
 				return "/bin/" + name, nil
 			}
 			return "", os.ErrNotExist
@@ -823,6 +850,7 @@ func TestInitPromptsForDetectedHarnessesDefaultYes(t *testing.T) {
 	for _, path := range []string{
 		filepath.Join(home, ".claude", "BORIS.md"),
 		filepath.Join(home, ".codex", "BORIS.md"),
+		filepath.Join(home, ".config", "opencode", "BORIS.md"),
 		filepath.Join(home, ".cursor", "rules", "boris.mdc"),
 		filepath.Join(home, ".kiro", "steering", "boris.md"),
 	} {
@@ -830,8 +858,8 @@ func TestInitPromptsForDetectedHarnessesDefaultYes(t *testing.T) {
 			t.Fatalf("expected install path %s: %v", path, err)
 		}
 	}
-	if strings.Count(stderr.String(), "Install BORIS instructions for") != 4 {
-		t.Fatalf("expected separate prompts for four harnesses, got: %s", stderr.String())
+	if strings.Count(stderr.String(), "Install BORIS instructions for") != 5 {
+		t.Fatalf("expected separate prompts for five harnesses, got: %s", stderr.String())
 	}
 	if strings.Contains(stderr.String(), "Refreshed BORIS instructions") {
 		t.Fatalf("interactive init should not refresh instructions before install prompts, got: %s", stderr.String())
@@ -874,6 +902,19 @@ func TestDetectHarnessesUsesConfigDirectories(t *testing.T) {
 	a := &app{lookPath: func(string) (string, error) { return "", os.ErrNotExist }}
 	got := a.detectHarnesses()
 	if len(got) != 1 || got[0].name != "cursor" {
+		t.Fatalf("detectHarnesses mismatch: %#v", got)
+	}
+}
+
+func TestDetectHarnessesUsesOpenCodeConfigDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".config", "opencode"), 0o700); err != nil {
+		t.Fatalf("mkdir opencode: %v", err)
+	}
+	a := &app{lookPath: func(string) (string, error) { return "", os.ErrNotExist }}
+	got := a.detectHarnesses()
+	if len(got) != 1 || got[0].name != "opencode" {
 		t.Fatalf("detectHarnesses mismatch: %#v", got)
 	}
 }
@@ -933,6 +974,7 @@ func TestInstallAllAndReferenceIdempotency(t *testing.T) {
 	}
 	for _, path := range []string{
 		filepath.Join(home, ".codex", "BORIS.md"),
+		filepath.Join(home, ".config", "opencode", "BORIS.md"),
 		filepath.Join(home, ".cursor", "rules", "boris.mdc"),
 		filepath.Join(home, ".kiro", "steering", "boris.md"),
 	} {
