@@ -53,6 +53,12 @@ func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
 	return respond(`{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"unexpected"}}`)
 }
 
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("disk full")
+}
+
 type failingDoer struct{}
 
 func (failingDoer) Do(*http.Request) (*http.Response, error) {
@@ -338,7 +344,7 @@ func TestListOutputFormatSpellings(t *testing.T) {
 // catalogs look misaligned.
 func TestRenderToolListIndentsEveryDescriptionLine(t *testing.T) {
 	var out bytes.Buffer
-	renderToolList(&out, []tool{
+	err := renderToolList(&out, []tool{
 		{
 			Name:        "tools___short_name",
 			Description: "Search for relevant context before making changes.",
@@ -348,7 +354,13 @@ func TestRenderToolListIndentsEveryDescriptionLine(t *testing.T) {
 			Description: "Multi-hop queries.\n\nExamples:\n- one",
 		},
 		{Name: "tools___bare"},
+		{Name: "tools___blank", Description: "   \n  "},
+		{Name: "tools___trailing", Description: "Ends with a newline.\n"},
+		{Name: "tools___crlf", Description: "First.\r\nSecond.\r\n"},
 	})
+	if err != nil {
+		t.Fatalf("renderToolList: %v", err)
+	}
 	want := "short_name\n" +
 		"  Search for relevant context before making changes.\n" +
 		"this_name_is_far_too_long_for_the_table_column\n" +
@@ -356,9 +368,34 @@ func TestRenderToolListIndentsEveryDescriptionLine(t *testing.T) {
 		"  \n" +
 		"  Examples:\n" +
 		"  - one\n" +
-		"bare\n"
+		"bare\n" +
+		"blank\n" +
+		"trailing\n" +
+		"  Ends with a newline.\n" +
+		"crlf\n" +
+		"  First.\n" +
+		"  Second.\n"
 	if got := out.String(); got != want {
 		t.Fatalf("layout mismatch:\ngot:\n%q\nwant:\n%q", got, want)
+	}
+}
+
+// A short write must not pass for a complete catalog in either format.
+func TestListReportsOutputWriteFailures(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	for _, output := range []string{"ndjson", "human"} {
+		t.Run(output, func(t *testing.T) {
+			var stderr bytes.Buffer
+			a := &app{stdin: strings.NewReader(""), stdout: failingWriter{}, stderr: &stderr, now: time.Now}
+			if code := a.run([]string{"--non-interactive", "list", "--output", output}); code != exitGeneric {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "disk full") {
+				t.Fatalf("stderr should report the write failure, got: %s", stderr.String())
+			}
+		})
 	}
 }
 

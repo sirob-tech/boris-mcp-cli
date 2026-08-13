@@ -219,11 +219,11 @@ func (a *app) cmdList(flags globalFlags, args []string) int {
 	} else {
 		fmt.Fprintf(a.stderr, "%d tools synced %s\n", len(cache.Tools), cache.LastSync.UTC().Format(time.RFC3339))
 	}
+	write := func() error { return writeToolRecords(a.stdout, cache.Tools, cache.LastSync) }
 	if flags.output == outputHuman {
-		renderToolList(a.stdout, cache.Tools)
-		return 0
+		write = func() error { return renderToolList(a.stdout, cache.Tools) }
 	}
-	if err := writeToolRecords(a.stdout, cache.Tools, cache.LastSync); err != nil {
+	if err := write(); err != nil {
 		return a.fail(flags, exitGeneric, "output_failed", err.Error())
 	}
 	return 0

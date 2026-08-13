@@ -385,17 +385,28 @@ func writeToolRecords(w io.Writer, tools []tool, lastSync time.Time) error {
 
 // renderToolList is the --output human view: names flush left, every
 // description line indented by two spaces. No wrapping — terminal width is
-// unknowable here, and rune counts are not display columns.
-func renderToolList(w io.Writer, tools []tool) {
+// unknowable here, and rune counts are not display columns. Write errors are
+// returned rather than dropped, so a truncated catalog cannot exit 0.
+func renderToolList(w io.Writer, tools []tool) error {
 	for _, t := range tools {
-		fmt.Fprintf(w, "%s\n", displayToolName(t.Name))
-		if t.Description == "" {
+		if _, err := fmt.Fprintf(w, "%s\n", displayToolName(t.Name)); err != nil {
+			return err
+		}
+		// Whitespace-only descriptions have nothing to show. The wrapping
+		// renderer collapsed them away via normalizeWhitespace; without this
+		// guard they would print as indented runs of spaces.
+		if strings.TrimSpace(t.Description) == "" {
 			continue
 		}
-		for _, line := range strings.Split(t.Description, "\n") {
-			fmt.Fprintf(w, "  %s\n", line)
+		// Trailing newlines are dropped — keeping them would put an indented
+		// blank line under every tool whose description ends in one.
+		for _, line := range strings.Split(strings.TrimRight(t.Description, "\r\n"), "\n") {
+			if _, err := fmt.Fprintf(w, "  %s\n", strings.TrimRight(line, "\r")); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 func displayToolName(name string) string {
