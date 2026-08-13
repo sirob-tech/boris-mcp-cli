@@ -208,3 +208,52 @@ bmcp call <tool> '{"arg":"value"}'
 Successful tool calls unwrap MCP text envelopes internally and print the useful
 payload directly. Use `--pretty` to format JSON payloads and `--raw` to inspect
 the original MCP envelope.
+
+### `bmcp list` output
+
+`list` writes NDJSON to stdout — one JSON object per line, nothing else. The
+`%d tools synced <timestamp>` header goes to stderr, so stdout stays parseable
+even when piped through `head`, and an empty catalog is empty stdout with
+exit 0.
+
+```json
+{"name":"tools___search_infrastructure_graph","display_name":"search_infrastructure_graph","description":"Multi-hop, aggregation…","last_sync":"2026-08-13T16:44:41Z"}
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | Full tool name. Always callable — use this to call the tool. Also the only unique key: two namespaces can share a `display_name`. |
+| `display_name` | Short alias with the namespace prefix stripped. Convenience only. |
+| `description` | Verbatim, including authored newlines (JSON-escaped, so one record stays one line). Always present, empty string when the tool has none. |
+| `last_sync` | Catalog sync time in RFC 3339. Omitted when the cache has no timestamp. |
+
+Descriptions are not HTML-escaped, so grepping raw lines for `<region>` works.
+Parse the lines as JSON rather than matching on field or column positions.
+
+Two things worth knowing when consuming this:
+
+- **`head` truncates safely but silently.** Every line is a complete record, so
+  `head -5` never yields invalid JSON — but it does hide tools, without any
+  marker in stdout. The total count is on stderr; compare it if completeness
+  matters.
+- **Pipe records, do not `echo` them.** `echo "$line" | jq` expands the `\n`
+  escapes inside a description and corrupts the JSON. Use `printf '%s'` or feed
+  `jq` the stream directly.
+
+For a human-readable catalog, pass `--output human` — each name flush left with
+its description indented two spaces:
+
+```bash
+bmcp list --output human
+```
+
+`--output` accepts `ndjson` (default), `json` as an alias for it, and `human`.
+Any other value, including an empty `--output=`, exits 5; omitting the value
+(`bmcp list --output`) is a flag-parse error and exits 1, like every other
+value-taking flag.
+
+Only `list` reads it — other commands accept and ignore it. As a global flag it
+always works before the command name. After the command name, `help`, `version`
+and `install` take their arguments verbatim (`install` rejects it outright), as
+does the tool in the `bmcp <tool> --arg value` form. Putting `--output` first is
+always safe.

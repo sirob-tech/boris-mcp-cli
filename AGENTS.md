@@ -8,7 +8,10 @@ Prefixes that trigger a release:
 
 - `feat: ...` → minor bump (`0.1.x` → `0.2.0`)
 - `fix: ...` → patch bump (`0.1.0` → `0.1.1`)
-- `feat!: ...` or any commit body with `BREAKING CHANGE:` → major bump (`0.x.y` → `1.0.0`)
+- `feat!: ...` or any commit body with `BREAKING CHANGE:` → minor bump while the
+  version is below 1.0.0 (`0.3.0` → `0.4.0`), major bump after that (`1.2.3` →
+  `2.0.0`). `bump-minor-pre-major` in `release-please-config.json` is what holds
+  0.x back from jumping straight to 1.0.0.
 
 Prefixes that do **not** trigger a release (still required for clean history):
 

@@ -531,14 +531,14 @@ If ` + "`doctor`" + ` fails on config, tell the user to run ` + "`bmcp init`" + 
 
 Useful commands:
 
-- ` + "`bmcp list`" + `: list available remote tools.
+- ` + "`bmcp list`" + `: list remote tools as NDJSON, one object per line: ` + "`name`" + ` (full name, always callable), ` + "`display_name`" + `, ` + "`description`" + `, ` + "`last_sync`" + `. Call tools by ` + "`name`" + `. Truncating with ` + "`head`" + ` never breaks a line but does hide tools — the total count is on stderr. Add ` + "`--output human`" + ` for indented text.
 - ` + "`bmcp describe <tool>`" + `: show tool schema and examples.
 - ` + "`bmcp <tool> --arg value`" + `: call a tool with CLI flags.
 - ` + "`bmcp call <tool> '{\"arg\":\"value\"}'`" + `: call a tool with JSON.
 - ` + "`bmcp --pretty <tool> ...`" + `: pretty-print JSON output when the tool returns JSON.
 - ` + "`bmcp --raw <tool> ...`" + `: show the original MCP tool envelope for debugging.
 
-Tools available when these instructions were generated:
+Tools available when these instructions were generated (short display names; ` + "`bmcp list`" + ` prints the full ` + "`name`" + ` for each):
 
 ` + renderInstructionToolList(cache) + `
 

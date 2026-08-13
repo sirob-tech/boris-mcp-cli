@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 type serverInfo struct {
@@ -345,22 +344,82 @@ func (t tool) Describe(w io.Writer) {
 	fmt.Fprintf(w, "\nSubcommand:\n  bmcp %s%s\n", displayName, exampleFlags(s))
 }
 
-func renderToolList(w io.Writer, tools []tool) {
-	const descWidth = 88
+// toolRecord is one line of `bmcp list` output. It is deliberately separate from
+// tool: tool is the on-disk cache format, so retagging it would rewrite
+// tools.json.
+// name, display_name and description are always present, so a caller can rely
+// on the shape of every record; only last_sync drops out, and only when the
+// cache has no timestamp to report.
+type toolRecord struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Description string `json:"description"`
+	LastSync    string `json:"last_sync,omitempty"`
+}
+
+// writeToolRecords emits NDJSON: one record per line, descriptions verbatim.
+// Authored newlines survive as JSON escapes, so a record never spans two lines
+// and `head` can never split one.
+func writeToolRecords(w io.Writer, tools []tool, lastSync time.Time) error {
+	stamp := ""
+	if !lastSync.IsZero() {
+		stamp = lastSync.UTC().Format(time.RFC3339)
+	}
+	enc := json.NewEncoder(w)
+	// Descriptions contain <, > and &; escaping them would hide those bytes
+	// from a caller grepping the raw lines.
+	enc.SetEscapeHTML(false)
 	for _, t := range tools {
-		fmt.Fprintf(w, "%s\n", displayToolName(t.Name))
-		desc := normalizeWhitespace(t.Description)
-		if desc == "" {
-			continue
+		record := toolRecord{
+			Name:        t.Name,
+			DisplayName: displayToolName(t.Name),
+			Description: t.Description,
+			LastSync:    stamp,
 		}
-		for _, line := range wrapText(desc, descWidth) {
-			fmt.Fprintf(w, "  %s\n", line)
+		if err := enc.Encode(record); err != nil {
+			return fmt.Errorf("write record for %s: %w", t.Name, err)
 		}
 	}
+	return nil
+}
+
+// renderToolList is the --output human view: names flush left, every
+// description line indented by two spaces. No wrapping — terminal width is
+// unknowable here, and rune counts are not display columns. Write errors are
+// returned rather than dropped, so a truncated catalog cannot exit 0.
+func renderToolList(w io.Writer, tools []tool) error {
+	for _, t := range tools {
+		if _, err := fmt.Fprintf(w, "%s\n", displayToolName(t.Name)); err != nil {
+			return err
+		}
+		// Whitespace-only descriptions have nothing to show. The wrapping
+		// renderer collapsed them away via normalizeWhitespace; without this
+		// guard they would print as indented runs of spaces.
+		if strings.TrimSpace(t.Description) == "" {
+			continue
+		}
+		// Trailing newlines are dropped — keeping them would put a blank line
+		// under every tool whose description ends in one. An interior blank line
+		// stays blank rather than becoming two spaces: there is nothing to indent,
+		// and trailing whitespace is noise in a terminal and in a diff.
+		for _, line := range strings.Split(strings.TrimRight(t.Description, "\r\n"), "\n") {
+			line = strings.TrimRight(line, "\r")
+			if line == "" {
+				if _, err := fmt.Fprintln(w); err != nil {
+					return err
+				}
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "  %s\n", line); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func displayToolName(name string) string {
-	if _, suffix, ok := strings.Cut(name, "___"); ok {
+	if _, suffix, ok := strings.Cut(name, "___"); ok && suffix != "" {
 		return suffix
 	}
 	return name
@@ -529,50 +588,8 @@ func exampleValue(p schemaProperty) string {
 	}
 }
 
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return s[:i]
-	}
-	return s
-}
-
 func normalizeWhitespace(s string) string {
 	return strings.Join(strings.Fields(s), " ")
-}
-
-// Widths are counted in runes, not bytes: tool descriptions are full of em
-// dashes and other multi-byte punctuation, and byte counting under-fills every
-// line that contains one.
-func wrapText(s string, width int) []string {
-	words := strings.Fields(s)
-	if len(words) == 0 {
-		return []string{""}
-	}
-	var lines []string
-	var current strings.Builder
-	currentWidth := 0
-	for _, word := range words {
-		wordWidth := utf8.RuneCountInString(word)
-		if currentWidth == 0 {
-			current.WriteString(word)
-			currentWidth = wordWidth
-			continue
-		}
-		if currentWidth+1+wordWidth <= width {
-			current.WriteByte(' ')
-			current.WriteString(word)
-			currentWidth += 1 + wordWidth
-			continue
-		}
-		lines = append(lines, current.String())
-		current.Reset()
-		current.WriteString(word)
-		currentWidth = wordWidth
-	}
-	if currentWidth > 0 {
-		lines = append(lines, current.String())
-	}
-	return lines
 }
 
 func toFloat(v any) (float64, bool) {
