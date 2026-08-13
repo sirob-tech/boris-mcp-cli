@@ -52,13 +52,19 @@ func (a *app) run(args []string) int {
 		return 0
 	}
 	name, cmdArgs := rest[0], rest[1:]
-	if c, ok := lookupCommand(name); ok {
-		if !c.rawArgs {
-			flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs)
-			if err != nil {
-				return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
-			}
+	c, known := lookupCommand(name)
+	if known && !c.rawArgs {
+		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs)
+		if err != nil {
+			return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 		}
+	}
+	// Validated here rather than in parseFlags: run() collapses every parse
+	// error to exitGeneric, and an unsupported --output is a usage error.
+	if flags.output, err = normalizeOutputFormat(flags.output); err != nil {
+		return a.fail(flags, exitValidation, "invalid_output", err.Error())
+	}
+	if known {
 		return c.run(a, flags, cmdArgs)
 	}
 	return a.cmdDynamic(flags, name, cmdArgs)
@@ -189,9 +195,12 @@ func (a *app) cmdSyncWithRefresh(flags globalFlags, refreshInstructions bool) in
 	return 0
 }
 
+// cmdList writes machine-readable records to stdout and everything else to
+// stderr: callers pipe it through head/grep, so one truncated line must still
+// be a complete, parseable record.
 func (a *app) cmdList(flags globalFlags, args []string) int {
 	if len(args) != 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: bmcp list")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp list [--output ndjson|human]")
 	}
 	cfg, _, err := a.requireConfig(flags)
 	if err != nil {
@@ -201,8 +210,18 @@ func (a *app) cmdList(flags globalFlags, args []string) int {
 	if err != nil {
 		return a.fail(flags, exitSync, "sync_failed", err.Error())
 	}
-	fmt.Fprintf(a.stdout, "%d tools synced %s\n", len(cache.Tools), cache.LastSync.UTC().Format(time.RFC3339))
-	renderToolList(a.stdout, cache.Tools)
+	if cache.LastSync.IsZero() {
+		fmt.Fprintf(a.stderr, "%d tools\n", len(cache.Tools))
+	} else {
+		fmt.Fprintf(a.stderr, "%d tools synced %s\n", len(cache.Tools), cache.LastSync.UTC().Format(time.RFC3339))
+	}
+	if flags.output == outputHuman {
+		renderToolList(a.stdout, cache.Tools)
+		return 0
+	}
+	if err := writeToolRecords(a.stdout, cache.Tools, cache.LastSync); err != nil {
+		return a.fail(flags, exitGeneric, "output_failed", err.Error())
+	}
 	return 0
 }
 
@@ -426,7 +445,7 @@ func usage(w io.Writer) {
   bmcp install <claude-code|codex|opencode|cursor|kiro|all> [--scope user|project]
   bmcp sync
   bmcp doctor
-  bmcp list|ls
+  bmcp list|ls [--output ndjson|human]
   bmcp describe|d <tool>
   bmcp call <tool> ['{"arg":"value"}']
   bmcp <exact_tool_name> --arg value
@@ -437,6 +456,7 @@ Global flags:
   --profile, -p <profile>      Override AWS profile
   --region <region>            Override SigV4 region
   --service <service>          Override SigV4 service
+  --output <ndjson|human>      Format for bmcp list (default ndjson)
   --json                       Emit structured errors
   --pretty                     Pretty-print successful tool JSON
   --raw                        Emit raw MCP tool envelopes

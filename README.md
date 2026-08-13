@@ -208,3 +208,37 @@ bmcp call <tool> '{"arg":"value"}'
 Successful tool calls unwrap MCP text envelopes internally and print the useful
 payload directly. Use `--pretty` to format JSON payloads and `--raw` to inspect
 the original MCP envelope.
+
+### `bmcp list` output
+
+`list` writes NDJSON to stdout — one JSON object per line, nothing else. The
+`%d tools synced <timestamp>` header goes to stderr, so stdout stays parseable
+even when piped through `head`, and an empty catalog is empty stdout with
+exit 0.
+
+```json
+{"name":"tools___search_infrastructure_graph","display_name":"search_infrastructure_graph","description":"Multi-hop, aggregation…","last_sync":"2026-08-13T16:44:41Z"}
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | Full tool name. Always callable — use this to call the tool. |
+| `display_name` | Short alias with the namespace prefix stripped. Convenience only. |
+| `description` | Verbatim, including authored newlines (JSON-escaped, so one record stays one line). |
+| `last_sync` | Catalog sync time in RFC 3339. Omitted when the cache has no timestamp. |
+
+Descriptions are not HTML-escaped, so grepping raw lines for `<region>` works.
+Field order is stable, but parse the lines as JSON rather than matching on
+column positions.
+
+For a human-readable catalog, pass `--output human` — each name flush left with
+its description indented two spaces:
+
+```bash
+bmcp list --output human
+```
+
+`--output` accepts `ndjson` (default), `json` as an alias for it, and `human`.
+It applies to `list`; other commands accept it and ignore it. It is a global
+flag, so it must come before the tool name in the `bmcp <tool> --arg value`
+form, which passes everything after the tool name to the tool itself.

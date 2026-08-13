@@ -236,39 +236,105 @@ func TestMCPProtocolVersionHeaderAlwaysSet(t *testing.T) {
 	}
 }
 
-func TestRenderToolListWrapsDescriptions(t *testing.T) {
-	var out bytes.Buffer
-	renderToolList(&out, []tool{
-		{
-			Name:        "tools___graph_query",
-			Description: "Execute read-only Cypher queries against the Memgraph graph database to explore infrastructure relationships.",
-		},
-		{
-			Name:        "x_amz_bedrock_agentcore_search",
-			Description: "A special tool that returns a trimmed down list of tools given a context. Use this tool only when there are many tools available and you want to get a subset that matches the provided context.",
-		},
+// Agents pipe `bmcp list` through head/grep, so stdout must carry nothing but
+// one self-contained record per tool.
+func TestListEmitsOneNDJSONRecordPerTool(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{
+		{Name: "tools___search_aws", Description: "Semantic search — scope it with <region> & tags."},
+		{Name: "tools___search_infrastructure_graph", Description: "Multi-hop queries.\n\nExamples:\n- one\n- two"},
 	})
-	got := out.String()
-	if !strings.Contains(got, "graph_query") {
-		t.Fatalf("missing first tool: %s", got)
+	cache, err := readCache(filepath.Join(borisHome, "tools.json"))
+	if err != nil {
+		t.Fatalf("readCache: %v", err)
 	}
-	if strings.Contains(got, "tools___graph_query") {
-		t.Fatalf("list should use shortened display names, got:\n%s", got)
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	if code := a.run([]string{"--non-interactive", "list"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
 	}
-	if strings.Contains(got, "Execute read-only Cypher queries against the Memgraph graph database to explore infrastructure relationships.") {
-		t.Fatalf("description should be wrapped, got:\n%s", got)
+	lines := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected one record per tool, got %d lines:\n%s", len(lines), stdout.String())
 	}
-	for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
-		if !strings.HasPrefix(line, "  ") && !isToolNameLine(line) {
-			t.Fatalf("every non-name line should be indented by two spaces, got:\n%s", got)
+	var records []toolRecord
+	for _, line := range lines {
+		var rec toolRecord
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Fatalf("line is not valid JSON: %q: %v", line, err)
 		}
+		records = append(records, rec)
+	}
+	want := []toolRecord{
+		{
+			Name:        "tools___search_aws",
+			DisplayName: "search_aws",
+			Description: "Semantic search — scope it with <region> & tags.",
+			LastSync:    cache.LastSync.UTC().Format(time.RFC3339),
+		},
+		{
+			Name:        "tools___search_infrastructure_graph",
+			DisplayName: "search_infrastructure_graph",
+			Description: "Multi-hop queries.\n\nExamples:\n- one\n- two",
+			LastSync:    cache.LastSync.UTC().Format(time.RFC3339),
+		},
+	}
+	for i, rec := range records {
+		if rec != want[i] {
+			t.Fatalf("record %d mismatch:\n got: %#v\nwant: %#v", i, rec, want[i])
+		}
+	}
+	// An agent grepping raw lines for <region> must find it, so HTML escaping
+	// stays off.
+	if !strings.Contains(stdout.String(), "<region> & tags") {
+		t.Fatalf("angle brackets and ampersands should not be \\u-escaped, got:\n%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "2 tools synced") {
+		t.Fatalf("count header belongs on stderr, got: %s", stderr.String())
 	}
 }
 
-// Names sit flush left and descriptions are indented under them, no matter how
-// long the name is — a length-dependent layout switch made mixed catalogs look
-// misaligned.
-func TestRenderToolListUsesOneLayoutForShortAndLongNames(t *testing.T) {
+func TestListOutputJSONIsAliasForNDJSON(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	cache, err := readCache(filepath.Join(borisHome, "tools.json"))
+	if err != nil {
+		t.Fatalf("readCache: %v", err)
+	}
+	var want bytes.Buffer
+	if err := writeToolRecords(&want, cache.Tools, cache.LastSync); err != nil {
+		t.Fatalf("writeToolRecords: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	if code := a.run([]string{"--non-interactive", "list", "--output", "json"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if stdout.String() != want.String() {
+		t.Fatalf("--output json should match ndjson:\n got: %q\nwant: %q", stdout.String(), want.String())
+	}
+}
+
+func TestListOutputHumanRendersTextNotJSON(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	if code := a.run([]string{"--non-interactive", "list", "--output", "human"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if got := stdout.String(); got != "search_aws\n  Search.\n" {
+		t.Fatalf("human output mismatch: %q", got)
+	}
+}
+
+// Names sit flush left and every description line is indented under them, no
+// matter how long the name is — a length-dependent layout switch made mixed
+// catalogs look misaligned.
+func TestRenderToolListIndentsEveryDescriptionLine(t *testing.T) {
 	var out bytes.Buffer
 	renderToolList(&out, []tool{
 		{
@@ -277,35 +343,66 @@ func TestRenderToolListUsesOneLayoutForShortAndLongNames(t *testing.T) {
 		},
 		{
 			Name:        "tools___this_name_is_far_too_long_for_the_table_column",
-			Description: "Search for relevant context before making changes.",
+			Description: "Multi-hop queries.\n\nExamples:\n- one",
 		},
+		{Name: "tools___bare"},
 	})
 	want := "short_name\n" +
 		"  Search for relevant context before making changes.\n" +
 		"this_name_is_far_too_long_for_the_table_column\n" +
-		"  Search for relevant context before making changes.\n"
+		"  Multi-hop queries.\n" +
+		"\n" +
+		"  Examples:\n" +
+		"  - one\n" +
+		"bare\n"
 	if got := out.String(); got != want {
 		t.Fatalf("layout mismatch:\ngot:\n%s\nwant:\n%s", got, want)
 	}
 }
 
-func TestWrapTextMeasuresRunesNotBytes(t *testing.T) {
-	// Each em dash is three bytes but one column; byte counting would break
-	// this line early instead of filling the full width.
-	got := wrapText("aaa — bbb — ccc — ddd", 21)
-	if len(got) != 1 || got[0] != "aaa — bbb — ccc — ddd" {
-		t.Fatalf("expected one full-width line, got %q", got)
+// Empty stdout is the signal for an empty catalog; a non-zero exit would trip
+// `set -e` and read as "BORIS is broken".
+func TestListEmptyCatalogExitsZeroWithEmptyStdout(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, nil)
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	if code := a.run([]string{"--non-interactive", "list"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
 	}
-	if got := wrapText("aaa — bbb — ccc — ddd", 20); len(got) != 2 {
-		t.Fatalf("expected a wrap one column below the fit, got %q", got)
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout should be empty, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "0 tools") {
+		t.Fatalf("stderr should report an empty catalog, got: %s", stderr.String())
 	}
 }
 
-func TestRenderToolListPrintsNameOnlyWhenDescriptionIsEmpty(t *testing.T) {
+func TestToolRecordsOmitLastSyncWhenCacheHasNoTimestamp(t *testing.T) {
 	var out bytes.Buffer
-	renderToolList(&out, []tool{{Name: "tools___bare"}})
-	if got := out.String(); got != "bare\n" {
-		t.Fatalf("bare name mismatch: %q", got)
+	if err := writeToolRecords(&out, []tool{{Name: "tools___search_aws"}}, time.Time{}); err != nil {
+		t.Fatalf("writeToolRecords: %v", err)
+	}
+	if got := out.String(); got != `{"name":"tools___search_aws","display_name":"search_aws"}`+"\n" {
+		t.Fatalf("zero last_sync should be omitted, got: %q", got)
+	}
+}
+
+// parseFlags maps every error to exitGeneric, so --output has to be validated
+// in run() before any command touches config or the network.
+func TestInvalidOutputValueFailsValidationBeforeDispatch(t *testing.T) {
+	t.Setenv("BMCP_HOME", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	if code := a.run([]string{"--output", "bogus", "sync"}); code != exitValidation {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("stdout should be empty, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "--output") {
+		t.Fatalf("stderr should name the offending flag, got: %s", stderr.String())
 	}
 }
 
@@ -1029,10 +1126,6 @@ func TestInstallRejectsInvalidScopeAndUnknownHarness(t *testing.T) {
 	if code := a.run([]string{"install", "unknown"}); code != exitValidation {
 		t.Fatalf("unknown harness exit code %d, stderr: %s", code, stderr.String())
 	}
-}
-
-func isToolNameLine(line string) bool {
-	return line == "graph_query" || line == "x_amz_bedrock_agentcore_search"
 }
 
 func TestSchemaHashCanonicalizesObjectKeys(t *testing.T) {

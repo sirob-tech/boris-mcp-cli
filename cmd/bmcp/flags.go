@@ -10,12 +10,32 @@ type globalFlags struct {
 	profile        string
 	region         string
 	service        string
+	output         string
 	jsonOut        bool
 	pretty         bool
 	raw            bool
 	nonInteractive bool
 	verbose        bool
 	allowHTTP      bool
+}
+
+const (
+	outputNDJSON = "ndjson"
+	outputHuman  = "human"
+)
+
+// normalizeOutputFormat resolves --output to a canonical value. An empty value
+// means the flag was not passed, and `json` is accepted as an alias because the
+// records are JSON — just one object per line.
+func normalizeOutputFormat(v string) (string, error) {
+	switch v {
+	case "", outputNDJSON, "json":
+		return outputNDJSON, nil
+	case outputHuman:
+		return outputHuman, nil
+	default:
+		return v, fmt.Errorf("invalid --output value: %s\nSupported values: ndjson (default), json, human", v)
+	}
 }
 
 type flagScope int
@@ -101,6 +121,14 @@ func parseFlags(flags globalFlags, args []string, scope flagScope) (globalFlags,
 			flags.service = v
 		case strings.HasPrefix(arg, "--service="):
 			flags.service = strings.TrimPrefix(arg, "--service=")
+		case arg == "--output":
+			v, err := next(arg)
+			if err != nil {
+				return flags, nil, err
+			}
+			flags.output = v
+		case strings.HasPrefix(arg, "--output="):
+			flags.output = strings.TrimPrefix(arg, "--output=")
 		default:
 			if scope == scopeGlobal {
 				return flags, nil, fmt.Errorf("unknown global flag: %s", arg)

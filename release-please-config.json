@@ -4,6 +4,7 @@
     ".": {
       "release-type": "go",
       "changelog-path": "CHANGELOG.md",
+      "bump-minor-pre-major": true,
       "extra-files": [
         "cmd/bmcp/main.go"
       ]
