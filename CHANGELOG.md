@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.4.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.3.0...v0.4.0) (2026-08-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* `bmcp list` writes NDJSON to stdout instead of two-column text, and the tool-count header moves from stdout to stderr. Pass `--output human` for text output.
+
+### Features
+
+* emit `bmcp list` as NDJSON ([#15](https://github.com/sirob-tech/boris-mcp-cli/issues/15)) ([88cb42c](https://github.com/sirob-tech/boris-mcp-cli/commit/88cb42c02521d037e59854c304cd31c169d90a04)), closes [#11](https://github.com/sirob-tech/boris-mcp-cli/issues/11)
+
+
+### Bug Fixes
+
+* render every tool in `bmcp list` with the same layout ([#9](https://github.com/sirob-tech/boris-mcp-cli/issues/9)) ([af63d72](https://github.com/sirob-tech/boris-mcp-cli/commit/af63d72737048a681a9d1ff3cba9dd8c7efd579a))
+
 ## [0.3.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.2.0...v0.3.0) (2026-07-03)
 
 
