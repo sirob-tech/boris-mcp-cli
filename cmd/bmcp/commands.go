@@ -16,15 +16,28 @@ import (
 type command struct {
 	names   []string
 	rawArgs bool
-	run     func(*app, globalFlags, []string) int
+	// autoUpdate marks the commands that may check for and apply an update.
+	// Tool calls are deliberately excluded: they must never pay for a network
+	// round trip, let alone a binary swap.
+	autoUpdate bool
+	// ownsUpdateFlags admits --check/--to/--rollback for this command only.
+	ownsUpdateFlags bool
+	run             func(*app, globalFlags, []string) int
 }
 
+// The auto-update hook hangs off this table rather than off the command
+// functions themselves, which is what makes "tool calls never update" true.
+// cmdInit is also reachable from requireConfig, so a first-run `bmcp list`
+// would otherwise trigger an update through the first-run setup path; and
+// cmdInit calls cmdSyncWithRefresh, so hooking that shared function would fire
+// twice for every init. Dispatch is the only place that sees the difference.
 var commands = []command{
 	{names: []string{"help", "-h", "--help"}, rawArgs: true, run: (*app).cmdHelp},
 	{names: []string{"version"}, rawArgs: true, run: (*app).cmdVersion},
-	{names: []string{"init"}, run: (*app).cmdInit},
-	{names: []string{"sync"}, run: (*app).cmdSync},
-	{names: []string{"doctor"}, run: (*app).cmdDoctor},
+	{names: []string{"init"}, autoUpdate: true, run: (*app).cmdInit},
+	{names: []string{"sync"}, autoUpdate: true, run: (*app).cmdSync},
+	{names: []string{"doctor"}, autoUpdate: true, run: (*app).cmdDoctor},
+	{names: []string{"update"}, ownsUpdateFlags: true, run: (*app).cmdUpdate},
 	{names: []string{"list", "ls"}, run: (*app).cmdList},
 	{names: []string{"describe", "d"}, run: (*app).cmdDescribe},
 	{names: []string{"call"}, run: (*app).cmdCall},
@@ -61,7 +74,11 @@ func (a *app) run(args []string) int {
 	name, cmdArgs := rest[0], rest[1:]
 	c, known := lookupCommand(name)
 	if known && !c.rawArgs {
-		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs)
+		scope := scopePostCommand
+		if c.ownsUpdateFlags {
+			scope = scopeUpdate
+		}
+		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs, scope)
 		if err != nil {
 			return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 		}
@@ -70,6 +87,9 @@ func (a *app) run(args []string) int {
 		}
 	}
 	if known {
+		if c.autoUpdate {
+			a.maybeAutoUpdate(flags)
+		}
 		return c.run(a, flags, cmdArgs)
 	}
 	return a.cmdDynamic(flags, name, cmdArgs)
@@ -168,6 +188,14 @@ func (a *app) cmdHelp(flags globalFlags, args []string) int {
 
 func (a *app) cmdVersion(flags globalFlags, args []string) int {
 	fmt.Fprintf(a.stdout, "bmcp %s\ncommit: %s\nbuilt: %s\n", version, buildCommit, buildDate)
+	// Without this line, "bmcp broke" reports after a self-update arrive with no
+	// way to tell which version replaced which, or when.
+	if path, err := a.resolveExecutable(); err == nil {
+		if receipt, err := readInstallReceipt(path); err == nil && len(receipt.Updates) > 0 {
+			last := receipt.Updates[len(receipt.Updates)-1]
+			fmt.Fprintf(a.stdout, "updated: %s -> %s at %s\n", last.From, last.To, last.At)
+		}
+	}
 	return 0
 }
 
@@ -396,14 +424,50 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 			}
 		}
 	}
+	// The update state is reported outside `checks` on purpose. add() feeds
+	// allChecksOK, which drives the exit code, so routing it through there
+	// would let a GitHub outage make doctor exit 1 — and BORIS.md tells agents
+	// to read a failing doctor as "BORIS is broken" and stop.
+	st := a.update
+	// The one update failure that must reach the exit code. A GitHub outage is
+	// not a BORIS outage, but "the swap left no working binary at this path" is
+	// not something to report as an informational row and exit 0 on.
+	if st != nil && errors.Is(st.Err, errUpdateCorrupted) {
+		add("update", false, st.Err.Error())
+	}
 	if flags.jsonOut {
-		out, _ := json.MarshalIndent(map[string]any{"ok": allChecksOK(checks), "checks": checks}, "", "  ")
+		payload := map[string]any{"ok": allChecksOK(checks), "checks": checks}
+		if st != nil {
+			payload["update"] = st.updateJSON()
+		}
+		out, _ := json.MarshalIndent(payload, "", "  ")
 		fmt.Fprintln(a.stderr, string(out))
+	} else if st != nil {
+		fmt.Fprintf(a.stdout, "%-18s %s  %s\n", "version", "ok", a.updateSummary(st))
 	}
 	if !allChecksOK(checks) {
 		return exitGeneric
 	}
 	return 0
+}
+
+func (a *app) updateSummary(st *updateState) string {
+	switch {
+	case st.Kind == installSource:
+		return fmt.Sprintf("%s (built from source)", st.Current)
+	case st.Applied:
+		return fmt.Sprintf("updated %s -> %s, active next run", st.Current, st.Target)
+	case st.Err != nil && st.Stage == updateStageApply:
+		return fmt.Sprintf("%s (update failed: %v)", st.Current, st.Err)
+	case st.Err != nil:
+		return fmt.Sprintf("%s (update check failed: %v)", st.Current, st.Err)
+	case !st.Checked:
+		return st.Current
+	case st.Available:
+		return fmt.Sprintf("%s, %s available (run: %s)", st.Current, st.Target, st.Action)
+	default:
+		return fmt.Sprintf("%s (latest)", st.Current)
+	}
 }
 
 func (a *app) cmdInstall(flags globalFlags, args []string) int {
@@ -455,9 +519,16 @@ func usage(w io.Writer) {
   bmcp describe|d <tool>
   bmcp call <tool> ['{"arg":"value"}']
   bmcp <exact_tool_name> --arg value
+  bmcp update [--check] [--to <version>] [--rollback]
   bmcp version
 
+Flags for bmcp update:
+  --check                      Report whether an update is available, apply nothing
+  --to <version>               Update to this exact version, downgrading if needed
+  --rollback                   Restore the binary the last update replaced
+
 Global flags:
+  --no-auto-update             Do not update automatically during this command
   --url, -u <url>              Override BORIS MCP URL
   --profile, -p <profile>      Override AWS profile
   --region <region>            Override SigV4 region

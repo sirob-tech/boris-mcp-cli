@@ -76,3 +76,24 @@ Do not use GitHub's "re-run jobs" button. It replays the workflow as it existed
 at the tag, so a release broken by a pipeline bug gets retried by the same
 broken pipeline. Uploads are idempotent (`replace_existing_artifacts`), and a
 successful run promotes the tag back to Latest — no deleting or re-tagging.
+
+## Releases reach machines by themselves
+
+Installed binaries self-update, so a release is not a thing users opt into — it
+propagates on its own the next time any machine runs `bmcp doctor`, `bmcp sync`,
+or `bmcp init`. Two consequences worth holding onto:
+
+- **Signing is a precondition, not a nicety.** `.goreleaser.yaml` signs
+  unconditionally and `release.yml` refuses to publish without the signing
+  secrets. An unsigned release is one that macOS clients will eventually refuse
+  to install, once `codesignFailClosed` is enabled in `cmd/bmcp/update.go`.
+- **`bump-minor-pre-major: true` means breaking changes are minor bumps**, so
+  no semver gate can express "safe to apply unattended". A `feat!:` merged today
+  reaches every machine automatically. If a change would break a caller's
+  scripts, say so in the release notes and consider whether it should wait.
+
+The blast radius of a bad release is quiet: if it makes `bmcp doctor` exit
+non-zero, agents read that as "BORIS is broken" and simply stop using it. No
+pipeline turns red. `bmcp update --rollback` restores the previous binary on a
+single machine; marking a release `prerelease: true` stops it spreading further
+but does not heal machines that already took it.

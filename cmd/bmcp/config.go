@@ -11,10 +11,16 @@ import (
 )
 
 type configFile struct {
-	URL            string
-	AWSProfile     string
-	Region         string
-	Service        string
+	URL        string
+	AWSProfile string
+	Region     string
+	Service    string
+	// AutoUpdate is the raw `auto_update` value rather than a bool because the
+	// default is on: absent has to stay distinguishable from an explicit
+	// "false", or writeConfig would stamp today's default into every config it
+	// rewrites and silently pin the user to it. Parsed at use by
+	// parseStrictBool, which keeps configFile comparable for the round-trip test.
+	AutoUpdate     string
 	SyncTTL        time.Duration
 	ConnectTimeout time.Duration
 	SyncTimeout    time.Duration
@@ -34,6 +40,13 @@ type effectiveConfig struct {
 	SyncTimeout    time.Duration
 	CallTimeout    time.Duration
 	NonInteractive bool
+	AutoUpdate     bool
+	// PinnedVersion is BMCP_VERSION. It names the version `bmcp update` should
+	// converge to, downgrading if needed, so a machine carrying a bad release
+	// can be healed rather than frozen on it. Auto-update never acts on it:
+	// silently downgrading a binary nobody asked to downgrade is worse than
+	// reporting the gap and letting an explicit `bmcp update` close it.
+	PinnedVersion string
 }
 
 func defaultEffective(flags globalFlags) effectiveConfig {
@@ -48,7 +61,41 @@ func defaultEffective(flags globalFlags) effectiveConfig {
 		URL: flags.url, Profile: flags.profile, Region: flags.region, Service: flags.service,
 		SyncTTL: defaultTTL, ConnectTimeout: defaultConnect, SyncTimeout: defaultSync, CallTimeout: defaultCall,
 		NonInteractive: flags.nonInteractive || truthy(os.Getenv("BMCP_NON_INTERACTIVE")),
+		AutoUpdate:     true,
+		PinnedVersion:  strings.TrimSpace(os.Getenv("BMCP_VERSION")),
 	}
+}
+
+// resolveAutoUpdate applies flag > env > file > default(on).
+//
+// A value that parses as neither true nor false is reported and ignored rather
+// than treated as false: a typo in `auto_update` must not be the thing that
+// quietly stops a fleet from receiving updates.
+func (a *app) resolveAutoUpdate(flags globalFlags, fileValue string) bool {
+	enabled := true
+	consider := func(raw, source string) {
+		if strings.TrimSpace(raw) == "" {
+			return
+		}
+		v, ok := parseStrictBool(raw)
+		if !ok {
+			// Once per process: loadEffective runs several times per command
+			// (auto-update, then the command itself), and repeating a config
+			// warning three times reads as three distinct problems.
+			if !a.warnedAutoUpdate {
+				a.warnedAutoUpdate = true
+				fmt.Fprintf(a.stderr, "Ignoring %s: %q is not a boolean (use true or false)\n", source, raw)
+			}
+			return
+		}
+		enabled = v
+	}
+	consider(fileValue, "auto_update in config")
+	consider(os.Getenv("BMCP_AUTO_UPDATE"), "BMCP_AUTO_UPDATE")
+	if flags.noAutoUpdate {
+		enabled = false
+	}
+	return enabled
 }
 
 func (a *app) loadEffective(flags globalFlags, require bool) (effectiveConfig, bool, error) {
@@ -76,6 +123,7 @@ func (a *app) loadEffective(flags globalFlags, require bool) (effectiveConfig, b
 	if flags.service == "" {
 		cfg.Service = firstNonEmpty(os.Getenv("BMCP_SERVICE"), fileCfg.Service)
 	}
+	cfg.AutoUpdate = a.resolveAutoUpdate(flags, fileCfg.AutoUpdate)
 	cfg.SyncTTL = durationFromEnv("BMCP_SYNC_TTL", fileCfg.SyncTTL)
 	cfg.ConnectTimeout = durationFromEnv("BMCP_CONNECT_TIMEOUT", fileCfg.ConnectTimeout)
 	cfg.SyncTimeout = durationFromEnv("BMCP_SYNC_TIMEOUT", fileCfg.SyncTimeout)
@@ -143,6 +191,8 @@ func readConfig(path string) (configFile, error) {
 			cfg.Region = val
 		case "service":
 			cfg.Service = val
+		case "auto_update":
+			cfg.AutoUpdate = val
 		case "sync_ttl":
 			if d, err := time.ParseDuration(val); err == nil {
 				cfg.SyncTTL = d
@@ -180,6 +230,9 @@ func writeConfig(path string, cfg configFile) error {
 	writeKV("aws_profile", cfg.AWSProfile)
 	writeKV("region", cfg.Region)
 	writeKV("service", cfg.Service)
+	// Deliberately only written when already present: an unset auto_update must
+	// stay unset so the compiled-in default keeps applying.
+	writeKV("auto_update", cfg.AutoUpdate)
 	fmt.Fprintf(&b, "sync_ttl = %q\n", cfg.SyncTTL.String())
 	fmt.Fprintf(&b, "connect_timeout = %q\n", cfg.ConnectTimeout.String())
 	fmt.Fprintf(&b, "sync_timeout = %q\n", cfg.SyncTimeout.String())
@@ -271,11 +324,20 @@ func durationFromEnv(name string, fallback time.Duration) time.Duration {
 	return fallback
 }
 
-func truthy(v string) bool {
+// parseStrictBool reports both the value and whether it was recognised, so a
+// caller can tell "explicitly false" from "not a boolean at all".
+func parseStrictBool(v string) (bool, bool) {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "1", "true", "yes", "on":
-		return true
+		return true, true
+	case "0", "false", "no", "off":
+		return false, true
 	default:
-		return false
+		return false, false
 	}
+}
+
+func truthy(v string) bool {
+	value, ok := parseStrictBool(v)
+	return ok && value
 }

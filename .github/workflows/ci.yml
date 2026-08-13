@@ -8,7 +8,11 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
@@ -16,8 +20,33 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # .goreleaser.yaml runs `go mod tidy` in a before-hook, so an untidy
+      # go.mod means the release build rewrites the tagged checkout.
+      - name: Check go.mod is tidy
+        run: go mod tidy -diff
+
       - name: Run tests
-        run: go test ./...
+        run: go test -race ./...
 
       - name: Test installer
         run: sh tests/install_test.sh
+
+  # The self-update path is the one place where being wrong replaces the user's
+  # binary, and several of its failure modes are macOS-only: os.Executable is
+  # symlink-resolved on Linux but not darwin, and codesign does not exist on
+  # Linux at all. Ubuntu alone cannot cover it.
+  update-e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Update an old build to the current release
+        run: sh tests/update_e2e.sh
