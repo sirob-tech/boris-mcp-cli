@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type serverInfo struct {
@@ -345,25 +346,14 @@ func (t tool) Describe(w io.Writer) {
 }
 
 func renderToolList(w io.Writer, tools []tool) {
-	const nameWidth = 34
 	const descWidth = 88
 	for _, t := range tools {
+		fmt.Fprintf(w, "%s\n", displayToolName(t.Name))
 		desc := normalizeWhitespace(t.Description)
-		name := displayToolName(t.Name)
 		if desc == "" {
-			fmt.Fprintf(w, "%s\n", name)
 			continue
 		}
-		lines := wrapText(desc, descWidth)
-		if len(name) <= nameWidth {
-			fmt.Fprintf(w, "%-*s %s\n", nameWidth, name, lines[0])
-			for _, line := range lines[1:] {
-				fmt.Fprintf(w, "%-*s %s\n", nameWidth, "", line)
-			}
-			continue
-		}
-		fmt.Fprintf(w, "%s\n", name)
-		for _, line := range lines {
+		for _, line := range wrapText(desc, descWidth) {
 			fmt.Fprintf(w, "  %s\n", line)
 		}
 	}
@@ -550,6 +540,9 @@ func normalizeWhitespace(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
+// Widths are counted in runes, not bytes: tool descriptions are full of em
+// dashes and other multi-byte punctuation, and byte counting under-fills every
+// line that contains one.
 func wrapText(s string, width int) []string {
 	words := strings.Fields(s)
 	if len(words) == 0 {
@@ -557,21 +550,26 @@ func wrapText(s string, width int) []string {
 	}
 	var lines []string
 	var current strings.Builder
+	currentWidth := 0
 	for _, word := range words {
-		if current.Len() == 0 {
+		wordWidth := utf8.RuneCountInString(word)
+		if currentWidth == 0 {
 			current.WriteString(word)
+			currentWidth = wordWidth
 			continue
 		}
-		if current.Len()+1+len(word) <= width {
+		if currentWidth+1+wordWidth <= width {
 			current.WriteByte(' ')
 			current.WriteString(word)
+			currentWidth += 1 + wordWidth
 			continue
 		}
 		lines = append(lines, current.String())
 		current.Reset()
 		current.WriteString(word)
+		currentWidth = wordWidth
 	}
-	if current.Len() > 0 {
+	if currentWidth > 0 {
 		lines = append(lines, current.String())
 	}
 	return lines

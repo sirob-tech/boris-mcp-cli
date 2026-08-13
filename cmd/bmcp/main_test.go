@@ -255,25 +255,57 @@ func TestRenderToolListWrapsDescriptions(t *testing.T) {
 	if strings.Contains(got, "tools___graph_query") {
 		t.Fatalf("list should use shortened display names, got:\n%s", got)
 	}
-	if !hasIndentedContinuation(got) {
-		t.Fatalf("expected wrapped continuation indentation, got:\n%s", got)
-	}
 	if strings.Contains(got, "Execute read-only Cypher queries against the Memgraph graph database to explore infrastructure relationships.") {
 		t.Fatalf("description should be wrapped, got:\n%s", got)
 	}
+	for _, line := range strings.Split(strings.TrimSuffix(got, "\n"), "\n") {
+		if !strings.HasPrefix(line, "  ") && !isToolNameLine(line) {
+			t.Fatalf("every non-name line should be indented by two spaces, got:\n%s", got)
+		}
+	}
 }
 
-func TestRenderToolListPutsVeryLongNamesOnOwnLine(t *testing.T) {
+// Names sit flush left and descriptions are indented under them, no matter how
+// long the name is — a length-dependent layout switch made mixed catalogs look
+// misaligned.
+func TestRenderToolListUsesOneLayoutForShortAndLongNames(t *testing.T) {
 	var out bytes.Buffer
 	renderToolList(&out, []tool{
+		{
+			Name:        "tools___short_name",
+			Description: "Search for relevant context before making changes.",
+		},
 		{
 			Name:        "tools___this_name_is_far_too_long_for_the_table_column",
 			Description: "Search for relevant context before making changes.",
 		},
 	})
-	got := out.String()
-	if !strings.HasPrefix(got, "this_name_is_far_too_long_for_the_table_column\n  Search for relevant context") {
-		t.Fatalf("long name should be on its own line, got:\n%s", got)
+	want := "short_name\n" +
+		"  Search for relevant context before making changes.\n" +
+		"this_name_is_far_too_long_for_the_table_column\n" +
+		"  Search for relevant context before making changes.\n"
+	if got := out.String(); got != want {
+		t.Fatalf("layout mismatch:\ngot:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestWrapTextMeasuresRunesNotBytes(t *testing.T) {
+	// Each em dash is three bytes but one column; byte counting would break
+	// this line early instead of filling the full width.
+	got := wrapText("aaa — bbb — ccc — ddd", 21)
+	if len(got) != 1 || got[0] != "aaa — bbb — ccc — ddd" {
+		t.Fatalf("expected one full-width line, got %q", got)
+	}
+	if got := wrapText("aaa — bbb — ccc — ddd", 20); len(got) != 2 {
+		t.Fatalf("expected a wrap one column below the fit, got %q", got)
+	}
+}
+
+func TestRenderToolListPrintsNameOnlyWhenDescriptionIsEmpty(t *testing.T) {
+	var out bytes.Buffer
+	renderToolList(&out, []tool{{Name: "tools___bare"}})
+	if got := out.String(); got != "bare\n" {
+		t.Fatalf("bare name mismatch: %q", got)
 	}
 }
 
@@ -999,13 +1031,8 @@ func TestInstallRejectsInvalidScopeAndUnknownHarness(t *testing.T) {
 	}
 }
 
-func hasIndentedContinuation(s string) bool {
-	for _, line := range strings.Split(s, "\n") {
-		if strings.HasPrefix(line, "          ") && strings.TrimSpace(line) != "" && !strings.Contains(line, "graph_query") && !strings.Contains(line, "x_amz_bedrock_agentcore_search") {
-			return true
-		}
-	}
-	return false
+func isToolNameLine(line string) bool {
+	return line == "graph_query" || line == "x_amz_bedrock_agentcore_search"
 }
 
 func TestSchemaHashCanonicalizesObjectKeys(t *testing.T) {
