@@ -11,7 +11,6 @@ type globalFlags struct {
 	region         string
 	service        string
 	output         string
-	outputSet      bool
 	jsonOut        bool
 	pretty         bool
 	raw            bool
@@ -27,19 +26,19 @@ const (
 
 // normalizeOutputFormat resolves --output to a canonical value. `json` is
 // accepted as an alias because the records are JSON — just one object per line.
-// set distinguishes an unpassed flag from `--output=`, which is a usage error
-// rather than a silent default.
-func normalizeOutputFormat(v string, set bool) (string, error) {
-	if v == "" && !set {
-		return outputNDJSON, nil
-	}
+//
+// It runs once per flag-parsing scope, so it is handed its own previous output
+// on the second pass: every canonical value must stay an accepted spelling.
+func normalizeOutputFormat(v string) (string, error) {
 	switch v {
 	case outputNDJSON, "json":
 		return outputNDJSON, nil
 	case outputHuman:
 		return outputHuman, nil
 	default:
-		return v, fmt.Errorf("invalid --output value: %q\nSupported values: ndjson (default), json, human", v)
+		// Never return the rejected value: callers assign the result before
+		// reporting the error, and flags should not carry an invalid format.
+		return outputNDJSON, fmt.Errorf("invalid --output value: %q\nSupported values: ndjson (default), json, human", v)
 	}
 }
 
@@ -51,7 +50,9 @@ const (
 )
 
 func parseGlobalFlags(args []string) (globalFlags, []string, error) {
-	return parseFlags(globalFlags{}, args, scopeGlobal)
+	// Seeding the default here means an empty output value can only come from an
+	// explicit `--output=`, which is a usage error rather than a silent default.
+	return parseFlags(globalFlags{output: outputNDJSON}, args, scopeGlobal)
 }
 
 func parsePostCommandFlags(flags globalFlags, args []string) (globalFlags, []string, error) {
@@ -131,9 +132,9 @@ func parseFlags(flags globalFlags, args []string, scope flagScope) (globalFlags,
 			if err != nil {
 				return flags, nil, err
 			}
-			flags.output, flags.outputSet = v, true
+			flags.output = v
 		case strings.HasPrefix(arg, "--output="):
-			flags.output, flags.outputSet = strings.TrimPrefix(arg, "--output="), true
+			flags.output = strings.TrimPrefix(arg, "--output=")
 		default:
 			if scope == scopeGlobal {
 				return flags, nil, fmt.Errorf("unknown global flag: %s", arg)

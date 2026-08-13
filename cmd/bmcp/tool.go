@@ -398,10 +398,19 @@ func renderToolList(w io.Writer, tools []tool) error {
 		if strings.TrimSpace(t.Description) == "" {
 			continue
 		}
-		// Trailing newlines are dropped — keeping them would put an indented
-		// blank line under every tool whose description ends in one.
+		// Trailing newlines are dropped — keeping them would put a blank line
+		// under every tool whose description ends in one. An interior blank line
+		// stays blank rather than becoming two spaces: there is nothing to indent,
+		// and trailing whitespace is noise in a terminal and in a diff.
 		for _, line := range strings.Split(strings.TrimRight(t.Description, "\r\n"), "\n") {
-			if _, err := fmt.Fprintf(w, "  %s\n", strings.TrimRight(line, "\r")); err != nil {
+			line = strings.TrimRight(line, "\r")
+			if line == "" {
+				if _, err := fmt.Fprintln(w); err != nil {
+					return err
+				}
+				continue
+			}
+			if _, err := fmt.Fprintf(w, "  %s\n", line); err != nil {
 				return err
 			}
 		}

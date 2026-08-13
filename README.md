@@ -247,9 +247,13 @@ its description indented two spaces:
 bmcp list --output human
 ```
 
-`--output` accepts `ndjson` (default), `json` as an alias for it, and `human`;
-any other value exits 5. It only affects `list`; `sync`, `doctor` and
-`describe` accept it and ignore it. Being a global flag, it has to precede the
-command name for `install`, and precede the tool name in the
-`bmcp <tool> --arg value` form, which passes everything after the tool name to
-the tool itself.
+`--output` accepts `ndjson` (default), `json` as an alias for it, and `human`.
+Any other value, including an empty `--output=`, exits 5; omitting the value
+(`bmcp list --output`) is a flag-parse error and exits 1, like every other
+value-taking flag.
+
+Only `list` reads it — other commands accept and ignore it. As a global flag it
+always works before the command name. After the command name, `help`, `version`
+and `install` take their arguments verbatim (`install` rejects it outright), as
+does the tool in the `bmcp <tool> --arg value` form. Putting `--output` first is
+always safe.

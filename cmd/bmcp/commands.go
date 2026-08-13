@@ -48,9 +48,10 @@ func (a *app) run(args []string) int {
 		return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 	}
 	// Validated here rather than in parseFlags: run() collapses every parse
-	// error to exitGeneric, and an unsupported --output is a usage error. It runs
-	// before every exit from this function, including the bare-usage path.
-	if flags.output, err = normalizeOutputFormat(flags.output, flags.outputSet); err != nil {
+	// error to exitGeneric, and an unsupported --output is a usage error. Checked
+	// before the bare-usage path too, so a bad value never exits 0. rawArgs
+	// commands still receive their own arguments unparsed, by design.
+	if flags.output, err = normalizeOutputFormat(flags.output); err != nil {
 		return a.fail(flags, exitValidation, "invalid_output", err.Error())
 	}
 	if len(rest) == 0 {
@@ -64,7 +65,7 @@ func (a *app) run(args []string) int {
 		if err != nil {
 			return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 		}
-		if flags.output, err = normalizeOutputFormat(flags.output, flags.outputSet); err != nil {
+		if flags.output, err = normalizeOutputFormat(flags.output); err != nil {
 			return a.fail(flags, exitValidation, "invalid_output", err.Error())
 		}
 	}
@@ -219,11 +220,12 @@ func (a *app) cmdList(flags globalFlags, args []string) int {
 	} else {
 		fmt.Fprintf(a.stderr, "%d tools synced %s\n", len(cache.Tools), cache.LastSync.UTC().Format(time.RFC3339))
 	}
-	write := func() error { return writeToolRecords(a.stdout, cache.Tools, cache.LastSync) }
 	if flags.output == outputHuman {
-		write = func() error { return renderToolList(a.stdout, cache.Tools) }
+		err = renderToolList(a.stdout, cache.Tools)
+	} else {
+		err = writeToolRecords(a.stdout, cache.Tools, cache.LastSync)
 	}
-	if err := write(); err != nil {
+	if err != nil {
 		return a.fail(flags, exitGeneric, "output_failed", err.Error())
 	}
 	return 0

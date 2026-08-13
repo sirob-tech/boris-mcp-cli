@@ -365,7 +365,7 @@ func TestRenderToolListIndentsEveryDescriptionLine(t *testing.T) {
 		"  Search for relevant context before making changes.\n" +
 		"this_name_is_far_too_long_for_the_table_column\n" +
 		"  Multi-hop queries.\n" +
-		"  \n" +
+		"\n" +
 		"  Examples:\n" +
 		"  - one\n" +
 		"bare\n" +
@@ -457,6 +457,36 @@ func TestInvalidOutputValueFailsValidationBeforeDispatch(t *testing.T) {
 				t.Fatalf("stderr should name the offending flag, got: %s", stderr.String())
 			}
 		})
+	}
+}
+
+// A cache with no timestamp reaches cmdList through the same stale fallback; the
+// header then has no timestamp to print and the records carry no last_sync.
+func TestListReportsCountWithoutTimestampWhenCacheHasNoSync(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	stale := &toolCache{Version: 1, URL: "http://localhost:8787/mcp", Tools: []tool{{Name: "tools___search_aws", Description: "Search."}}}
+	if err := writeCache(filepath.Join(borisHome, "tools.json"), stale); err != nil {
+		t.Fatalf("writeCache: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		httpClient:  failingDoer{},
+		credentials: staticCreds(),
+	}
+	if code := a.run([]string{"--non-interactive", "list"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if got := stdout.String(); got != `{"name":"tools___search_aws","display_name":"search_aws","description":"Search."}`+"\n" {
+		t.Fatalf("record should carry no last_sync: %q", got)
+	}
+	if !strings.Contains(stderr.String(), "1 tools\n") {
+		t.Fatalf("header should omit an absent timestamp, got: %s", stderr.String())
 	}
 }
 
