@@ -11,6 +11,7 @@ type globalFlags struct {
 	region         string
 	service        string
 	output         string
+	outputSet      bool
 	jsonOut        bool
 	pretty         bool
 	raw            bool
@@ -24,17 +25,21 @@ const (
 	outputHuman  = "human"
 )
 
-// normalizeOutputFormat resolves --output to a canonical value. An empty value
-// means the flag was not passed, and `json` is accepted as an alias because the
-// records are JSON — just one object per line.
-func normalizeOutputFormat(v string) (string, error) {
+// normalizeOutputFormat resolves --output to a canonical value. `json` is
+// accepted as an alias because the records are JSON — just one object per line.
+// set distinguishes an unpassed flag from `--output=`, which is a usage error
+// rather than a silent default.
+func normalizeOutputFormat(v string, set bool) (string, error) {
+	if v == "" && !set {
+		return outputNDJSON, nil
+	}
 	switch v {
-	case "", outputNDJSON, "json":
+	case outputNDJSON, "json":
 		return outputNDJSON, nil
 	case outputHuman:
 		return outputHuman, nil
 	default:
-		return v, fmt.Errorf("invalid --output value: %s\nSupported values: ndjson (default), json, human", v)
+		return v, fmt.Errorf("invalid --output value: %q\nSupported values: ndjson (default), json, human", v)
 	}
 }
 
@@ -126,9 +131,9 @@ func parseFlags(flags globalFlags, args []string, scope flagScope) (globalFlags,
 			if err != nil {
 				return flags, nil, err
 			}
-			flags.output = v
+			flags.output, flags.outputSet = v, true
 		case strings.HasPrefix(arg, "--output="):
-			flags.output = strings.TrimPrefix(arg, "--output=")
+			flags.output, flags.outputSet = strings.TrimPrefix(arg, "--output="), true
 		default:
 			if scope == scopeGlobal {
 				return flags, nil, fmt.Errorf("unknown global flag: %s", arg)

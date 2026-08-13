@@ -347,10 +347,13 @@ func (t tool) Describe(w io.Writer) {
 // toolRecord is one line of `bmcp list` output. It is deliberately separate from
 // tool: tool is the on-disk cache format, so retagging it would rewrite
 // tools.json.
+// name, display_name and description are always present, so a caller can rely
+// on the shape of every record; only last_sync drops out, and only when the
+// cache has no timestamp to report.
 type toolRecord struct {
 	Name        string `json:"name"`
 	DisplayName string `json:"display_name"`
-	Description string `json:"description,omitempty"`
+	Description string `json:"description"`
 	LastSync    string `json:"last_sync,omitempty"`
 }
 
@@ -389,11 +392,7 @@ func renderToolList(w io.Writer, tools []tool) {
 		if t.Description == "" {
 			continue
 		}
-		for _, line := range strings.Split(strings.TrimRight(t.Description, "\n"), "\n") {
-			if line == "" {
-				fmt.Fprintln(w)
-				continue
-			}
+		for _, line := range strings.Split(t.Description, "\n") {
 			fmt.Fprintf(w, "  %s\n", line)
 		}
 	}

@@ -222,14 +222,23 @@ exit 0.
 
 | Field | Meaning |
 |---|---|
-| `name` | Full tool name. Always callable — use this to call the tool. |
+| `name` | Full tool name. Always callable — use this to call the tool. Also the only unique key: two namespaces can share a `display_name`. |
 | `display_name` | Short alias with the namespace prefix stripped. Convenience only. |
-| `description` | Verbatim, including authored newlines (JSON-escaped, so one record stays one line). |
+| `description` | Verbatim, including authored newlines (JSON-escaped, so one record stays one line). Always present, empty string when the tool has none. |
 | `last_sync` | Catalog sync time in RFC 3339. Omitted when the cache has no timestamp. |
 
 Descriptions are not HTML-escaped, so grepping raw lines for `<region>` works.
-Field order is stable, but parse the lines as JSON rather than matching on
-column positions.
+Parse the lines as JSON rather than matching on field or column positions.
+
+Two things worth knowing when consuming this:
+
+- **`head` truncates safely but silently.** Every line is a complete record, so
+  `head -5` never yields invalid JSON — but it does hide tools, without any
+  marker in stdout. The total count is on stderr; compare it if completeness
+  matters.
+- **Pipe records, do not `echo` them.** `echo "$line" | jq` expands the `\n`
+  escapes inside a description and corrupts the JSON. Use `printf '%s'` or feed
+  `jq` the stream directly.
 
 For a human-readable catalog, pass `--output human` — each name flush left with
 its description indented two spaces:
@@ -238,7 +247,9 @@ its description indented two spaces:
 bmcp list --output human
 ```
 
-`--output` accepts `ndjson` (default), `json` as an alias for it, and `human`.
-It applies to `list`; other commands accept it and ignore it. It is a global
-flag, so it must come before the tool name in the `bmcp <tool> --arg value`
-form, which passes everything after the tool name to the tool itself.
+`--output` accepts `ndjson` (default), `json` as an alias for it, and `human`;
+any other value exits 5. It only affects `list`; `sync`, `doctor` and
+`describe` accept it and ignore it. Being a global flag, it has to precede the
+command name for `install`, and precede the tool name in the
+`bmcp <tool> --arg value` form, which passes everything after the tool name to
+the tool itself.

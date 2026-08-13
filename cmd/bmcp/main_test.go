@@ -53,6 +53,12 @@ func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
 	return respond(`{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"unexpected"}}`)
 }
 
+type failingDoer struct{}
+
+func (failingDoer) Do(*http.Request) (*http.Response, error) {
+	return nil, errors.New("dial tcp: connection refused")
+}
+
 func staticCreds() credentialsFunc {
 	return func(context.Context, effectiveConfig) (aws.Credentials, string, error) {
 		return aws.Credentials{AccessKeyID: "AKIATEST", SecretAccessKey: "secret", Source: "test"}, "us-east-1", nil
@@ -254,48 +260,41 @@ func TestListEmitsOneNDJSONRecordPerTool(t *testing.T) {
 	if code := a.run([]string{"--non-interactive", "list"}); code != 0 {
 		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
 	}
+	// Golden raw lines, not a decode into toolRecord: the record's own struct
+	// tags would appear on both sides of that comparison and cancel out, so a
+	// renamed key or a re-enabled HTML escape would pass unnoticed. `<region> &`
+	// staying raw is what lets an agent grep the lines it printed.
+	stamp := cache.LastSync.UTC().Format(time.RFC3339)
+	want := []string{
+		`{"name":"tools___search_aws","display_name":"search_aws","description":"Semantic search — scope it with <region> & tags.","last_sync":"` + stamp + `"}`,
+		`{"name":"tools___search_infrastructure_graph","display_name":"search_infrastructure_graph","description":"Multi-hop queries.\n\nExamples:\n- one\n- two","last_sync":"` + stamp + `"}`,
+	}
 	lines := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
-	if len(lines) != 2 {
+	if len(lines) != len(want) {
 		t.Fatalf("expected one record per tool, got %d lines:\n%s", len(lines), stdout.String())
 	}
-	var records []toolRecord
-	for _, line := range lines {
-		var rec toolRecord
-		if err := json.Unmarshal([]byte(line), &rec); err != nil {
-			t.Fatalf("line is not valid JSON: %q: %v", line, err)
+	for i, line := range lines {
+		if line != want[i] {
+			t.Fatalf("record %d mismatch:\n got: %s\nwant: %s", i, line, want[i])
 		}
-		records = append(records, rec)
-	}
-	want := []toolRecord{
-		{
-			Name:        "tools___search_aws",
-			DisplayName: "search_aws",
-			Description: "Semantic search — scope it with <region> & tags.",
-			LastSync:    cache.LastSync.UTC().Format(time.RFC3339),
-		},
-		{
-			Name:        "tools___search_infrastructure_graph",
-			DisplayName: "search_infrastructure_graph",
-			Description: "Multi-hop queries.\n\nExamples:\n- one\n- two",
-			LastSync:    cache.LastSync.UTC().Format(time.RFC3339),
-		},
-	}
-	for i, rec := range records {
-		if rec != want[i] {
-			t.Fatalf("record %d mismatch:\n got: %#v\nwant: %#v", i, rec, want[i])
-		}
-	}
-	// An agent grepping raw lines for <region> must find it, so HTML escaping
-	// stays off.
-	if !strings.Contains(stdout.String(), "<region> & tags") {
-		t.Fatalf("angle brackets and ampersands should not be \\u-escaped, got:\n%s", stdout.String())
 	}
 	if !strings.Contains(stderr.String(), "2 tools synced") {
 		t.Fatalf("count header belongs on stderr, got: %s", stderr.String())
 	}
+	// --json means structured errors; it must not restructure the catalog.
+	var jsonStdout bytes.Buffer
+	a.stdout = &jsonStdout
+	if code := a.run([]string{"--non-interactive", "--json", "list"}); code != 0 {
+		t.Fatalf("--json list exit code %d, stderr: %s", code, stderr.String())
+	}
+	if jsonStdout.String() != stdout.String() {
+		t.Fatalf("--json should not change list output:\n got: %q\nwant: %q", jsonStdout.String(), stdout.String())
+	}
 }
 
-func TestListOutputJSONIsAliasForNDJSON(t *testing.T) {
+// Every accepted --output spelling, in both flag positions and both syntaxes,
+// through both `list` and its `ls` alias.
+func TestListOutputFormatSpellings(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
@@ -303,31 +302,34 @@ func TestListOutputJSONIsAliasForNDJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readCache: %v", err)
 	}
-	var want bytes.Buffer
-	if err := writeToolRecords(&want, cache.Tools, cache.LastSync); err != nil {
-		t.Fatalf("writeToolRecords: %v", err)
+	ndjson := `{"name":"tools___search_aws","display_name":"search_aws","description":"Search.","last_sync":"` +
+		cache.LastSync.UTC().Format(time.RFC3339) + "\"}\n"
+	human := "search_aws\n  Search.\n"
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"list"}, want: ndjson},
+		{args: []string{"ls"}, want: ndjson},
+		{args: []string{"list", "--output", "ndjson"}, want: ndjson},
+		{args: []string{"list", "--output=ndjson"}, want: ndjson},
+		{args: []string{"list", "--output", "json"}, want: ndjson},
+		{args: []string{"--output", "json", "list"}, want: ndjson},
+		{args: []string{"list", "--output", "human"}, want: human},
+		{args: []string{"list", "--output=human"}, want: human},
+		{args: []string{"--output=human", "ls"}, want: human},
 	}
-	var stdout, stderr bytes.Buffer
-	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
-	if code := a.run([]string{"--non-interactive", "list", "--output", "json"}); code != 0 {
-		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
-	}
-	if stdout.String() != want.String() {
-		t.Fatalf("--output json should match ndjson:\n got: %q\nwant: %q", stdout.String(), want.String())
-	}
-}
-
-func TestListOutputHumanRendersTextNotJSON(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
-	var stdout, stderr bytes.Buffer
-	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
-	if code := a.run([]string{"--non-interactive", "list", "--output", "human"}); code != 0 {
-		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
-	}
-	if got := stdout.String(); got != "search_aws\n  Search.\n" {
-		t.Fatalf("human output mismatch: %q", got)
+	for _, tc := range cases {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+			if code := a.run(append([]string{"--non-interactive"}, tc.args...)); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if stdout.String() != tc.want {
+				t.Fatalf("stdout mismatch:\n got: %q\nwant: %q", stdout.String(), tc.want)
+			}
+		})
 	}
 }
 
@@ -351,12 +353,12 @@ func TestRenderToolListIndentsEveryDescriptionLine(t *testing.T) {
 		"  Search for relevant context before making changes.\n" +
 		"this_name_is_far_too_long_for_the_table_column\n" +
 		"  Multi-hop queries.\n" +
-		"\n" +
+		"  \n" +
 		"  Examples:\n" +
 		"  - one\n" +
 		"bare\n"
 	if got := out.String(); got != want {
-		t.Fatalf("layout mismatch:\ngot:\n%s\nwant:\n%s", got, want)
+		t.Fatalf("layout mismatch:\ngot:\n%q\nwant:\n%q", got, want)
 	}
 }
 
@@ -379,30 +381,78 @@ func TestListEmptyCatalogExitsZeroWithEmptyStdout(t *testing.T) {
 	}
 }
 
-func TestToolRecordsOmitLastSyncWhenCacheHasNoTimestamp(t *testing.T) {
+// name, display_name and description are unconditional so consumers can rely on
+// the record shape; only last_sync drops out, and only when it is zero.
+func TestToolRecordKeepsEveryFieldButAZeroLastSync(t *testing.T) {
 	var out bytes.Buffer
 	if err := writeToolRecords(&out, []tool{{Name: "tools___search_aws"}}, time.Time{}); err != nil {
 		t.Fatalf("writeToolRecords: %v", err)
 	}
-	if got := out.String(); got != `{"name":"tools___search_aws","display_name":"search_aws"}`+"\n" {
-		t.Fatalf("zero last_sync should be omitted, got: %q", got)
+	if got := out.String(); got != `{"name":"tools___search_aws","display_name":"search_aws","description":""}`+"\n" {
+		t.Fatalf("zero last_sync should be the only omitted field, got: %q", got)
 	}
 }
 
 // parseFlags maps every error to exitGeneric, so --output has to be validated
-// in run() before any command touches config or the network.
+// in run() before any command touches config or the network — and before the
+// bare-usage return, which would otherwise swallow a bad value with exit 0.
 func TestInvalidOutputValueFailsValidationBeforeDispatch(t *testing.T) {
 	t.Setenv("BMCP_HOME", t.TempDir())
+	cases := [][]string{
+		{"--output", "bogus", "sync"},
+		{"list", "--output", "bogus"},
+		{"list", "--output="},
+		{"--output=", "list"},
+		{"--output", "bogus"},
+		{"--output", "NDJSON", "list"},
+	}
+	for _, args := range cases {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+			if code := a.run(args); code != exitValidation {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("stdout should be empty, got %q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), "--output") {
+				t.Fatalf("stderr should name the offending flag, got: %s", stderr.String())
+			}
+		})
+	}
+}
+
+// The stale-cache fallback keeps exit 0, so its warning has to stay on stderr —
+// one line of prose on stdout would break every consumer.
+func TestListKeepsStaleCacheWarningOffStdout(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	cache, err := readCache(filepath.Join(borisHome, "tools.json"))
+	if err != nil {
+		t.Fatalf("readCache: %v", err)
+	}
+	// Expire the cache so the catalog refresh runs, then fail that refresh.
 	var stdout, stderr bytes.Buffer
-	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
-	if code := a.run([]string{"--output", "bogus", "sync"}); code != exitValidation {
-		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	a := &app{
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         func() time.Time { return cache.LastSync.Add(defaultTTL + time.Hour) },
+		httpClient:  failingDoer{},
+		credentials: staticCreds(),
 	}
-	if stdout.Len() != 0 {
-		t.Fatalf("stdout should be empty, got %q", stdout.String())
+	if code := a.run([]string{"--non-interactive", "list"}); code != 0 {
+		t.Fatalf("stale cache should still exit 0, got %d, stderr: %s", code, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "--output") {
-		t.Fatalf("stderr should name the offending flag, got: %s", stderr.String())
+	want := `{"name":"tools___search_aws","display_name":"search_aws","description":"Search.","last_sync":"` +
+		cache.LastSync.UTC().Format(time.RFC3339) + "\"}\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout should be records only:\n got: %q\nwant: %q", stdout.String(), want)
+	}
+	if !strings.Contains(stderr.String(), "using stale cache") {
+		t.Fatalf("stale-cache warning belongs on stderr, got: %s", stderr.String())
 	}
 }
 
@@ -412,6 +462,11 @@ func TestDisplayToolNameStripsNamespacePrefix(t *testing.T) {
 	}
 	if got := displayToolName("graph_query"); got != "graph_query" {
 		t.Fatalf("displayToolName should leave plain names alone: %q", got)
+	}
+	// A bare prefix has an empty suffix; falling back to the full name keeps
+	// display_name and the human list from rendering a nameless entry.
+	if got := displayToolName("tools___"); got != "tools___" {
+		t.Fatalf("empty suffix should fall back to the full name: %q", got)
 	}
 }
 

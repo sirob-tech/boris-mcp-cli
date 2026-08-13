@@ -47,6 +47,12 @@ func (a *app) run(args []string) int {
 	if err != nil {
 		return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 	}
+	// Validated here rather than in parseFlags: run() collapses every parse
+	// error to exitGeneric, and an unsupported --output is a usage error. It runs
+	// before every exit from this function, including the bare-usage path.
+	if flags.output, err = normalizeOutputFormat(flags.output, flags.outputSet); err != nil {
+		return a.fail(flags, exitValidation, "invalid_output", err.Error())
+	}
 	if len(rest) == 0 {
 		usage(a.stdout)
 		return 0
@@ -58,11 +64,9 @@ func (a *app) run(args []string) int {
 		if err != nil {
 			return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 		}
-	}
-	// Validated here rather than in parseFlags: run() collapses every parse
-	// error to exitGeneric, and an unsupported --output is a usage error.
-	if flags.output, err = normalizeOutputFormat(flags.output); err != nil {
-		return a.fail(flags, exitValidation, "invalid_output", err.Error())
+		if flags.output, err = normalizeOutputFormat(flags.output, flags.outputSet); err != nil {
+			return a.fail(flags, exitValidation, "invalid_output", err.Error())
+		}
 	}
 	if known {
 		return c.run(a, flags, cmdArgs)
@@ -200,7 +204,7 @@ func (a *app) cmdSyncWithRefresh(flags globalFlags, refreshInstructions bool) in
 // be a complete, parseable record.
 func (a *app) cmdList(flags globalFlags, args []string) int {
 	if len(args) != 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: bmcp list [--output ndjson|human]")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp list [--output ndjson|json|human]")
 	}
 	cfg, _, err := a.requireConfig(flags)
 	if err != nil {
@@ -445,7 +449,7 @@ func usage(w io.Writer) {
   bmcp install <claude-code|codex|opencode|cursor|kiro|all> [--scope user|project]
   bmcp sync
   bmcp doctor
-  bmcp list|ls [--output ndjson|human]
+  bmcp list|ls [--output ndjson|json|human]
   bmcp describe|d <tool>
   bmcp call <tool> ['{"arg":"value"}']
   bmcp <exact_tool_name> --arg value
@@ -456,7 +460,7 @@ Global flags:
   --profile, -p <profile>      Override AWS profile
   --region <region>            Override SigV4 region
   --service <service>          Override SigV4 service
-  --output <ndjson|human>      Format for bmcp list (default ndjson)
+  --output <ndjson|json|human> Format for bmcp list (default ndjson)
   --json                       Emit structured errors
   --pretty                     Pretty-print successful tool JSON
   --raw                        Emit raw MCP tool envelopes
