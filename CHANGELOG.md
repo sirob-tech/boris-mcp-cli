@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.4.0...v0.5.0) (2026-08-14)
+
+
+### Features
+
+* self-update with auto-update on doctor, sync and init ([#20](https://github.com/sirob-tech/boris-mcp-cli/issues/20)) ([86a8b85](https://github.com/sirob-tech/boris-mcp-cli/commit/86a8b8536966ca588d439bc5139c83681fba801d))
+
 ## [0.4.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.3.0...v0.4.0) (2026-08-13)
 
 
