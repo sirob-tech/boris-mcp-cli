@@ -792,7 +792,8 @@ If a tool call later fails on authentication or connectivity, run ` + "`bmcp doc
 Useful commands:
 
 - ` + "`bmcp list`" + `: list remote tools as NDJSON, one object per line: ` + "`name`" + ` (full name, always callable), ` + "`display_name`" + `, ` + "`description`" + `, ` + "`last_sync`" + `. Call tools by ` + "`name`" + `. Truncating with ` + "`head`" + ` never breaks a line but does hide tools — the total count is on stderr. Add ` + "`--output human`" + ` for indented text.
-- ` + "`bmcp describe <tool>`" + `: show tool schema and examples.
+- ` + "`bmcp list --schemas`" + `: the same records with each tool's ` + "`input_schema`" + ` included. Prefer this when you intend to call a tool: it answers "which tools exist" and "how do I call them" in one local invocation, with no per-tool ` + "`describe`" + ` round trip.
+- ` + "`bmcp describe <tool>`" + `: show one tool's schema and examples as indented text.
 - ` + "`bmcp <tool> --arg value`" + `: call a tool with CLI flags.
 - ` + "`bmcp call <tool> '{\"arg\":\"value\"}'`" + `: call a tool with JSON.
 - ` + "`bmcp --pretty <tool> ...`" + `: pretty-print JSON output when the tool returns JSON.

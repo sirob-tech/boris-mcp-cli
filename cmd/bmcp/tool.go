@@ -504,12 +504,24 @@ type toolRecord struct {
 	DisplayName string `json:"display_name"`
 	Description string `json:"description"`
 	LastSync    string `json:"last_sync,omitempty"`
+	// InputSchema is the server's schema verbatim, present only under --schemas.
+	// Verbatim because a caller that wants to validate against it needs the
+	// document the server actually published, not this CLI's reading of it —
+	// schemaObject models the subset the describe renderer uses and would
+	// silently drop the rest.
+	InputSchema json.RawMessage `json:"input_schema,omitempty"`
 }
 
 // writeToolRecords emits NDJSON: one record per line, descriptions verbatim.
 // Authored newlines survive as JSON escapes, so a record never spans two lines
 // and `head` can never split one.
-func writeToolRecords(w io.Writer, tools []tool, lastSync time.Time) error {
+//
+// withSchemas is a flag rather than the default because the two answer different
+// questions. "Which tools exist" is asked once and skimmed; "how do I call these"
+// is asked before writing a payload. On the live catalog the schemas take the
+// output from 8.7KB to 18.9KB, and a caller piping the catalog through `head` to
+// see what is available should not pay for schemas it will not read.
+func writeToolRecords(w io.Writer, tools []tool, lastSync time.Time, withSchemas bool) error {
 	stamp := ""
 	if !lastSync.IsZero() {
 		stamp = lastSync.UTC().Format(time.RFC3339)
@@ -525,11 +537,54 @@ func writeToolRecords(w io.Writer, tools []tool, lastSync time.Time) error {
 			Description: t.Description,
 			LastSync:    stamp,
 		}
+		if withSchemas {
+			// Assigned raw. The schema on disk is indented — writeCache stores the
+			// catalog with MarshalIndent, which re-indents this very field — so a
+			// record carrying it would seem bound to span as many lines as the schema
+			// has fields, breaking the one guarantee NDJSON makes here. It does not,
+			// because encoding/json compacts a RawMessage as it encodes it. That is
+			// the property TestListWithSchemasStaysOneRecordPerLine pins: not code in
+			// this function, but the reason none is needed.
+			record.InputSchema = t.InputSchema
+		}
 		if err := enc.Encode(record); err != nil {
 			return fmt.Errorf("write record for %s: %w", t.Name, err)
 		}
 	}
 	return nil
+}
+
+// errWriter remembers the first write failure so a renderer built on fmt.Fprintf
+// can report one. renderToolList returns write errors so that a catalog
+// truncated by a full disk cannot exit 0, and Describe — which predates that
+// rule and does not check its own writes — must not become a hole in it.
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errWriter) Write(p []byte) (int, error) {
+	// Short-circuited so that one failure does not become one failure per
+	// remaining Fprintf, and so the error reported is the first one.
+	if e.err != nil {
+		return 0, e.err
+	}
+	n, err := e.w.Write(p)
+	e.err = err
+	return n, err
+}
+
+// renderToolListWithSchemas is `--schemas --output human`: the same document
+// describe produces, for every tool, separated by a blank line.
+func renderToolListWithSchemas(w io.Writer, tools []tool) error {
+	ew := &errWriter{w: w}
+	for i, t := range tools {
+		if i > 0 {
+			fmt.Fprintln(ew)
+		}
+		t.Describe(ew)
+	}
+	return ew.err
 }
 
 // renderToolList is the --output human view: names flush left, every
