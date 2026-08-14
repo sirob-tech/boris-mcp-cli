@@ -481,6 +481,77 @@ func TestInvalidOutputValueFailsValidationBeforeDispatch(t *testing.T) {
 	}
 }
 
+// bmcp is driven mostly by coding agents, and --help is the first thing an agent
+// tries against an unfamiliar binary. It has to reach stdout and exit 0 wherever
+// it appears, without touching config or the network — a non-zero exit reads as
+// "this tool is broken" and the agent abandons it.
+func TestHelpFlagPrintsUsageToStdoutAndExitsZero(t *testing.T) {
+	// No BMCP_HOME and no config on purpose: help must not require either.
+	t.Setenv("BMCP_HOME", filepath.Join(t.TempDir(), "absent"))
+	cases := [][]string{
+		{"--help"},
+		{"-h"},
+		{"help"},
+		{"--json", "--help"},
+		// Post-command: a known command must answer --help rather than reject it
+		// as an unknown flag.
+		{"doctor", "--help"},
+		{"list", "-h"},
+		{"describe", "--help"},
+		{"update", "--help"},
+		// install is rawArgs, so it answers --help in its own argument loop.
+		{"install", "--help"},
+	}
+	for _, args := range cases {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin:  strings.NewReader(""),
+				stdout: &stdout,
+				stderr: &stderr,
+				now:    time.Now,
+				// Any network call at all is a test failure: help must be answerable
+				// offline, and the autoUpdate commands above would otherwise reach
+				// GitHub before printing anything.
+				httpClient: failingDoer{},
+			}
+			if code := a.run(args); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), "Usage:") {
+				t.Fatalf("usage should go to stdout, got stdout %q stderr %q", stdout.String(), stderr.String())
+			}
+			if strings.Contains(stderr.String(), "unknown") {
+				t.Fatalf("stderr should not report an unknown flag, got: %s", stderr.String())
+			}
+		})
+	}
+}
+
+// The regression guard for the fix's one real risk: --help is no longer a
+// command alias, and the global scope stops parsing at the first non-flag token,
+// so a tool's own --help must still resolve to that tool's schema.
+func TestHelpAfterToolNameStillDescribesTheTool(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{
+		Name:        "tools___search_aws",
+		Description: "Semantic search for AWS resources.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+	}})
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now, httpClient: failingDoer{}}
+	if code := a.run([]string{"--non-interactive", "search_aws", "--help"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "Usage:") {
+		t.Fatalf("a tool's --help should print its schema, not the global usage, got:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "bmcp search_aws --query") {
+		t.Fatalf("expected the tool's own describe output, got:\n%s", stdout.String())
+	}
+}
+
 // A cache with no timestamp reaches cmdList through the same stale fallback; the
 // header then has no timestamp to print and the records carry no last_sync.
 func TestListReportsCountWithoutTimestampWhenCacheHasNoSync(t *testing.T) {

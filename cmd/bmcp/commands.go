@@ -32,7 +32,10 @@ type command struct {
 // cmdInit calls cmdSyncWithRefresh, so hooking that shared function would fire
 // twice for every init. Dispatch is the only place that sees the difference.
 var commands = []command{
-	{names: []string{"help", "-h", "--help"}, rawArgs: true, run: (*app).cmdHelp},
+	// `-h`/`--help` are deliberately not aliases here. They never reached this
+	// table — parseGlobalFlags rejected them first — so they live in globalFlags
+	// instead, where run() can honour them both before and after a command name.
+	{names: []string{"help"}, rawArgs: true, run: (*app).cmdHelp},
 	{names: []string{"version"}, rawArgs: true, run: (*app).cmdVersion},
 	{names: []string{"init"}, autoUpdate: true, run: (*app).cmdInit},
 	{names: []string{"sync"}, autoUpdate: true, run: (*app).cmdSync},
@@ -67,6 +70,11 @@ func (a *app) run(args []string) int {
 	if flags.output, err = normalizeOutputFormat(flags.output); err != nil {
 		return a.fail(flags, exitValidation, "invalid_output", err.Error())
 	}
+	// Checked after --output on purpose, so `bmcp --output bogus --help` still
+	// reports the bad value rather than exiting 0 on the usage path.
+	if flags.help {
+		return a.cmdHelp(flags, nil)
+	}
 	if len(rest) == 0 {
 		usage(a.stdout)
 		return 0
@@ -84,6 +92,11 @@ func (a *app) run(args []string) int {
 		}
 		if flags.output, err = normalizeOutputFormat(flags.output); err != nil {
 			return a.fail(flags, exitValidation, "invalid_output", err.Error())
+		}
+		// Before maybeAutoUpdate below: asking a command for help must not cost a
+		// network round trip, let alone a binary swap.
+		if flags.help {
+			return a.cmdHelp(flags, nil)
 		}
 	}
 	if known {
@@ -484,6 +497,12 @@ func (a *app) cmdInstall(flags globalFlags, args []string) int {
 			scope = args[i]
 		case strings.HasPrefix(arg, "--scope="):
 			scope = strings.TrimPrefix(arg, "--scope=")
+		// install is rawArgs, so parseFlags never sees its arguments and cannot
+		// set flags.help for it. Handled here so `bmcp install --help` answers
+		// like every other command rather than failing as an unknown flag.
+		case arg == "--help" || arg == "-h":
+			usage(a.stdout)
+			return 0
 		case strings.HasPrefix(arg, "-"):
 			return a.fail(flags, exitValidation, "usage", "unknown install flag: "+arg)
 		default:
@@ -528,6 +547,7 @@ Flags for bmcp update:
   --rollback                   Restore the binary the last update replaced
 
 Global flags:
+  --help, -h                   Show this help; after a tool name, that tool's schema
   --no-auto-update             Do not update automatically during this command
   --url, -u <url>              Override BORIS MCP URL
   --profile, -p <profile>      Override AWS profile
