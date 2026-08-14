@@ -84,9 +84,12 @@ propagates on its own the next time any machine runs `bmcp doctor`, `bmcp sync`,
 or `bmcp init`. Two consequences worth holding onto:
 
 - **Signing is a precondition, not a nicety.** `.goreleaser.yaml` signs
-  unconditionally and `release.yml` refuses to publish without the signing
-  secrets. An unsigned release is one that macOS clients will eventually refuse
-  to install, once `codesignFailClosed` is enabled in `cmd/bmcp/update.go`.
+  unconditionally, `release.yml` refuses to publish without the signing secrets,
+  and `codesignFailClosed` in `cmd/bmcp/update.go` is now enabled — so an
+  unsigned release is one every macOS client refuses to install, and no later
+  release can reach those machines automatically either. The preflight exists to
+  make sure that situation is never reached; recovery would mean setting
+  `codesignFailClosed` back to false and shipping a signed release from there.
 - **`bump-minor-pre-major: true` means breaking changes are minor bumps**, so
   no semver gate can express "safe to apply unattended". A `feat!:` merged today
   reaches every machine automatically. If a change would break a caller's

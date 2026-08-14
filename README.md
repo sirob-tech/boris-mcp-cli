@@ -143,16 +143,19 @@ What is verified before a downloaded binary replaces the running one:
   intact, not that they came from us.
 - The bytes are read back off disk after staging and re-hashed, so a short or
   truncated write cannot be committed over a working binary.
-- On macOS the Developer ID signature is verified with `codesign`. **This is
-  currently advisory: a failure warns and the update proceeds.** It stays that
-  way for one release, because a fleet that refuses every update cannot receive
-  the fix for whatever made it refuse. On Linux there is no signature check at
-  all — the release artifacts are not signed for that platform.
+- On macOS the Developer ID signature is verified with `codesign` against a
+  pinned Team ID, and **a failure aborts the update** — the staged binary is
+  discarded and the running one is left untouched. This was advisory for one
+  release (v0.5.0, the first shipped under fail-closed signing), because a fleet
+  that refuses every update cannot receive the fix for whatever made it refuse.
+  On Linux there is no signature check at all — the release artifacts are not
+  signed for that platform.
 
-The practical consequence: today the trust root is GitHub. Anything able to
-replace a published release asset can reach installed binaries. If that is
-outside your risk tolerance, set `auto_update = "false"` and upgrade
-deliberately.
+The practical consequence: on Linux the trust root is GitHub, so anything able
+to replace a published release asset can reach installed binaries. On macOS a
+substituted asset is rejected unless it also carries a valid Developer ID
+signature from the pinned team. If that is outside your risk tolerance, set
+`auto_update = "false"` and upgrade deliberately.
 
 ```bash
 bmcp update              # update to the latest release

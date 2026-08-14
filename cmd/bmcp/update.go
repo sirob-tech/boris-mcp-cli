@@ -43,12 +43,19 @@ const (
 	// darwin update on every machine.
 	codesignRequirement = `=anchor apple generic and certificate leaf[subject.OU] = T962D4K3Y7`
 
-	// codesignFailClosed stays false until a release has shipped under the
-	// fail-closed signing in .goreleaser.yaml. A fleet that refuses every
-	// update cannot receive the fix for whatever made it refuse, so the first
-	// release verifies and warns only. Flip once a signed release exists and
-	// the macOS CI job has exercised a real N-1 -> N swap.
-	codesignFailClosed = false
+	// codesignFailClosed makes an unverifiable darwin binary abort the update
+	// rather than warn. It was false for exactly one release — v0.5.0, the first
+	// shipped under the fail-closed signing in .goreleaser.yaml — because a
+	// fleet that refuses every update cannot receive the fix for whatever made
+	// it refuse. That release exists and installs from it, so the warn-only
+	// window is over.
+	//
+	// It stays a named constant because that failure mode has not gone away: if
+	// a certificate change ever makes verification fail fleet-wide, setting this
+	// back to false is the lever that lets the fix reach machines at all. Both
+	// settings are covered by tests, so flipping it does not leave the suite
+	// asserting behaviour the binary no longer has.
+	codesignFailClosed = true
 
 	staleLockAge = 10 * time.Minute
 )
