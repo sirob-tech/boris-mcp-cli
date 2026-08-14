@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.7.0...v0.7.1) (2026-08-14)
+
+
+### Bug Fixes
+
+* close the silent paths that corrupt the tool catalog and its backups ([#42](https://github.com/sirob-tech/boris-mcp-cli/issues/42)) ([fed247d](https://github.com/sirob-tech/boris-mcp-cli/commit/fed247dc1c26217dbb5fbce1171b590a2b1172f6)), closes [#28](https://github.com/sirob-tech/boris-mcp-cli/issues/28) [#30](https://github.com/sirob-tech/boris-mcp-cli/issues/30) [#31](https://github.com/sirob-tech/boris-mcp-cli/issues/31)
+* refresh the instruction tool list on doctor, not only on sync ([#44](https://github.com/sirob-tech/boris-mcp-cli/issues/44)) ([228ff9c](https://github.com/sirob-tech/boris-mcp-cli/commit/228ff9cd3eb5b0292fc689f82b0018e4c9d701f6)), closes [#25](https://github.com/sirob-tech/boris-mcp-cli/issues/25)
+
 ## [0.7.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.6.0...v0.7.0) (2026-08-14)
 
 
