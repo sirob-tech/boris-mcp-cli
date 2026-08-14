@@ -4,9 +4,27 @@ on:
   push:
     tags:
       - "v*"
+  # Recovery path for a release that failed partway through. GitHub's own
+  # "re-run jobs" button replays the workflow *as it existed at the tag*, so a
+  # release broken by a pipeline bug would be retried by the same broken
+  # pipeline. Dispatching from the default branch with the tag as an input runs
+  # the current pipeline against the old tag instead, which is what recovery
+  # actually needs — and needs no re-tagging.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish or re-publish, e.g. v0.4.0"
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+# Two runs against one tag would race to upload the same assets. Queued rather
+# than cancelled: cancelling mid-upload is how a half-populated release happens.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   goreleaser:
@@ -14,6 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref_name }}
           fetch-depth: 0
 
       - uses: actions/setup-go@v5
@@ -40,3 +59,90 @@ jobs:
           MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
           MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+
+  # Nothing between GoReleaser and the user was ever checked. v0.4.0 published a
+  # release object with no assets, `/releases/latest` resolved to it, and every
+  # `curl | sh` install 404'd — with a green-looking repo, because no job ever
+  # tried to install what was released.
+  #
+  # Both runners, because the two platforms fail differently: only macOS can
+  # catch an unsigned or wrongly-signed binary, and only Linux exercises the
+  # linux archive.
+  smoke:
+    needs: goreleaser
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      # Deliberately the workflow's own ref, not the tag: users install by
+      # curl'ing install.sh from the default branch, so that is the installer
+      # the release has to work with. On a tag push the two are the same tree
+      # anyway.
+      - uses: actions/checkout@v4
+
+      - name: Install the published release and run it
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: sh tests/release_smoke.sh "$TAG"
+
+  # The release object outlives a failed release: release-please creates it and
+  # the tag on merge, and GoReleaser uploads assets into it afterwards. So a
+  # failure anywhere above leaves a published, assetless release that
+  # `/releases/latest` still points at — breaking installs for everyone until a
+  # human notices. Marking it prerelease excludes it from `/releases/latest`,
+  # which falls back to the last release that actually works.
+  #
+  # Reversible on purpose: a re-run that succeeds promotes the same tag back.
+  publication-state:
+    needs: [goreleaser, smoke]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Promote a good release, demote a broken one
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASED: ${{ needs.goreleaser.result }}
+          SMOKED: ${{ needs.smoke.result }}
+        run: |
+          set -eu
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::warning::No release exists for $TAG — nothing to promote or demote"
+            [ "$RELEASED" = "success" ] && [ "$SMOKED" = "success" ] || exit 1
+            exit 0
+          fi
+
+          if [ "$RELEASED" = "success" ] && [ "$SMOKED" = "success" ]; then
+            # A tag like v1.0.0-rc1 is a prerelease because it says so, not
+            # because anything failed. Leave those alone.
+            case "$TAG" in
+              *-*)
+                echo "$TAG is a prerelease tag — leaving its publication state alone"
+                exit 0
+                ;;
+            esac
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --draft=false --prerelease=false --latest
+            echo "### $TAG published" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Installed and verified on Linux and macOS. \`/releases/latest\` resolves here." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease
+          echo "::error::$TAG is broken (goreleaser=$RELEASED smoke=$SMOKED) — marked prerelease so installs fall back to the last good release"
+          {
+            echo "### $TAG withheld"
+            echo ""
+            echo "goreleaser: \`$RELEASED\` · smoke: \`$SMOKED\`"
+            echo ""
+            echo "The release was marked **prerelease**, so \`/releases/latest\` skips it and \`curl | sh\` installs keep working off the previous release."
+            echo ""
+            echo "Fix the cause, then re-run this workflow on \`$TAG\`. A successful run promotes the same tag back to latest — no re-tagging needed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1

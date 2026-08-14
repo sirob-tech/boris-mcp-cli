@@ -23,11 +23,56 @@ Without a recognised prefix, release-please ignores the commit — the change sh
 
 1. Merge conventional commits to `main`.
 2. `release-please` opens/updates a `chore(main): release X.Y.Z` PR with version bump + CHANGELOG.
-3. Merging that PR creates a `vX.Y.Z` tag.
+3. Merging that PR creates the `vX.Y.Z` tag **and the GitHub release object**.
 4. The tag triggers `.github/workflows/release.yml` on `macos-latest`:
    - GoReleaser builds darwin/linux × amd64/arm64
    - macOS binaries are signed (Developer ID) and notarized (Apple notarytool, `wait: true`)
    - Tarballs + `checksums.txt` upload to GitHub Releases
    - Homebrew formula pushed to `sirob-tech/homebrew-tap/Formula/bmcp.rb` via a GitHub App installation token (no PAT)
+5. `smoke` installs the published release through `install.sh` on Linux and macOS.
+6. `publication-state` promotes the release to Latest, or marks it prerelease if
+   anything above failed.
 
 Do not hand-tag releases unless recovering from a broken release-please state.
+
+### Why steps 5 and 6 exist
+
+release-please publishes the release object *before* GoReleaser has anything to
+put in it. Between those two moments the release is real, it is what
+`/releases/latest` resolves to, and it contains nothing — so `curl … | sh`
+returns 404 for everyone. If GoReleaser then fails, that state is permanent.
+This is how `v0.4.0` shipped: Apple rejected notarization with
+`FORBIDDEN.REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED`, and installs stayed broken
+because no job checked whether the release was installable.
+
+`publication-state` bounds that window to the length of one workflow run.
+`smoke` is what tells it which way to go, and it tests over the public download
+URLs — an authenticated check would pass on a release the public cannot fetch.
+
+### Before releasing
+
+`.github/workflows/release-preflight.yml` runs the whole signing and
+notarization path against real Apple servers and stops short of publishing. It
+runs automatically on every release-please PR, weekly on a schedule, and on
+demand:
+
+```sh
+gh workflow run release-preflight.yml
+```
+
+Run it if a release has not gone out in a while. Signing depends on an Apple
+agreement, a certificate, and an App Store Connect key — all of which expire
+outside this repository, and none of which anything else notices.
+
+### Recovering a broken release
+
+Re-run the release **from the default branch**, passing the tag:
+
+```sh
+gh workflow run release.yml --ref main -f tag=vX.Y.Z
+```
+
+Do not use GitHub's "re-run jobs" button. It replays the workflow as it existed
+at the tag, so a release broken by a pipeline bug gets retried by the same
+broken pipeline. Uploads are idempotent (`replace_existing_artifacts`), and a
+successful run promotes the tag back to Latest — no deleting or re-tagging.

@@ -1,0 +1,136 @@
+name: Release preflight
+
+# Proves the macOS signing and notarization path still works *without*
+# publishing anything.
+#
+# Notarization depends on state that lives entirely outside this repository: an
+# Apple Developer agreement that can lapse, a certificate that expires, and an
+# App Store Connect key that can be revoked. None of that is visible from the
+# code, and the release pipeline is the only thing that exercises it — so the
+# first sign of breakage was a tagged release that had already been created and
+# could no longer be un-created. v0.4.0 died exactly this way:
+# FORBIDDEN.REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED, after the tag and release
+# object existed.
+#
+# This runs the real pipeline against real Apple servers and stops short of
+# publishing, so the same failure surfaces somewhere it costs nothing.
+
+on:
+  workflow_dispatch:
+  # Every release-please PR is a release about to happen. Checking here means
+  # the answer is already on the PR before the merge that creates the tag.
+  pull_request:
+    branches:
+      - main
+  # Nothing else notices a lapsed agreement or an expiring certificate until a
+  # release needs it, which may be months away.
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-preflight-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    # Only for release-please PRs — every other PR would burn a notarization
+    # round-trip on Apple's servers for a change that cannot affect signing.
+    # Dispatch and schedule runs always proceed.
+    if: github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--')
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Require signing secrets
+        env:
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+        run: |
+          missing=""
+          for name in MACOS_SIGN_P12 MACOS_SIGN_PASSWORD MACOS_NOTARY_ISSUER_ID \
+                      MACOS_NOTARY_KEY_ID MACOS_NOTARY_KEY; do
+            eval "value=\${$name}"
+            [ -n "$value" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Signing secrets are missing:$missing"
+            exit 1
+          fi
+
+      # GoReleaser needs a tag on HEAD to run the release pipeline. Deleting the
+      # real tags first keeps it from picking up a tag that already points at
+      # this commit — on a release-please PR that is exactly the situation.
+      # Nothing is pushed; these tags exist only in the runner's clone.
+      - name: Tag a throwaway version
+        run: |
+          git tag -d $(git tag -l) >/dev/null 2>&1 || true
+          git tag v0.0.0-preflight
+
+      # `--skip=publish,announce` stops after the artifacts are built, signed and
+      # notarized. Nothing reaches GitHub, and no tag or release is created.
+      # HOMEBREW_TAP_TOKEN is a placeholder: the formula is rendered but never
+      # pushed, and the config would fail to template without the variable set.
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean --skip=publish,announce
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: not-used-in-preflight
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+
+      # GoReleaser exiting 0 proves Apple accepted the submission. It does not
+      # prove the signature satisfies what `bmcp update` demands before it will
+      # replace a running binary — that requirement names a specific Team ID, so
+      # a certificate reissued under a different team would sign and notarize
+      # cleanly and still be rejected by every installed copy.
+      - name: Verify the signature bmcp update requires
+        run: |
+          set -eu
+          requirement='=anchor apple generic and certificate leaf[subject.OU] = T962D4K3Y7'
+          found=0
+          for bin in dist/*darwin*/bmcp; do
+            [ -f "$bin" ] || continue
+            found=$((found + 1))
+            echo "--- $bin"
+            codesign --verify --strict --verbose=2 "$bin"
+            codesign --verify -R "$requirement" "$bin"
+            codesign -dv "$bin" 2>&1 | grep -E 'TeamIdentifier|Authority' || true
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No darwin binaries found in dist/ — signing did not run"
+            exit 1
+          fi
+          echo "Verified $found darwin binaries"
+
+      - name: Summarize
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "### Signing preflight passed" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Apple accepted a notarization submission and the artifacts satisfy the \`bmcp update\` signing requirement. A release tagged now should publish." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Signing preflight failed" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "**Do not tag a release.** The release pipeline would fail the same way, leaving an empty release that \`/releases/latest\` points at." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`FORBIDDEN.REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED\` means an Apple agreement needs accepting at [appstoreconnect.apple.com](https://appstoreconnect.apple.com) — no repository change fixes it." >> "$GITHUB_STEP_SUMMARY"
+          fi
