@@ -65,3 +65,7 @@ release:
   github:
     owner: sirob-tech
     name: boris-mcp-cli
+  # Makes re-publishing a tag idempotent. A release that failed partway leaves
+  # some assets uploaded and some not; without this, the retry dies on a 422 for
+  # the ones that made it, and the only way forward is deleting things by hand.
+  replace_existing_artifacts: true
