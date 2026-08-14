@@ -713,17 +713,6 @@ func syncableMCP(gh *fakeGitHub) *fakeMCP {
 	return &fakeMCP{tools: []tool{{Name: "search_aws_memory", Description: "d"}}, github: gh}
 }
 
-// jsonTail returns the JSON document at the end of a stream that also carries
-// human prose — doctor --json shares stderr with "Syncing tools...".
-func jsonTail(t *testing.T, s string) []byte {
-	t.Helper()
-	idx := strings.Index(s, "{")
-	if idx < 0 {
-		t.Fatalf("no JSON found in: %s", s)
-	}
-	return []byte(s[idx:])
-}
-
 func TestToolCallsNeverReachTheUpdateEndpoints(t *testing.T) {
 	// The load-bearing guarantee: an agent making dozens of tool calls per
 	// session must never pay for a network round trip, let alone a binary swap.
@@ -924,11 +913,13 @@ func TestDoctorJSONCarriesTheUpdateObject(t *testing.T) {
 	var payload struct {
 		Update map[string]any `json:"update"`
 	}
-	if err := json.Unmarshal(jsonTail(t, stderr.String()), &payload); err != nil {
-		t.Fatalf("doctor --json is not valid JSON: %v\n%s", err, stderr.String())
+	// Parsed straight off stdout, no scanning for the first `{`: the document has
+	// the stream to itself.
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("doctor --json is not valid JSON: %v\n%s", err, stdout.String())
 	}
 	if payload.Update == nil {
-		t.Fatalf("expected an update object, got: %s", stderr.String())
+		t.Fatalf("expected an update object, got: %s", stdout.String())
 	}
 	for _, key := range []string{"current", "latest", "target", "available", "checked", "error", "applied", "action"} {
 		if _, ok := payload.Update[key]; !ok {
@@ -944,9 +935,18 @@ func TestDoctorJSONCarriesTheUpdateObject(t *testing.T) {
 	if payload.Update["error"] != nil || payload.Update["applied"] != false {
 		t.Fatalf("expected no error and applied=false: %v", payload.Update)
 	}
-	// Under --json there must be no free-text prose on the machine channel.
-	if strings.Contains(stdout.String(), "available") {
-		t.Fatalf("--json must not emit the human version row: %s", stdout.String())
+	// The Unmarshal above is itself the guarantee that no prose shares the machine
+	// channel: json.Unmarshal rejects trailing non-whitespace, so a human row
+	// printed alongside the document would fail the parse. What remains to pin is
+	// the split — prose on stderr, and the document *only* on stdout.
+	if !strings.Contains(stderr.String(), "Syncing tools") {
+		t.Fatalf("expected progress prose on stderr, got: %s", stderr.String())
+	}
+	// Matched on "checks" rather than "ok": fail() legitimately writes an
+	// {"ok":false,...} envelope to stderr under --json, so "ok" would fire on the
+	// error path this very commit defines, with a misleading message.
+	if strings.Contains(stderr.String(), `"checks"`) {
+		t.Fatalf("the JSON document must not also reach stderr: %s", stderr.String())
 	}
 }
 

@@ -616,6 +616,61 @@ func TestHelpNeverReachesTheNetwork(t *testing.T) {
 	}
 }
 
+// doctor --json used to write its document to stderr, which syncTools also
+// writes "Syncing tools..." to — so the stream was not a parseable JSON
+// document and consumers had to scan for the first `{`. It now follows the same
+// split as cmdList: machine output on stdout, prose on stderr.
+func TestDoctorJSONIsParseableOnStdoutWithProseOnStderr(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		httpClient:  &fakeMCP{tools: []tool{{Name: "tools___search_aws", Description: "Search."}}},
+		credentials: staticCreds(),
+	}
+	if code := a.run([]string{"doctor", "--json"}); code != 0 {
+		t.Fatalf("doctor exit %d, stderr: %s", code, stderr.String())
+	}
+	// Unmarshalling the whole of stdout is the assertion: it rejects any leading
+	// or trailing prose, which is exactly what the bug produced.
+	var payload struct {
+		OK     bool `json:"ok"`
+		Checks []struct {
+			Name string `json:"name"`
+			OK   bool   `json:"ok"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not a single JSON document: %v\n%s", err, stdout.String())
+	}
+	if !payload.OK || len(payload.Checks) == 0 {
+		t.Fatalf("expected passing checks, got: %s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "Syncing tools") {
+		t.Fatalf("progress prose belongs on stderr, got: %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), `"checks"`) {
+		t.Fatalf("the document must not also reach stderr: %s", stderr.String())
+	}
+	// Without --json the rows stay human and stdout carries no JSON.
+	stdout.Reset()
+	stderr.Reset()
+	if code := a.run([]string{"doctor"}); code != 0 {
+		t.Fatalf("doctor exit %d, stderr: %s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), `"checks"`) {
+		t.Fatalf("plain doctor should print rows, not JSON: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "config") {
+		t.Fatalf("expected human check rows on stdout, got: %s", stdout.String())
+	}
+}
+
 // A cache with no timestamp reaches cmdList through the same stale fallback; the
 // header then has no timestamp to print and the records carry no last_sync.
 func TestListReportsCountWithoutTimestampWhenCacheHasNoSync(t *testing.T) {
