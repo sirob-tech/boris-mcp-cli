@@ -20,9 +20,11 @@ type command struct {
 	// Tool calls are deliberately excluded: they must never pay for a network
 	// round trip, let alone a binary swap.
 	autoUpdate bool
-	// ownsUpdateFlags admits --check/--to/--rollback for this command only.
-	ownsUpdateFlags bool
-	run             func(*app, globalFlags, []string) int
+	// scope admits the flags belonging to this command alone — --check/--to/
+	// --rollback for update, --deep for doctor. The zero value is
+	// scopePostCommand, which is what every other command wants.
+	scope flagScope
+	run   func(*app, globalFlags, []string) int
 }
 
 // The auto-update hook hangs off this table rather than off the command
@@ -48,8 +50,8 @@ var commands = []command{
 	{names: []string{"version", "--version", "-V"}, rawArgs: true, run: (*app).cmdVersion},
 	{names: []string{"init"}, autoUpdate: true, run: (*app).cmdInit},
 	{names: []string{"sync"}, autoUpdate: true, run: (*app).cmdSync},
-	{names: []string{"doctor"}, autoUpdate: true, run: (*app).cmdDoctor},
-	{names: []string{"update"}, ownsUpdateFlags: true, run: (*app).cmdUpdate},
+	{names: []string{"doctor"}, autoUpdate: true, scope: scopeDoctor, run: (*app).cmdDoctor},
+	{names: []string{"update"}, scope: scopeUpdate, run: (*app).cmdUpdate},
 	// `tools` is here because it is what agents typed. It was the single most
 	// common wrong first token in the transcript audit, ahead of every
 	// near-miss spelling a suggestion could have caught, and a suggestion still
@@ -176,11 +178,7 @@ func (a *app) run(args []string) int {
 	name, cmdArgs := rest[0], rest[1:]
 	c, known := lookupCommand(name)
 	if known && !c.rawArgs {
-		scope := scopePostCommand
-		if c.ownsUpdateFlags {
-			scope = scopeUpdate
-		}
-		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs, scope)
+		flags, cmdArgs, err = parsePostCommandFlags(flags, cmdArgs, c.scope)
 		if err != nil {
 			return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 		}
@@ -583,15 +581,38 @@ func (a *app) cmdDynamic(flags globalFlags, name string, args []string) int {
 	return a.runCall(flags, t.Name, string(body), false)
 }
 
+// cmdDoctor answers "can this machine call BORIS right now".
+//
+// The generated instructions require it before the first BORIS call of every
+// agent session, which makes it the latency and authentication gate on all BMCP
+// usage. It used to load AWS credentials and sync the catalog every time: a
+// 3.55s median and an 11s maximum in the audited sessions, and three outright
+// failures where an expired SSO session met a sandbox that could not reach
+// device authorization — a diagnostic command failing closed on work the first
+// real tool call would have done anyway.
+//
+// So the routine answer now comes from local state alone, and the network half
+// runs only when local state cannot give it: no cache, an unreadable one, one
+// belonging to another server, or one past its TTL. `--deep` asks for it
+// unconditionally, which is what to reach for when a call has already failed on
+// auth or connectivity and the question is who is at fault.
+//
+// What this deliberately does not fix is #17. failSchemaChanged fires when a
+// tool call observes LastSync advance, and the escalation above syncs on exactly
+// the condition that would otherwise have made the tool call sync — a stale
+// cache — so doctor still consumes the signal first and the guard still cannot
+// fire in a session that ran doctor. Restoring it needs a baseline of what the
+// agent last read, not of when the cache was last written.
 func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 	if len(args) != 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: bmcp doctor")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp doctor [--deep]")
 	}
 	cfg, exists, err := a.loadEffective(flags, false)
 	checks := []map[string]any{}
-	// nil when no refresh was attempted (no config, no auth, or the remote was
-	// unreachable), which is a different state from "attempted and wrote nothing".
+	// nil when no refresh was attempted — no config, or no readable catalog to
+	// render from — which is a different state from "attempted and wrote nothing".
 	var instructions *refreshSummary
+	deep := false
 	add := func(name string, ok bool, msg string) {
 		checks = append(checks, map[string]any{"name": name, "ok": ok, "message": msg})
 		if flags.jsonOut {
@@ -610,32 +631,56 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 	} else {
 		add("config", true, cfg.ConfigPath)
 		add("url", validateURL(cfg.URL, flags.allowHTTP) == nil, sanitizeURL(cfg.URL))
-		if cache, err := readCache(cfg.ToolsPath); err == nil {
-			add("cache", true, fmt.Sprintf("%d tools, age %s", len(cache.Tools), a.now().Sub(cache.LastSync).Round(time.Second)))
-		} else {
-			add("cache", false, "missing or unreadable")
-		}
-		_, _, authErr := a.loadCredentials(context.Background(), cfg)
-		add("auth", authErr == nil, messageOrOK(authErr))
-		if authErr == nil {
-			cache, syncErr := a.syncTools(context.Background(), cfg)
-			add("remote", syncErr == nil, messageOrOK(syncErr))
-			if syncErr == nil {
-				add("tools", true, fmt.Sprintf("%d tools synced", len(cache.Tools)))
-				// The catalog that just landed in tools.json is not the catalog
-				// agents read. They read the tool list embedded in the instruction
-				// files, and until now only `bmcp sync` rewrote those — while
-				// BORIS.md tells agents to run `bmcp doctor`, not sync. So a tool
-				// added, renamed or removed upstream stayed invisible to every
-				// agent indefinitely, and the names they did see could point at
-				// tools the server no longer serves.
-				//
-				// User scope only. doctor runs unattended from whatever directory
-				// an agent is working in, and a project-scope file is claimed by
-				// filename alone — see refreshExistingInstructions.
-				summary := a.refreshInstructions(cache, false)
-				instructions = &summary
+		disk, diskErr := readCache(cfg.ToolsPath)
+		deep = flags.doctorDeep || !a.catalogIsFresh(cfg, disk, diskErr)
+		if deep {
+			_, _, authErr := a.loadCredentials(context.Background(), cfg)
+			add("auth", authErr == nil, messageOrOK(authErr))
+			if authErr == nil {
+				synced, syncErr := a.syncTools(context.Background(), cfg)
+				add("remote", syncErr == nil, messageOrOK(syncErr))
+				if syncErr == nil {
+					add("tools", true, fmt.Sprintf("%d tools synced", len(synced.Tools)))
+					disk, diskErr = synced, nil
+				}
 			}
+		}
+		// Reported last, and from the state this run ends in rather than the one it
+		// started in. Emitting it before the escalation meant a machine whose cache
+		// was missing was told "cache fail" and exited 1 having just successfully
+		// rebuilt it — and BORIS.md tells agents to read a failing doctor as "BORIS
+		// is broken" and stop using it.
+		if diskErr != nil {
+			add("cache", false, "missing or unreadable")
+		} else {
+			add("cache", true, a.cacheStatus(cfg, disk))
+			// Refreshed from whatever catalog this run ended with, synced or not.
+			//
+			// The catalog in tools.json is not the catalog agents read. They read the
+			// tool list embedded in the instruction files, and only `bmcp sync`
+			// rewrote those — while BORIS.md tells agents to run `bmcp doctor`. So a
+			// tool added, renamed or removed stayed invisible to every agent
+			// indefinitely, and the names they did see could point at tools the
+			// server no longer serves.
+			//
+			// Doing it on the local path too is what keeps that per-session cadence
+			// after this command stopped syncing. It cannot carry a change the server
+			// made — nothing local can — but it does carry every change that has
+			// already reached this machine: a catalog some earlier tool call synced,
+			// a template the last self-update changed, and a file whose previous
+			// refresh failed. Those are most of what went stale, and they cost
+			// nothing to fix. Server drift is bounded by sync_ttl instead of by the
+			// session, which is the price of not authenticating every session.
+			//
+			// It is free to repeat because renderInstructionToolList is a pure
+			// function of the catalog: an unchanged one renders byte-identical and
+			// writeFileWithBackup declines to write it at all.
+			//
+			// User scope only. doctor runs unattended from whatever directory an
+			// agent is working in, and a project-scope file is claimed by filename
+			// alone — see refreshExistingInstructions.
+			summary := a.refreshInstructions(disk, false)
+			instructions = &summary
 		}
 	}
 	// The update state is reported outside `checks` on purpose. add() feeds
@@ -650,7 +695,10 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 		add("update", false, st.Err.Error())
 	}
 	if flags.jsonOut {
-		payload := map[string]any{"ok": allChecksOK(checks), "checks": checks}
+		// mode says which question was answered, because the two produce different
+		// check sets and a consumer that finds no `auth` row should be able to tell
+		// "not checked" from "checked and gone".
+		payload := map[string]any{"ok": allChecksOK(checks), "checks": checks, "mode": doctorMode(deep)}
 		if st != nil {
 			payload["update"] = st.updateJSON()
 		}
@@ -670,6 +718,32 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 		return exitGeneric
 	}
 	return 0
+}
+
+func doctorMode(deep bool) string {
+	if deep {
+		return "deep"
+	}
+	return "local"
+}
+
+// cacheStatus describes the catalog on disk, and when it is not the one a tool
+// call would use, why not. "age 200h" is not an answer on its own: whether that
+// is stale depends on sync_ttl, and a cache can also be unusable at any age
+// because it belongs to another server. Each branch mirrors one conjunct of
+// catalogIsFresh, so a reader is never told to look at something that is fine.
+func (a *app) cacheStatus(cfg effectiveConfig, cache *toolCache) string {
+	msg := fmt.Sprintf("%d %s, age %s", len(cache.Tools), pluralize(len(cache.Tools), "tool"),
+		a.now().Sub(cache.LastSync).Round(time.Second))
+	switch {
+	case cache.URL != cfg.URL:
+		return msg + ", synced from a different URL"
+	case cfg.SyncTTL == 0:
+		return msg + ", sync_ttl is 0 so it is never reused"
+	case a.now().Sub(cache.LastSync) > cfg.SyncTTL:
+		return fmt.Sprintf("%s, older than sync_ttl %s", msg, cfg.SyncTTL)
+	}
+	return msg
 }
 
 func (a *app) updateSummary(st *updateState) string {
@@ -742,13 +816,18 @@ func usage(w io.Writer) {
   bmcp init [--url <url>] [--profile <profile>]
   bmcp install <claude-code|codex|opencode|cursor|kiro|all> [--scope user|project]
   bmcp sync
-  bmcp doctor
+  bmcp doctor [--deep]
   bmcp list|ls|tools [--output ndjson|json|human]
   bmcp describe|d <tool>
   bmcp call <tool> ['{"arg":"value"}']
   bmcp <exact_tool_name> --arg value
   bmcp update [--check] [--to <version>] [--rollback]
   bmcp version
+
+Flags for bmcp doctor:
+  --deep                       Also check credentials, the server and the live
+                               catalog. Without it doctor answers from local
+                               state when the cached catalog is fresh
 
 Flags for bmcp update:
   --check                      Report whether an update is available, apply nothing

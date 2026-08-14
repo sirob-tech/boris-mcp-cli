@@ -39,6 +39,10 @@ type globalFlags struct {
 	// means "print the version" is the same trap this file already sprang once
 	// with help.
 	updateTo string
+	// doctorDeep asks doctor for the checks that need the network: credentials,
+	// the server, and the live catalog. Without it doctor answers from local
+	// state alone whenever that state is trustworthy — see cmdDoctor.
+	doctorDeep bool
 }
 
 const (
@@ -66,15 +70,23 @@ func normalizeOutputFormat(v string) (string, error) {
 
 type flagScope int
 
+// scopePostCommand is the zero value so that the commands table can name a scope
+// per command and leave it out for the ordinary ones, which is what every
+// non-rawArgs command wants.
 const (
-	scopeGlobal flagScope = iota
-	scopePostCommand
+	scopePostCommand flagScope = iota
+	scopeGlobal
 	// scopeUpdate is scopePostCommand plus the flags only `bmcp update` accepts.
 	// They are scoped rather than shared because every non-rawArgs command runs
 	// through the same switch: admitting --to/--check/--rollback everywhere
 	// turned `bmcp call <tool> --to x` from a flag error that did nothing into a
 	// real call against the live server, and let `--to` swallow the tool name.
 	scopeUpdate
+	// scopeDoctor is scopePostCommand plus `--deep`, scoped for the same reason.
+	// `--deep` reads as "try harder", so admitting it everywhere would invite
+	// `bmcp <tool> --deep` — which is a tool argument named deep on some future
+	// catalog, and silently nothing on this one.
+	scopeDoctor
 )
 
 func parseGlobalFlags(args []string) (globalFlags, []string, error) {
@@ -146,6 +158,8 @@ func parseFlags(flags globalFlags, args []string, scope flagScope) (globalFlags,
 		// so it has to be accepted wherever those are invoked.
 		case arg == "--no-auto-update":
 			flags.noAutoUpdate = true
+		case arg == "--deep" && scope == scopeDoctor:
+			flags.doctorDeep = true
 		case arg == "--check" && scope == scopeUpdate:
 			flags.updateCheck = true
 		case arg == "--rollback" && scope == scopeUpdate:
