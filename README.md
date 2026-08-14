@@ -315,7 +315,10 @@ Project-scope targets:
 Existing files are modified in place. When a file changes, a timestamped
 `.bak-<timestamp>` backup is created and printed. The five most recent backups
 of a file are kept, so a bad write is still recoverable after a later one has
-happened.
+happened. The generated content is a pure function of the tool catalog, so a
+refresh against an unchanged catalog writes nothing at all — no backup, no
+mtime change — and the routine refresh below cannot age genuine restore points
+out of the set.
 
 Refresh tools and installed instructions:
 
@@ -325,6 +328,23 @@ bmcp sync
 
 `sync` refreshes the local tool cache and updates any existing BORIS instruction
 files it finds, without installing new harnesses.
+
+`doctor` refreshes the **user-scope** files whenever it reaches the server, so
+the tool list agents read stays current without anyone running `sync` by hand.
+Like `sync`, it installs no new harnesses — it only rewrites files that already
+exist.
+
+Project-scope files stay `sync`'s job. A project file is claimed by filename
+alone — nothing inside a `BORIS.md` marks it as generated — and `doctor` is what
+agents run every session from whatever repository they happen to be working in.
+Refreshing project scope from there would rewrite an unrelated file of that name
+in someone else's repository. `sync` is typed by a person who knows which
+directory they are standing in, so it still refreshes both.
+
+This is what keeps the catalog honest across a self-update. The run that applies
+an update finishes on the binary it already loaded, so it writes that binary's
+instructions; the next `doctor` run is the new binary and installs the new
+ones.
 
 ## Use
 

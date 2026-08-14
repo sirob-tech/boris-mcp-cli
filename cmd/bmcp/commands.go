@@ -255,11 +255,42 @@ func (a *app) cmdSyncWithRefresh(flags globalFlags, refreshInstructions bool) in
 	}
 	fmt.Fprintf(a.stderr, "Synced %d tools to %s\n", len(cache.Tools), cfg.ToolsPath)
 	if refreshInstructions {
-		for _, result := range refreshExistingInstructions(cache) {
-			printRefreshResult(a.stderr, result)
-		}
+		// True: a human typed `bmcp sync` in a directory they chose.
+		a.refreshInstructions(cache, true)
 	}
 	return 0
+}
+
+// refreshSummary is what a refresh did, in the form doctor --json reports. The
+// exit code deliberately ignores a failed refresh, so without this a fleet
+// watching `ok` would never learn that its agents are reading a months-stale
+// tool list — which is issue #25 again, one layer up.
+type refreshSummary struct {
+	Refreshed int `json:"refreshed"`
+	Failed    int `json:"failed"`
+}
+
+// refreshInstructions rewrites installed instruction files so the tool catalog
+// they embed matches the one this run just fetched. Every caller has already
+// synced, so the cache is the newest catalog available.
+//
+// Output goes to stderr and nothing here reaches an exit code. This runs inside
+// doctor, and BORIS.md tells agents to read a failing doctor as "BORIS is
+// broken" and stop using it — an unwritable ~/.claude is not that.
+func (a *app) refreshInstructions(cache *toolCache, includeProject bool) refreshSummary {
+	var summary refreshSummary
+	for _, result := range refreshExistingInstructions(cache, includeProject) {
+		for _, file := range result.Files {
+			switch {
+			case file.Path == "":
+				summary.Failed++
+			case file.Changed:
+				summary.Refreshed++
+			}
+		}
+		printRefreshResult(a.stderr, result)
+	}
+	return summary
 }
 
 // cmdList writes machine-readable records to stdout and everything else to
@@ -425,6 +456,9 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 	}
 	cfg, exists, err := a.loadEffective(flags, false)
 	checks := []map[string]any{}
+	// nil when no refresh was attempted (no config, no auth, or the remote was
+	// unreachable), which is a different state from "attempted and wrote nothing".
+	var instructions *refreshSummary
 	add := func(name string, ok bool, msg string) {
 		checks = append(checks, map[string]any{"name": name, "ok": ok, "message": msg})
 		if flags.jsonOut {
@@ -455,6 +489,19 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 			add("remote", syncErr == nil, messageOrOK(syncErr))
 			if syncErr == nil {
 				add("tools", true, fmt.Sprintf("%d tools synced", len(cache.Tools)))
+				// The catalog that just landed in tools.json is not the catalog
+				// agents read. They read the tool list embedded in the instruction
+				// files, and until now only `bmcp sync` rewrote those — while
+				// BORIS.md tells agents to run `bmcp doctor`, not sync. So a tool
+				// added, renamed or removed upstream stayed invisible to every
+				// agent indefinitely, and the names they did see could point at
+				// tools the server no longer serves.
+				//
+				// User scope only. doctor runs unattended from whatever directory
+				// an agent is working in, and a project-scope file is claimed by
+				// filename alone — see refreshExistingInstructions.
+				summary := a.refreshInstructions(cache, false)
+				instructions = &summary
 			}
 		}
 	}
@@ -473,6 +520,9 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 		payload := map[string]any{"ok": allChecksOK(checks), "checks": checks}
 		if st != nil {
 			payload["update"] = st.updateJSON()
+		}
+		if instructions != nil {
+			payload["instructions"] = instructions
 		}
 		out, _ := json.MarshalIndent(payload, "", "  ")
 		// stdout, matching the convention cmdList follows: machine-readable output
