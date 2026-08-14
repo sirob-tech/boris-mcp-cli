@@ -475,7 +475,11 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 			payload["update"] = st.updateJSON()
 		}
 		out, _ := json.MarshalIndent(payload, "", "  ")
-		fmt.Fprintln(a.stderr, string(out))
+		// stdout, matching the convention cmdList follows: machine-readable output
+		// on stdout, prose on stderr. This document used to share stderr with
+		// syncTools' "Syncing tools...", so the stream was not a parseable JSON
+		// document and every consumer had to scan for the first `{`.
+		fmt.Fprintln(a.stdout, string(out))
 	} else if st != nil {
 		fmt.Fprintf(a.stdout, "%-18s %s  %s\n", "version", "ok", a.updateSummary(st))
 	}

@@ -384,3 +384,18 @@ always works before the command name. After the command name, `help`, `version`
 and `install` take their arguments verbatim (`install` rejects it outright), as
 does the tool in the `bmcp <tool> --arg value` form. Putting `--output` first is
 always safe.
+
+### `bmcp doctor --json` output
+
+`doctor --json` writes one JSON document to stdout and nothing else, so it can
+be piped straight into a parser:
+
+```bash
+bmcp doctor --json | jq '.checks[] | select(.ok == false)'
+```
+
+Progress prose such as `Syncing tools...` goes to stderr, following the same
+split as `bmcp list`. The document carries `ok`, a `checks` array, and an
+`update` object when an update check ran. `ok` is false when any check failed,
+which is also when the command exits 1 — a failed *update* check is reported
+inside `update` and never changes the exit code.
