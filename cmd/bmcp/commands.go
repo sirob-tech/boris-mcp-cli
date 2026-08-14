@@ -40,12 +40,23 @@ var commands = []command{
 	// by the flag, because parseGlobalFlags rejects unknown `-`-prefixed tokens
 	// before dispatch and so would never see these names.
 	{names: []string{"help", "-h", "--help"}, rawArgs: true, run: (*app).cmdHelp},
-	{names: []string{"version"}, rawArgs: true, run: (*app).cmdVersion},
+	// The `--version`/`-V` aliases cover the same one position the help aliases
+	// do: after `--`, where parseFlags stops interpreting flags and hands the token
+	// on as a command name. Without them `bmcp -- --version` reaches cmdDynamic and
+	// is answered with a suggestion to run `bmcp version` — which is what it
+	// already said.
+	{names: []string{"version", "--version", "-V"}, rawArgs: true, run: (*app).cmdVersion},
 	{names: []string{"init"}, autoUpdate: true, run: (*app).cmdInit},
 	{names: []string{"sync"}, autoUpdate: true, run: (*app).cmdSync},
 	{names: []string{"doctor"}, autoUpdate: true, run: (*app).cmdDoctor},
 	{names: []string{"update"}, ownsUpdateFlags: true, run: (*app).cmdUpdate},
-	{names: []string{"list", "ls"}, run: (*app).cmdList},
+	// `tools` is here because it is what agents typed. It was the single most
+	// common wrong first token in the transcript audit, ahead of every
+	// near-miss spelling a suggestion could have caught, and a suggestion still
+	// costs the round trip an alias does not. It shadows a remote tool literally
+	// named `tools`, which the namespace prefix (`tools___<name>`) makes an
+	// implausible name for a tool inside it.
+	{names: []string{"list", "ls", "tools"}, run: (*app).cmdList},
 	{names: []string{"describe", "d"}, run: (*app).cmdDescribe},
 	{names: []string{"call"}, run: (*app).cmdCall},
 	{names: []string{"install"}, rawArgs: true, run: (*app).cmdInstall},
@@ -60,6 +71,73 @@ func lookupCommand(name string) (command, bool) {
 		}
 	}
 	return command{}, false
+}
+
+// commandNames lists one spelling per command — names[0] — which is what keeps
+// the flag-shaped aliases (`-h`, `--help`) and the single-letter ones (`d`) out
+// of suggestions. Suggesting `bmcp -h` to someone who mistyped a command name
+// would answer a question they did not ask.
+func commandNames() []string {
+	out := make([]string, 0, len(commands))
+	for _, c := range commands {
+		out = append(out, c.names[0])
+	}
+	return out
+}
+
+// nearestCommand answers with a command name only where the guess is a good one.
+// Plain edit distance is not good enough here, and it fails in both directions.
+//
+// Command names are short, so `sync`, `init`, `call` and `list` become attractors
+// that swallow any three-to-five character token: at a flat threshold of 3, `info`
+// meant `init` and `cost` meant `list`. Both of those point at commands with side
+// effects — `init` rewrites config and `sync` rewrites installed instruction files
+// — so a confidently wrong suggestion can talk a caller into one.
+//
+// In the other direction, truncation costs one edit per dropped character, so the
+// most natural abbreviations lost to unrelated short names: `desc` was answered
+// with `help` while being an unambiguous prefix of `describe`, which already has
+// `d` as an alias.
+func nearestCommand(name string) string {
+	// Prefix affinity first. A token that prefixes exactly one command is not a
+	// guess at all, however many edits away it is. Aliases count and map back to
+	// the canonical name, so `tool` resolves through `tools` to `list`.
+	if prefixed := commandsWithPrefix(name); len(prefixed) == 1 {
+		return prefixed[0]
+	}
+	// Then distance, scaled to the length of what it is matching against. One edit
+	// on a four-letter command is already a quarter of it.
+	best, bestDist := "", 0
+	for _, candidate := range commandNames() {
+		limit := 3
+		if len(candidate) <= 4 {
+			limit = 1
+		}
+		d := editDistance(name, candidate)
+		if d <= limit && (best == "" || d < bestDist) {
+			best, bestDist = candidate, d
+		}
+	}
+	return best
+}
+
+// commandsWithPrefix returns the canonical name of every command that name is a
+// prefix of, by any of its spellings. An empty name prefixes everything and so
+// identifies nothing.
+func commandsWithPrefix(name string) []string {
+	if name == "" {
+		return nil
+	}
+	var out []string
+	for _, c := range commands {
+		for _, n := range c.names {
+			if strings.HasPrefix(n, name) {
+				out = append(out, c.names[0])
+				break
+			}
+		}
+	}
+	return out
 }
 
 func (a *app) run(args []string) int {
@@ -78,6 +156,18 @@ func (a *app) run(args []string) int {
 	// reports the bad value rather than exiting 0 on the usage path.
 	if flags.help {
 		return a.cmdHelp(flags, nil)
+	}
+	// After help, so `bmcp --help --version` answers the broader question, and
+	// before the bare-usage path, so `bmcp -V` is not answered with usage.
+	if flags.version {
+		// Only as the whole request. `bmcp --version <tool> --arg x` would otherwise
+		// report the version and silently never call the tool, which is the same
+		// trap that made the update flag `--to` rather than `--version`.
+		if len(rest) > 0 {
+			return a.fail(flags, exitValidation, "usage", fmt.Sprintf(
+				"--version reports the installed version and takes no arguments; got %q.\nTo update to a specific version: bmcp update --to <version>", rest[0]))
+		}
+		return a.cmdVersion(flags, nil)
 	}
 	if len(rest) == 0 {
 		usage(a.stdout)
@@ -98,7 +188,9 @@ func (a *app) run(args []string) int {
 			return a.fail(flags, exitValidation, "invalid_output", err.Error())
 		}
 		// Before maybeAutoUpdate below: asking a command for help must not cost a
-		// network round trip, let alone a binary swap.
+		// network round trip, let alone a binary swap. There is no version check
+		// here on purpose — parseFlags accepts --version in the global scope only,
+		// so after a command name it is a flag error.
 		if flags.help {
 			return a.cmdHelp(flags, nil)
 		}
@@ -220,6 +312,14 @@ func (a *app) cmdVersion(flags globalFlags, args []string) int {
 	if hasHelpArg(args) {
 		usage(a.stdout)
 		return 0
+	}
+	// Rejected rather than ignored. run() guards the flag form, but the command
+	// aliases reach here with their arguments intact, so `bmcp -- --version doctor`
+	// and `bmcp version garbage` would otherwise report the version and exit 0
+	// having silently dropped what was actually asked for.
+	if len(args) > 0 {
+		return a.fail(flags, exitValidation, "usage", fmt.Sprintf(
+			"bmcp version takes no arguments; got %q.\nTo update to a specific version: bmcp update --to <version>", args[0]))
 	}
 	fmt.Fprintf(a.stdout, "bmcp %s\ncommit: %s\nbuilt: %s\n", version, buildCommit, buildDate)
 	// Without this line, "bmcp broke" reports after a self-update arrive with no
@@ -426,6 +526,30 @@ func (a *app) runCall(flags globalFlags, name string, payload string, readStdin 
 }
 
 func (a *app) cmdDynamic(flags globalFlags, name string, args []string) int {
+	// A mistyped command is answered from local state alone. Everything below can
+	// load credentials, sync the catalog, and — through requireConfig on an
+	// unconfigured interactive machine — run the whole first-run setup, none of
+	// which a typo should cost, and the last of which turns a typo into a prompt.
+	//
+	// The bar for answering locally is that the answer cannot differ from the one
+	// the normal path would give: either the catalog on disk is already the catalog
+	// a tool call would use, or there is no config, so no sync could produce a
+	// better one. Without that bar a stale cache made real tools unreachable — the
+	// server grows tools, and any new one whose name reads like a typo would be
+	// refused locally and never synced for.
+	if near := nearestCommand(name); near != "" {
+		cfg, configured, cfgErr := a.loadEffective(flags, false)
+		disk, diskErr := readCache(cfg.ToolsPath)
+		if cfgErr != nil || !configured || a.catalogIsFresh(cfg, disk, diskErr) {
+			if _, err := resolveTool(disk, name); err != nil {
+				var unknown *unknownToolError
+				if errors.As(err, &unknown) {
+					err = unknown.withCommand(near)
+				}
+				return a.fail(flags, exitValidation, "unknown_command", err.Error())
+			}
+		}
+	}
 	cfg, _, err := a.requireConfig(flags)
 	if err != nil {
 		return a.fail(flags, exitConfig, "not_configured", err.Error())
@@ -436,6 +560,15 @@ func (a *app) cmdDynamic(flags globalFlags, name string, args []string) int {
 	}
 	t, err := resolveTool(cache, name)
 	if err != nil {
+		// Reached whenever the check above declined to answer locally: a stale or
+		// absent catalog, or a name nowhere near a command. resolveTool speaks only
+		// for the catalog, so the command table's answer is added here.
+		var unknown *unknownToolError
+		if errors.As(err, &unknown) {
+			if near := nearestCommand(name); near != "" {
+				err = unknown.withCommand(near)
+			}
+		}
 		return a.fail(flags, exitValidation, "unknown_command", err.Error())
 	}
 	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h") {
@@ -610,7 +743,7 @@ func usage(w io.Writer) {
   bmcp install <claude-code|codex|opencode|cursor|kiro|all> [--scope user|project]
   bmcp sync
   bmcp doctor
-  bmcp list|ls [--output ndjson|json|human]
+  bmcp list|ls|tools [--output ndjson|json|human]
   bmcp describe|d <tool>
   bmcp call <tool> ['{"arg":"value"}']
   bmcp <exact_tool_name> --arg value
@@ -625,6 +758,8 @@ Flags for bmcp update:
 Global flags:
   --help, -h                   Show this help. As the only argument after a tool
                                name, shows that tool's schema instead
+  --version, -V                Show the installed version, same as bmcp version.
+                               Takes no arguments and no command
   --no-auto-update             Do not update automatically during this command
   --url, -u <url>              Override BORIS MCP URL
   --profile, -p <profile>      Override AWS profile

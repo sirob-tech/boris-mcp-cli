@@ -48,11 +48,38 @@ type schemaProperty struct {
 	Description string                    `json:"description,omitempty"`
 	Items       *schemaProperty           `json:"items,omitempty"`
 	Properties  map[string]schemaProperty `json:"properties,omitempty"`
+	// Required is a nested object's own required list. Only added for rendering:
+	// without it every sub-field would be marked optional, which for a required
+	// one is not a gap in the output but a wrong statement in it.
+	Required []string `json:"required,omitempty"`
+	// Enum and Const let a generated example name a value the schema accepts. A
+	// type placeholder in a field constrained to `["a","b"]` is valid JSON that the
+	// server still rejects, which for a copy-pasteable example is not much better
+	// than being unparseable.
+	Enum  []any `json:"enum,omitempty"`
+	Const any   `json:"const,omitempty"`
+}
+
+// catalogIsFresh reports whether the cache on disk is the catalog a tool call at
+// this instant would actually use: readable, belonging to this server, and inside
+// the TTL.
+//
+// cacheForCatalog inverts it to decide whether to sync, and cmdDynamic requires it
+// before answering an unknown name locally. Both callers must agree, or a local
+// answer could contradict the one the normal path would give after syncing —
+// which is how a tool the server had but the cache did not became unreachable.
+func (a *app) catalogIsFresh(cfg effectiveConfig, cache *toolCache, cacheErr error) bool {
+	// Guarded first: readCache returns a nil cache alongside its error, so every
+	// field access below depends on this.
+	if cacheErr != nil {
+		return false
+	}
+	return cache.URL == cfg.URL && cfg.SyncTTL != 0 && a.now().Sub(cache.LastSync) <= cfg.SyncTTL
 }
 
 func (a *app) cacheForCatalog(flags globalFlags, cfg effectiveConfig, allowStale bool) (*toolCache, error) {
 	cache, cacheErr := readCache(cfg.ToolsPath)
-	due := cacheErr != nil || cache.URL != cfg.URL || cfg.SyncTTL == 0 || a.now().Sub(cache.LastSync) > cfg.SyncTTL
+	due := !a.catalogIsFresh(cfg, cache, cacheErr)
 	// A refusal earlier in this run already established that upstream is listing
 	// nothing and that the cache on disk is the last known-good catalog. Asking
 	// again in the same process cannot produce a better answer, and the second ask
@@ -352,26 +379,102 @@ func (t tool) Describe(w io.Writer) {
 	if len(s.Properties) == 0 {
 		fmt.Fprintln(w, "  none")
 	} else {
-		req := map[string]bool{}
-		for _, r := range s.Required {
-			req[r] = true
-		}
+		req := set(s.Required)
 		for _, name := range propertyNames(s.Properties) {
-			marker := "optional"
-			if req[name] {
-				marker = "required"
-			}
-			p := s.Properties[name]
-			desc := p.Description
-			if desc != "" {
-				desc = " - " + desc
-			}
-			fmt.Fprintf(w, "  %s (%s, %s)%s\n", name, typeName(p.Type), marker, desc)
+			describeProperty(w, "  ", name, s.Properties[name], req[name])
 		}
 	}
 	displayName := displayToolName(t.Name)
 	fmt.Fprintf(w, "\nJSON call:\n  bmcp call %s '{%s}'\n", displayName, exampleJSONArgs(s))
 	fmt.Fprintf(w, "\nSubcommand:\n  bmcp %s%s\n", displayName, exampleFlags(s))
+}
+
+// describeProperty renders one argument and, indented under it, the fields a
+// structured argument is made of.
+//
+// Rendering only the top level showed an object argument with no fields at all,
+// so the only shape guidance a caller got was the `{"Key":"value"}` placeholder
+// in the examples below — which Validate accepts, because it checks an object
+// argument for being a map and nothing else. `Key` then reached the server as a
+// filter key that does not exist, and the call succeeded.
+func describeProperty(w io.Writer, indent, name string, p schemaProperty, required bool) {
+	marker := "optional"
+	if required {
+		marker = "required"
+	}
+	// Collapsed, not printed verbatim: the indentation is now semantic, so a
+	// newline inside a description would put continuation text at column 0 where
+	// it reads as another argument. Tool-level descriptions in this catalog
+	// already contain newlines, so a property one is a question of when.
+	desc := normalizeWhitespace(p.Description)
+	if desc != "" {
+		desc = " - " + desc
+	}
+	fmt.Fprintf(w, "%s%s (%s, %s)%s\n", indent, name, argTypeName(p), marker, desc)
+	fields, fieldsRequired := nestedProperties(p)
+	req := set(fieldsRequired)
+	for _, sub := range propertyNames(fields) {
+		describeProperty(w, indent+"  ", sub, fields[sub], req[sub])
+	}
+}
+
+// nestedProperties returns the fields a caller has to fill in for a structured
+// argument, plus that level's own required list. Array items are followed as well
+// as object properties, because both hide a shape the caller must produce.
+//
+// The recursion in describeProperty terminates on this: the tree comes from an
+// unmarshalled schema, so however deep it nests it is finite — a `$ref` cycle is
+// not representable in it, because nothing here resolves `$ref` at all.
+func nestedProperties(p schemaProperty) (map[string]schemaProperty, []string) {
+	// The declared type decides which keyword applies. JSON Schema reads `items` for
+	// an array and `properties` for an object, so a schema carrying both is not
+	// licence to pick whichever is present: preferring `properties` on a declared
+	// array printed fields the array does not have while the heading, taken from
+	// `items`, described the ones it does.
+	//
+	// Array levels are followed as deep as they nest, so an array of arrays of
+	// objects still reaches the fields, and argTypeName names every level it
+	// descends so the heading stays attributable to them.
+	if typeName(p.Type) == "array" {
+		if p.Items != nil {
+			return nestedProperties(*p.Items)
+		}
+		return nil, nil
+	}
+	if len(p.Properties) > 0 {
+		return p.Properties, p.Required
+	}
+	// No declared type: presence is the only evidence of shape.
+	if p.Items != nil {
+		return nestedProperties(*p.Items)
+	}
+	return nil, nil
+}
+
+// argTypeName spells an array of typed items as "array of object" rather than
+// "array". For the structured case that is what attributes the fields indented
+// underneath to the items instead of to the array itself.
+func argTypeName(p schemaProperty) string {
+	name := typeName(p.Type)
+	if name == "" {
+		// No declared type: infer from whichever shape keyword is present, in the same
+		// order nestedProperties uses, so the heading always describes the fields
+		// printed beneath it. An items schema declaring properties and no type used to
+		// render as a bare "array" with its fields indented under it, which is the
+		// exact ambiguity this function exists to remove.
+		switch {
+		case len(p.Properties) > 0:
+			name = "object"
+		case p.Items != nil:
+			name = "array"
+		}
+	}
+	if name == "array" && p.Items != nil {
+		if inner := argTypeName(*p.Items); inner != "" {
+			return "array of " + inner
+		}
+	}
+	return name
 }
 
 // toolRecord is one line of `bmcp list` output. It is deliberately separate from
@@ -497,7 +600,7 @@ func resolveTool(cache *toolCache, name string) (tool, error) {
 		return t, nil
 	}
 	if cache == nil {
-		return tool{}, fmt.Errorf("Unknown command or tool: %s", name)
+		return tool{}, newUnknownToolError(cache, name)
 	}
 	var matches []tool
 	for _, t := range cache.Tools {
@@ -516,7 +619,79 @@ func resolveTool(cache *toolCache, name string) (tool, error) {
 		sort.Strings(fullNames)
 		return tool{}, fmt.Errorf("Ambiguous tool alias: %s\nUse the full tool name: %s", name, strings.Join(fullNames, ", "))
 	}
-	return tool{}, fmt.Errorf("Unknown command or tool: %s", name)
+	return tool{}, newUnknownToolError(cache, name)
+}
+
+// unknownToolError is returned when a name matched nothing in the catalog. It is a
+// type rather than a formatted string so that a caller which also has the local
+// command table behind it — cmdDynamic, for a first token — can add that near miss
+// to the same message, while callers where the name can only be a tool (describe,
+// call) leave it empty. Assembling the lines in one place is what keeps the
+// recovery hint last no matter which suggestions are present.
+type unknownToolError struct {
+	name        string
+	nearTool    string
+	nearCommand string
+}
+
+func newUnknownToolError(cache *toolCache, name string) *unknownToolError {
+	return &unknownToolError{name: name, nearTool: nearestToolName(cache, name)}
+}
+
+// withCommand returns a copy naming the nearest local command as well. The two
+// near misses stay on separate labelled lines because they call for different next
+// moves: one is a different spelling of something bmcp does locally, the other is a
+// different tool on the server.
+func (e *unknownToolError) withCommand(near string) *unknownToolError {
+	out := *e
+	out.nearCommand = near
+	return &out
+}
+
+func (e *unknownToolError) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Unknown command or tool: %s", e.name)
+	if e.nearCommand != "" {
+		fmt.Fprintf(&b, "\nDid you mean the command: bmcp %s?", e.nearCommand)
+	}
+	if e.nearTool != "" {
+		fmt.Fprintf(&b, "\nDid you mean the tool: %s?", e.nearTool)
+	}
+	// Unconditional. The least-informed failure — nothing close enough to suggest —
+	// is the one that most needs a next step, and it used to be the only one that
+	// got none.
+	b.WriteString("\nRun `bmcp --help` for commands, `bmcp list` for the current tool catalog.")
+	return b.String()
+}
+
+// nearestToolName matches both spellings of every tool, because both are things a
+// caller types: the display name is what the generated instructions show, and the
+// full namespaced name is what a copy out of the catalog gives. Matching only the
+// display form left a typo in the full name unsuggestable, since the `tools___`
+// prefix alone puts the distance past the threshold.
+//
+// The answer is always the display name — the shorter spelling that also resolves.
+// Sorted, so a tie between two equally distant names resolves the same way on every
+// run.
+func nearestToolName(cache *toolCache, name string) string {
+	if cache == nil {
+		return ""
+	}
+	displayFor := make(map[string]string, len(cache.Tools)*2)
+	spellings := make([]string, 0, len(cache.Tools)*2)
+	for _, t := range cache.Tools {
+		display := displayToolName(t.Name)
+		for _, spelling := range []string{display, t.Name} {
+			if _, seen := displayFor[spelling]; seen {
+				continue
+			}
+			displayFor[spelling] = display
+			spellings = append(spellings, spelling)
+		}
+	}
+	sort.Strings(spellings)
+	// A miss yields "", which is also what an absent key returns.
+	return displayFor[nearest(name, spellings)]
 }
 
 func propertyNames(props map[string]schemaProperty) []string {
@@ -529,19 +704,38 @@ func propertyNames(props map[string]schemaProperty) []string {
 }
 
 func suggestion(name string, candidates []string) string {
-	best, dist := "", 99
-	for _, c := range candidates {
-		if d := levenshtein(name, c); d < dist {
-			best, dist = c, d
-		}
-	}
-	if best != "" && dist <= 3 {
+	if best := nearest(name, candidates); best != "" {
 		return fmt.Sprintf("Did you mean: --%s?\n", best)
 	}
 	return ""
 }
 
-func levenshtein(a, b string) int {
+// nearest returns the closest candidate within an edit distance of 3, or "" when
+// nothing is close enough. Ties go to the earliest candidate, so callers that
+// want a deterministic answer pass a sorted list.
+func nearest(name string, candidates []string) string {
+	best, dist := "", 4
+	for _, c := range candidates {
+		if d := editDistance(name, c); d < dist {
+			best, dist = c, d
+		}
+	}
+	return best
+}
+
+// editDistance is Damerau-Levenshtein restricted to adjacent transpositions: a
+// swap of two neighbouring characters costs one edit, not two.
+//
+// That distinction carries real weight against short command names. Transposition
+// is one of the most common ways to mistype a word, and under plain Levenshtein
+// `lsit`, `snyc`, `inti` and `clal` all cost two — out of reach of the tight
+// threshold that four-letter command names need to avoid swallowing unrelated
+// tokens. Counting the swap as one edit covers them without loosening anything
+// else.
+func editDistance(a, b string) int {
+	// Two previous rows, because a transposition reaches back two positions in
+	// both strings.
+	prev2 := make([]int, len(b)+1)
 	prev := make([]int, len(b)+1)
 	for j := range prev {
 		prev[j] = j
@@ -555,8 +749,15 @@ func levenshtein(a, b string) int {
 				cost = 1
 			}
 			cur[j] = min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+			// The two characters just consumed are the same pair in the opposite
+			// order, so one swap explains them.
+			if i > 1 && j > 1 && a[i-1] == b[j-2] && a[i-2] == b[j-1] {
+				if swapped := prev2[j-2] + 1; swapped < cur[j] {
+					cur[j] = swapped
+				}
+			}
 		}
-		prev = cur
+		prev2, prev = prev, cur
 	}
 	return prev[len(b)]
 }
@@ -591,15 +792,30 @@ func exampleFlags(s schemaObject) string {
 func exampleFlagValue(p schemaProperty) string {
 	switch typeName(p.Type) {
 	case "object":
-		return `'{"Key":"value"}'`
+		if len(p.Properties) == 0 {
+			return `'{"Key":"value"}'`
+		}
+		return "'" + exampleObject(p) + "'"
 	case "array":
-		return `'[]'`
+		return "'" + exampleArray(p) + "'"
 	default:
 		return exampleValue(p)
 	}
 }
 
 func exampleValue(p schemaProperty) string {
+	// A schema that names its accepted values is the best example available: a type
+	// placeholder in a constrained field parses and is then rejected upstream.
+	if p.Const != nil {
+		if b, err := json.Marshal(p.Const); err == nil {
+			return string(b)
+		}
+	}
+	for _, v := range p.Enum {
+		if b, err := json.Marshal(v); err == nil {
+			return string(b)
+		}
+	}
 	switch typeName(p.Type) {
 	case "string":
 		return `"value"`
@@ -610,12 +826,66 @@ func exampleValue(p schemaProperty) string {
 	case "number":
 		return "1.0"
 	case "array":
-		return "[]"
+		return exampleArray(p)
 	case "object":
-		return "{}"
+		// An object with no declared fields keeps `{}`: there is no real key to
+		// name, and `{}` at least sends nothing rather than sending a wrong key.
+		if len(p.Properties) == 0 {
+			return "{}"
+		}
+		return exampleObject(p)
 	default:
-		return "..."
+		// Quoted, so the result is still valid JSON. A bare `...` was tolerable
+		// when it could only appear at the top level of a rendered example; nested
+		// inside an object or array it makes the whole example unparseable, and the
+		// CLI then rejects its own printed example.
+		return `"..."`
 	}
+}
+
+// exampleArray shows one element whenever the schema says what an element looks
+// like. `[]` passes Validate — which checks only that the value is a list — and
+// then reaches the server missing whatever the items require, which is the same
+// wrong-payload harm the object examples exist to remove.
+func exampleArray(p schemaProperty) string {
+	if p.Items == nil {
+		return "[]"
+	}
+	return "[" + exampleValue(*p.Items) + "]"
+}
+
+// exampleObject names a field the schema actually declares. The `Key` placeholder
+// it replaces was not merely unhelpful: local validation accepts it, so the
+// example was a copy-pasteable way to send the server a key that does not exist
+// and get a plausible answer back. Callers must check len(p.Properties) first.
+func exampleObject(p schemaProperty) string {
+	parts := []string{}
+	for _, name := range exampleFieldNames(p) {
+		parts = append(parts, fmt.Sprintf("%q:%s", name, exampleValue(p.Properties[name])))
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+// exampleFieldNames returns every required field, not just one: an example naming a
+// single field of two required ones is a payload the server rejects for a missing
+// key, which is the same class of unusable example as an empty array.
+//
+// With nothing required it returns the first field alone — naming one is what
+// teaches the shape, and naming all of them would bury it. propertyNames sorts, so
+// both cases are stable across runs. Callers must check len(p.Properties) first.
+func exampleFieldNames(p schemaProperty) []string {
+	names := propertyNames(p.Properties)
+	required := set(p.Required)
+	var out []string
+	for _, n := range names {
+		if required[n] {
+			out = append(out, n)
+		}
+	}
+	if len(out) == 0 {
+		out = names[:1]
+	}
+	return out
 }
 
 func normalizeWhitespace(s string) string {
