@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -19,10 +20,26 @@ import (
 type fakeMCP struct {
 	tools      []tool
 	callResult []byte
+	// github serves the update endpoints. Left nil, any GitHub request is a
+	// hard test failure rather than a silent trip to the real network — which
+	// is what makes the "tool calls never check for updates" tests meaningful.
+	github         *fakeGitHub
+	githubRequests int
 }
 
 func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
-	body, _ := io.ReadAll(req.Body)
+	if req.URL != nil && (req.URL.Host == "github.com" || req.URL.Host == "api.github.com") {
+		m.githubRequests++
+		if m.github == nil {
+			return nil, fmt.Errorf("unexpected GitHub request: %s", req.URL)
+		}
+		return m.github.Do(req)
+	}
+	// Guarded because a HEAD carries no body, and io.ReadAll(nil) panics.
+	var body []byte
+	if req.Body != nil {
+		body, _ = io.ReadAll(req.Body)
+	}
 	var rpc jsonRPCRequest
 	_ = json.Unmarshal(body, &rpc)
 	header := http.Header{"Content-Type": {"application/json"}}

@@ -17,6 +17,13 @@ type globalFlags struct {
 	nonInteractive bool
 	verbose        bool
 	allowHTTP      bool
+	noAutoUpdate   bool
+	updateCheck    bool
+	updateRollback bool
+	// updateTo is `--to`, not `--version`: `version` is already a command and
+	// `--help`/`-h` are already command aliases, so a `--version` flag would
+	// collide with the natural fix for issue #13.
+	updateTo string
 }
 
 const (
@@ -47,6 +54,12 @@ type flagScope int
 const (
 	scopeGlobal flagScope = iota
 	scopePostCommand
+	// scopeUpdate is scopePostCommand plus the flags only `bmcp update` accepts.
+	// They are scoped rather than shared because every non-rawArgs command runs
+	// through the same switch: admitting --to/--check/--rollback everywhere
+	// turned `bmcp call <tool> --to x` from a flag error that did nothing into a
+	// real call against the live server, and let `--to` swallow the tool name.
+	scopeUpdate
 )
 
 func parseGlobalFlags(args []string) (globalFlags, []string, error) {
@@ -55,8 +68,8 @@ func parseGlobalFlags(args []string) (globalFlags, []string, error) {
 	return parseFlags(globalFlags{output: outputNDJSON}, args, scopeGlobal)
 }
 
-func parsePostCommandFlags(flags globalFlags, args []string) (globalFlags, []string, error) {
-	return parseFlags(flags, args, scopePostCommand)
+func parsePostCommandFlags(flags globalFlags, args []string, scope flagScope) (globalFlags, []string, error) {
+	return parseFlags(flags, args, scope)
 }
 
 func parseFlags(flags globalFlags, args []string, scope flagScope) (globalFlags, []string, error) {
@@ -95,6 +108,22 @@ func parseFlags(flags globalFlags, args []string, scope flagScope) (globalFlags,
 			flags.verbose = true
 		case arg == "--allow-http":
 			flags.allowHTTP = true
+		// Global: it suppresses the auto-update that doctor, sync and init run,
+		// so it has to be accepted wherever those are invoked.
+		case arg == "--no-auto-update":
+			flags.noAutoUpdate = true
+		case arg == "--check" && scope == scopeUpdate:
+			flags.updateCheck = true
+		case arg == "--rollback" && scope == scopeUpdate:
+			flags.updateRollback = true
+		case arg == "--to" && scope == scopeUpdate:
+			v, err := next(arg)
+			if err != nil {
+				return flags, nil, err
+			}
+			flags.updateTo = v
+		case strings.HasPrefix(arg, "--to=") && scope == scopeUpdate:
+			flags.updateTo = strings.TrimPrefix(arg, "--to=")
 		case arg == "--url" || arg == "-u":
 			v, err := next(arg)
 			if err != nil {

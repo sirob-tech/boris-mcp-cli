@@ -24,6 +24,16 @@ const (
 	exitUpstream   = 6
 )
 
+// Injected by GoReleaser at build time. `version` arrives unprefixed
+// (`0.3.0`) while git tags and the release redirect carry a `v`, so anything
+// comparing the two must normalize first — see normalizeVersion.
+//
+// buildCommit is the sole source-build sentinel: `version` defaults to a string
+// that is also a real released tag, so it cannot distinguish the two. Note that
+// release-please-config.json lists this file under extra-files but no line here
+// carries an x-release-please-version annotation, so nothing rewrites `version`
+// today. Adding one would turn the default into a real version and break that
+// detection; key install classification on buildCommit instead.
 var (
 	version     = "0.1.0"
 	buildCommit = "unknown"
@@ -45,6 +55,15 @@ type app struct {
 	credentials credentialsFunc
 	lookPath    func(string) (string, error)
 	interactive func() bool
+	// executable and verifySignature are injectable so the swap can be tested.
+	// Without them a test exercising the update path resolves to, and would
+	// overwrite, the `go test` binary itself.
+	executable      func() (string, error)
+	verifySignature func(string) error
+	// update carries the result of the auto-update check from run() to whatever
+	// command wants to report it. Only doctor reads it.
+	update           *updateState
+	warnedAutoUpdate bool
 }
 
 func main() {

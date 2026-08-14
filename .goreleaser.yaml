@@ -33,9 +33,15 @@ archives:
 checksum:
   name_template: checksums.txt
 
+# Signing is unconditional on purpose. `bmcp update` verifies the Developer ID
+# signature before replacing a darwin binary, so a release that shipped unsigned
+# would be one that no installed binary can update to. Gating this on
+# `isEnvSet "MACOS_SIGN_P12"` made a missing secret degrade to a successful
+# unsigned release; now it fails the release instead. The release workflow
+# checks the same secrets up front so the failure names the missing one.
 notarize:
   macos:
-    - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+    - enabled: true
       sign:
         certificate: "{{.Env.MACOS_SIGN_P12}}"
         password: "{{.Env.MACOS_SIGN_PASSWORD}}"
