@@ -481,6 +481,141 @@ func TestInvalidOutputValueFailsValidationBeforeDispatch(t *testing.T) {
 	}
 }
 
+// bmcp is driven mostly by coding agents, and --help is the first thing an agent
+// tries against an unfamiliar binary. It has to reach stdout and exit 0 wherever
+// it appears, without touching config or the network — a non-zero exit reads as
+// "this tool is broken" and the agent abandons it.
+func TestHelpFlagPrintsUsageToStdoutAndExitsZero(t *testing.T) {
+	// No BMCP_HOME and no config on purpose: help must not require either.
+	t.Setenv("BMCP_HOME", filepath.Join(t.TempDir(), "absent"))
+	cases := [][]string{
+		{"--help"},
+		{"-h"},
+		{"help"},
+		{"--json", "--help"},
+		// Post-command: a known command must answer --help rather than reject it
+		// as an unknown flag.
+		{"doctor", "--help"},
+		{"list", "-h"},
+		{"describe", "--help"},
+		{"update", "--help"},
+		// install and version are rawArgs, so parseFlags never sees their
+		// arguments and each answers --help itself.
+		{"install", "--help"},
+		{"install", "claude-code", "-h"},
+		{"version", "--help"},
+		// After `--` the flag cannot fire, because `--` stops flag interpretation.
+		// The command-table aliases are what keep this working; without them the
+		// token is treated as an unknown tool and costs a sync round trip.
+		{"--", "--help"},
+		{"--", "-h"},
+	}
+	for _, args := range cases {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin:  strings.NewReader(""),
+				stdout: &stdout,
+				stderr: &stderr,
+				now:    time.Now,
+				// Every HTTP call fails, so a help path that reached the network
+				// could not accidentally succeed here. It does not *prove* no call
+				// was attempted — failingDoer returns an error rather than failing
+				// the test, and under `go test` inspectUpdate short-circuits as a
+				// source build before any request is built. That guarantee is pinned
+				// separately by TestHelpNeverReachesTheNetwork.
+				httpClient: failingDoer{},
+			}
+			if code := a.run(args); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), "Usage:") {
+				t.Fatalf("usage should go to stdout, got stdout %q stderr %q", stdout.String(), stderr.String())
+			}
+			if strings.Contains(stderr.String(), "unknown") {
+				t.Fatalf("stderr should not report an unknown flag, got: %s", stderr.String())
+			}
+		})
+	}
+}
+
+// Both orderings in run() are load-bearing and neither is expressible in the
+// table above, because both cases exit non-zero.
+//
+// --output is validated before the help check on purpose: the comment at the top
+// of run() records that a bad value must never exit 0, and `--output bogus
+// --help` is exactly the hole that would open if help were checked first.
+func TestInvalidOutputStillLosesToValidationWhenHelpIsAsked(t *testing.T) {
+	t.Setenv("BMCP_HOME", filepath.Join(t.TempDir(), "absent"))
+	for _, args := range [][]string{
+		{"--output", "bogus", "--help"},
+		{"--help", "--output", "bogus"},
+		{"doctor", "--help", "--output", "bogus"},
+		{"doctor", "--output", "bogus", "-h"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now, httpClient: failingDoer{}}
+			if code := a.run(args); code != exitValidation {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "--output") {
+				t.Fatalf("stderr should name the offending flag, got: %s", stderr.String())
+			}
+			if strings.Contains(stdout.String(), "Usage:") {
+				t.Fatalf("a bad --output must not be answered with usage: %s", stdout.String())
+			}
+		})
+	}
+}
+
+// The other ordering: the help check sits before maybeAutoUpdate, so asking a
+// command for help cannot cost a network round trip or a binary swap. This needs
+// a release build to be meaningful — under `go test` the default buildCommit
+// makes inspectUpdate short-circuit as a source build before any request is
+// constructed, so the check would pass either way.
+func TestHelpNeverReachesTheNetwork(t *testing.T) {
+	asReleaseBuild(t, "0.5.0")
+	t.Setenv("BMCP_HOME", configuredHome(t))
+	t.Setenv("HOME", t.TempDir())
+	path := stagedBinary(t, "old binary")
+
+	for _, args := range [][]string{
+		{"--help"},
+		{"-h"},
+		{"help"},
+		{"doctor", "--help"},
+		{"sync", "--help"},
+		{"init", "--help"},
+		{"--", "--help"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			// github is nil, so fakeMCP.Do turns any GitHub request into an error and
+			// counts it; githubRequests is what makes the assertion real.
+			m := &fakeMCP{tools: []tool{{Name: "search_aws_memory", Description: "d"}}}
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+				now: time.Now, httpClient: m, credentials: staticCreds(),
+				lookPath:   func(string) (string, error) { return "", os.ErrNotExist },
+				executable: func() (string, error) { return path, nil },
+			}
+			if code := a.run(args); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if m.githubRequests != 0 {
+				t.Fatalf("%v made %d GitHub requests; help must not check for updates", args, m.githubRequests)
+			}
+			if strings.Contains(stderr.String(), "Syncing tools") {
+				t.Fatalf("%v reached the MCP server; help must not sync: %s", args, stderr.String())
+			}
+		})
+	}
+	if got, _ := os.ReadFile(path); string(got) != "old binary" {
+		t.Fatalf("no help invocation may replace the binary, got %q", got)
+	}
+}
+
 // A cache with no timestamp reaches cmdList through the same stale fallback; the
 // header then has no timestamp to print and the records carry no last_sync.
 func TestListReportsCountWithoutTimestampWhenCacheHasNoSync(t *testing.T) {
@@ -613,6 +748,12 @@ func TestDynamicHelpUsesDisplayAlias(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "bmcp search_aws --query") {
 		t.Fatalf("help should use alias in subcommand example, got:\n%s", stdout.String())
+	}
+	// A tool's --help must resolve to that tool, not to the global usage. The
+	// global flag scope stops at the first non-flag token, which is what keeps
+	// this argv reaching cmdDynamic at all.
+	if strings.Contains(stdout.String(), "Usage:") {
+		t.Fatalf("a tool's --help should print its schema, not the global usage, got:\n%s", stdout.String())
 	}
 }
 

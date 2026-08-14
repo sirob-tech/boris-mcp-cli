@@ -20,9 +20,15 @@ type globalFlags struct {
 	noAutoUpdate   bool
 	updateCheck    bool
 	updateRollback bool
-	// updateTo is `--to`, not `--version`: `version` is already a command and
-	// `--help`/`-h` are already command aliases, so a `--version` flag would
-	// collide with the natural fix for issue #13.
+	// help is a flag as well as a command alias, because neither form covers
+	// every position. The flag serves `bmcp --help` and `bmcp doctor --help`; an
+	// alias cannot, since parseGlobalFlags rejects unknown `-`-prefixed tokens
+	// before dispatch sees the name. The alias serves `bmcp -- --help`, which the
+	// flag cannot, since `--` stops flag interpretation. See the commands table.
+	help bool
+	// updateTo is `--to`, not `--version`: `version` is already a command, and a
+	// `--version` flag next to a `version` command is the same trap this file
+	// already sprang once with help.
 	updateTo string
 }
 
@@ -96,6 +102,13 @@ func parseFlags(flags globalFlags, args []string, scope flagScope) (globalFlags,
 			return args[i], nil
 		}
 		switch {
+		// Accepted in every scope, so help works before or after a command name.
+		// It only fires when --help precedes the command, though, since the global
+		// scope hands everything from the first non-flag token onward to the
+		// command. `bmcp <tool> --help` therefore still reaches cmdDynamic, which
+		// answers it with that tool's schema instead of this usage text.
+		case arg == "--help" || arg == "-h":
+			flags.help = true
 		case arg == "--json":
 			flags.jsonOut = true
 		case arg == "--pretty":
