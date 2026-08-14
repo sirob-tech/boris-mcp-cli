@@ -32,10 +32,14 @@ type command struct {
 // cmdInit calls cmdSyncWithRefresh, so hooking that shared function would fire
 // twice for every init. Dispatch is the only place that sees the difference.
 var commands = []command{
-	// `-h`/`--help` are deliberately not aliases here. They never reached this
-	// table — parseGlobalFlags rejected them first — so they live in globalFlags
-	// instead, where run() can honour them both before and after a command name.
-	{names: []string{"help"}, rawArgs: true, run: (*app).cmdHelp},
+	// The `-h`/`--help` aliases cover exactly one position that globalFlags.help
+	// cannot: after `--`, where parseFlags stops interpreting flags and hands the
+	// token on as a command name. Without them `bmcp -- --help` falls through to
+	// cmdDynamic and is treated as an unknown *tool*, which costs a credential
+	// load and a sync round trip before failing. Every other position is served
+	// by the flag, because parseGlobalFlags rejects unknown `-`-prefixed tokens
+	// before dispatch and so would never see these names.
+	{names: []string{"help", "-h", "--help"}, rawArgs: true, run: (*app).cmdHelp},
 	{names: []string{"version"}, rawArgs: true, run: (*app).cmdVersion},
 	{names: []string{"init"}, autoUpdate: true, run: (*app).cmdInit},
 	{names: []string{"sync"}, autoUpdate: true, run: (*app).cmdSync},
@@ -199,7 +203,24 @@ func (a *app) cmdHelp(flags globalFlags, args []string) int {
 	return 0
 }
 
+// hasHelpArg spots --help/-h in the argument list of a rawArgs command, which
+// parseFlags never gets to inspect.
+func hasHelpArg(args []string) bool {
+	for _, arg := range args {
+		if arg == "--help" || arg == "-h" {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *app) cmdVersion(flags globalFlags, args []string) int {
+	// version is rawArgs, so parseFlags never sees its arguments and cannot set
+	// flags.help for it — same reason install handles these two tokens itself.
+	if hasHelpArg(args) {
+		usage(a.stdout)
+		return 0
+	}
 	fmt.Fprintf(a.stdout, "bmcp %s\ncommit: %s\nbuilt: %s\n", version, buildCommit, buildDate)
 	// Without this line, "bmcp broke" reports after a self-update arrive with no
 	// way to tell which version replaced which, or when.
@@ -484,6 +505,13 @@ func (a *app) updateSummary(st *updateState) string {
 }
 
 func (a *app) cmdInstall(flags globalFlags, args []string) int {
+	// Same reason as cmdVersion: install is rawArgs, so flags.help is never set
+	// for it. Checked before the argument loop so that --help wins over any other
+	// usage error in the same command line.
+	if hasHelpArg(args) {
+		usage(a.stdout)
+		return 0
+	}
 	scope := "user"
 	var harnesses []string
 	for i := 0; i < len(args); i++ {
@@ -497,12 +525,6 @@ func (a *app) cmdInstall(flags globalFlags, args []string) int {
 			scope = args[i]
 		case strings.HasPrefix(arg, "--scope="):
 			scope = strings.TrimPrefix(arg, "--scope=")
-		// install is rawArgs, so parseFlags never sees its arguments and cannot
-		// set flags.help for it. Handled here so `bmcp install --help` answers
-		// like every other command rather than failing as an unknown flag.
-		case arg == "--help" || arg == "-h":
-			usage(a.stdout)
-			return 0
 		case strings.HasPrefix(arg, "-"):
 			return a.fail(flags, exitValidation, "usage", "unknown install flag: "+arg)
 		default:
@@ -547,7 +569,8 @@ Flags for bmcp update:
   --rollback                   Restore the binary the last update replaced
 
 Global flags:
-  --help, -h                   Show this help; after a tool name, that tool's schema
+  --help, -h                   Show this help. As the only argument after a tool
+                               name, shows that tool's schema instead
   --no-auto-update             Do not update automatically during this command
   --url, -u <url>              Override BORIS MCP URL
   --profile, -p <profile>      Override AWS profile
