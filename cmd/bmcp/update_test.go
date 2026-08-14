@@ -570,9 +570,49 @@ func TestAcquireUpdateLockStealsAStaleLock(t *testing.T) {
 	}
 }
 
-func TestCodesignFailureOnlyWarnsUntilFailClosedIsEnabled(t *testing.T) {
+// The two codesign tests are inverses guarded on the same constant, so exactly
+// one runs. Keeping both means flipping codesignFailClosed — including flipping
+// it back in an emergency — never leaves the suite asserting behaviour the
+// binary no longer has.
+func TestCodesignFailureRefusesTheUpdateWhenFailClosed(t *testing.T) {
+	if !codesignFailClosed {
+		t.Skip("fail-closed is disabled; TestCodesignFailureOnlyWarns covers that setting")
+	}
+	asReleaseBuild(t, "0.5.0")
+	path := stagedBinary(t, "old binary")
+	assets := map[string][]byte{"bmcp-" + hostAsset(): releaseArchive(t, []byte("new binary"))}
+	assets["checksums.txt"] = checksumsFor(assets)
+
+	var stderr bytes.Buffer
+	a := &app{
+		stderr:          &stderr,
+		httpClient:      &fakeGitHub{latestTag: "v0.6.0", assets: assets},
+		now:             time.Now,
+		executable:      func() (string, error) { return path, nil },
+		verifySignature: func(string) error { return fmt.Errorf("signature does not match") },
+	}
+
+	st := a.inspectUpdate(context.Background(), effectiveConfig{}, "")
+	err := a.applyUpdate(context.Background(), globalFlags{}, st, st.Target)
+	if err == nil || !strings.Contains(err.Error(), "refusing to install an unverified binary") {
+		t.Fatalf("expected the update to be refused, got %v", err)
+	}
+	// The running binary is the thing that must survive: refusing an update is
+	// only safe if it leaves a working bmcp behind.
+	got, _ := os.ReadFile(path)
+	if string(got) != "old binary" {
+		t.Fatalf("a refused update must not swap the binary, got %q", got)
+	}
+	// A staged file left behind would be committed by the next update without
+	// ever being verified again.
+	if _, err := os.Stat(stagedPath(path)); !os.IsNotExist(err) {
+		t.Fatalf("a refused update must clear its staged binary, stat gave %v", err)
+	}
+}
+
+func TestCodesignFailureOnlyWarns(t *testing.T) {
 	if codesignFailClosed {
-		t.Skip("fail-closed is enabled; this test covers the warn-only rollout window")
+		t.Skip("fail-closed is enabled; TestCodesignFailureRefusesTheUpdateWhenFailClosed covers that setting")
 	}
 	asReleaseBuild(t, "0.5.0")
 	path := stagedBinary(t, "old binary")
