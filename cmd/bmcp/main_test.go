@@ -682,7 +682,10 @@ func TestDoctorJSONIsParseableOnStdoutWithProseOnStderr(t *testing.T) {
 		httpClient:  &fakeMCP{tools: []tool{{Name: "tools___search_aws", Description: "Search."}}},
 		credentials: staticCreds(),
 	}
-	if code := a.run([]string{"doctor", "--json"}); code != 0 {
+	// --deep because a routine doctor answers from local state and emits no
+	// progress prose at all, so it cannot demonstrate prose landing on the wrong
+	// stream. The deep path is the one that has a stream split to get wrong.
+	if code := a.run([]string{"doctor", "--deep", "--json"}); code != 0 {
 		t.Fatalf("doctor exit %d, stderr: %s", code, stderr.String())
 	}
 	// Unmarshalling the whole of stdout is the assertion: it rejects any leading
@@ -2100,7 +2103,11 @@ func TestDoctorFailsWhileUpstreamListsNoTools(t *testing.T) {
 		httpClient:  &fakeMCP{tools: []tool{}},
 		credentials: staticCreds(),
 	}
-	if code := a.run([]string{"doctor"}); code != exitGeneric {
+	// --deep: an empty upstream is only observable by asking it. A routine doctor
+	// answers from the cache, which is intact here, and reporting that as broken
+	// would be wrong — cacheForCatalog serves calls from exactly this cache while
+	// upstream lists nothing.
+	if code := a.run([]string{"doctor", "--deep"}); code != exitGeneric {
 		t.Fatalf("doctor should fail while the catalog is empty, exit %d", code)
 	}
 	if !strings.Contains(stdout.String(), "remote") || !strings.Contains(stdout.String(), "returned no tools") {
@@ -2108,8 +2115,370 @@ func TestDoctorFailsWhileUpstreamListsNoTools(t *testing.T) {
 	}
 	// The cache row still reports the preserved catalog, so the two rows together
 	// say "upstream is empty, your catalog survived".
-	if !strings.Contains(stdout.String(), "1 tools") {
+	if !strings.Contains(stdout.String(), "1 tool,") {
 		t.Fatalf("the cache row should still report the preserved catalog, got:\n%s", stdout.String())
+	}
+}
+
+// doctorRows parses the human check rows into name -> state. Matching row names
+// as substrings of the whole of stdout does not work: the cache row's message
+// contains the word "tools", so a `tools` row would appear to be present on
+// every run that printed a catalog of two or more.
+func doctorRows(t *testing.T, stdout string) map[string]string {
+	t.Helper()
+	rows := map[string]string{}
+	for _, line := range strings.Split(stdout, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		rows[fields[0]] = fields[1]
+	}
+	return rows
+}
+
+// refusingCreds fails the test if credentials are ever loaded. The audited
+// failures were not slow credential loads but failed ones — an expired SSO
+// session in a sandbox that could not reach device authorization — so "did not
+// authenticate" is the property, not "authenticated quickly".
+func refusingCreds(t *testing.T) credentialsFunc {
+	t.Helper()
+	return func(context.Context, effectiveConfig) (aws.Credentials, string, error) {
+		t.Error("doctor loaded AWS credentials while the cached catalog was fresh")
+		return aws.Credentials{}, "", errors.New("credentials must not be loaded")
+	}
+}
+
+// staleCache backdates the seeded catalog so it falls outside sync_ttl.
+func staleCache(t *testing.T, borisHome string, age time.Duration) {
+	t.Helper()
+	path := filepath.Join(borisHome, "tools.json")
+	cache, err := readCache(path)
+	if err != nil {
+		t.Fatalf("read seeded cache: %v", err)
+	}
+	cache.LastSync = time.Now().Add(-age)
+	if err := writeCache(path, cache); err != nil {
+		t.Fatalf("write backdated cache: %v", err)
+	}
+}
+
+// The whole point of the change: the command the generated instructions put in
+// front of every agent session must not authenticate or reach the server to
+// answer the routine question. In the audit this path had a 3.55s median and an
+// 11s maximum, and failed outright three times on credentials that the first
+// real tool call would have loaded anyway.
+func TestDoctorMakesNoRemoteCallWhileTheCatalogIsFresh(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	var stdout, stderr bytes.Buffer
+	m := &fakeMCP{tools: []tool{{Name: "tools___search_aws", Description: "Search."}}}
+	a := &app{
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		httpClient:  m,
+		credentials: refusingCreds(t),
+	}
+	if code := a.run([]string{"doctor"}); code != 0 {
+		t.Fatalf("doctor exit %d, stderr: %s", code, stderr.String())
+	}
+	if m.listCalls != 0 {
+		t.Fatalf("doctor synced the catalog on the routine path: %d tools/list calls", m.listCalls)
+	}
+	// Named rows rather than a count, because the failure this guards against is
+	// a check quietly reappearing, not the total changing.
+	rows := doctorRows(t, stdout.String())
+	for _, row := range []string{"auth", "remote", "tools"} {
+		if _, ok := rows[row]; ok {
+			t.Fatalf("the routine path must not report %q, got:\n%s", row, stdout.String())
+		}
+	}
+	for _, row := range []string{"config", "url", "cache"} {
+		if rows[row] != "ok" {
+			t.Fatalf("expected %q to pass locally, got %q in:\n%s", row, rows[row], stdout.String())
+		}
+	}
+}
+
+// The escalation, and its converse. A fresh cache is the only thing that earns
+// the local answer; anything that leaves the local catalog unusable has to go
+// and get one, or doctor would report ready on a machine that is not.
+func TestDoctorGoesRemoteWhenLocalStateCannotAnswer(t *testing.T) {
+	fresh := []tool{{Name: "tools___search_aws", Description: "Search."}}
+	for _, tc := range []struct {
+		name    string
+		degrade func(t *testing.T, borisHome string)
+		args    []string
+	}{
+		{
+			name:    "stale cache",
+			degrade: func(t *testing.T, home string) { staleCache(t, home, 8*24*time.Hour) },
+			args:    []string{"doctor"},
+		},
+		{
+			name: "missing cache",
+			degrade: func(t *testing.T, home string) {
+				if err := os.Remove(filepath.Join(home, "tools.json")); err != nil {
+					t.Fatalf("remove cache: %v", err)
+				}
+			},
+			args: []string{"doctor"},
+		},
+		{
+			name: "unreadable cache",
+			degrade: func(t *testing.T, home string) {
+				if err := os.WriteFile(filepath.Join(home, "tools.json"), []byte("{"), 0o600); err != nil {
+					t.Fatalf("corrupt cache: %v", err)
+				}
+			},
+			args: []string{"doctor"},
+		},
+		{
+			// --deep overrides a perfectly good local state, which is what makes it
+			// useful after a call has already failed on auth or connectivity.
+			name:    "--deep while fresh",
+			degrade: func(t *testing.T, home string) {},
+			args:    []string{"doctor", "--deep"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Chdir(t.TempDir())
+			borisHome := setupInstallCatalog(t, home, fresh)
+			tc.degrade(t, borisHome)
+			var stdout, stderr bytes.Buffer
+			m := &fakeMCP{tools: fresh}
+			a := &app{
+				stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+				now: time.Now, httpClient: m, credentials: staticCreds(),
+			}
+			// Exit 0 including the missing- and unreadable-cache cases: doctor
+			// rebuilt the catalog in the same run, and BORIS.md teaches agents to
+			// read a failing doctor as "BORIS is broken" and stop using it. Before
+			// the cache row moved after the escalation, those two exited 1 having
+			// just fixed the thing they were complaining about.
+			if code := a.run(tc.args); code != 0 {
+				t.Fatalf("doctor exit %d, stdout:\n%s\nstderr: %s", code, stdout.String(), stderr.String())
+			}
+			if m.listCalls != 1 {
+				t.Fatalf("expected exactly one sync, got %d tools/list calls", m.listCalls)
+			}
+			rows := doctorRows(t, stdout.String())
+			for _, row := range []string{"auth", "remote", "tools", "cache"} {
+				if rows[row] != "ok" {
+					t.Fatalf("expected %q to pass, got %q in:\n%s", row, rows[row], stdout.String())
+				}
+			}
+		})
+	}
+}
+
+// The local path still carries every catalog change that has already reached
+// this machine — one an earlier tool call synced, a template a self-update
+// changed, or a file whose last refresh failed. That is what keeps the
+// per-session cadence #44 added after doctor stopped syncing; only server-side
+// drift now waits for sync_ttl.
+func TestDoctorRefreshesInstructionsWithoutSyncing(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	setupInstallCatalog(t, home, []tool{{Name: "tools___cached_tool", Description: "Already synced."}})
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	instructionsPath := filepath.Join(claudeDir, "BORIS.md")
+	if err := os.WriteFile(instructionsPath, []byte("# BORIS\n\n- `gone_tool`: Removed upstream.\n"), 0o644); err != nil {
+		t.Fatalf("write instructions: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	m := &fakeMCP{tools: []tool{{Name: "tools___cached_tool", Description: "Already synced."}}}
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: m, credentials: refusingCreds(t),
+	}
+	if code := a.run([]string{"doctor"}); code != 0 {
+		t.Fatalf("doctor exit %d, stderr: %s", code, stderr.String())
+	}
+	if m.listCalls != 0 {
+		t.Fatalf("the refresh must come from the cache, not a sync: %d tools/list calls", m.listCalls)
+	}
+	got, err := os.ReadFile(instructionsPath)
+	if err != nil {
+		t.Fatalf("read instructions: %v", err)
+	}
+	if !strings.Contains(string(got), "`cached_tool`: Already synced.") {
+		t.Fatalf("the local refresh did not render the cached catalog: %s", got)
+	}
+	if strings.Contains(string(got), "gone_tool") {
+		t.Fatalf("the stale entry survived the refresh: %s", got)
+	}
+}
+
+// The other half of the rehoming: once doctor stops syncing, the lazy sync a
+// tool call performs is what carries a server-side catalog change to the
+// instruction files agents actually read. Hanging that off doctor alone would
+// have meant hanging it off nothing.
+func TestLazySyncDuringAToolCallRefreshesInstructions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___old_tool", Description: "Old description."}})
+	staleCache(t, borisHome, 8*24*time.Hour)
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	instructionsPath := filepath.Join(claudeDir, "BORIS.md")
+	if err := os.WriteFile(instructionsPath, []byte("# BORIS\n\n- `old_tool`: Old description.\n"), 0o644); err != nil {
+		t.Fatalf("write instructions: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now,
+		httpClient: &fakeMCP{
+			tools:      []tool{{Name: "tools___new_tool", Description: "Newly synced."}},
+			callResult: []byte(`{"ok":true}`),
+		},
+		credentials: staticCreds(),
+	}
+	// A tool call, not doctor and not sync: the point is that the refresh rides
+	// on whichever command discovers the new catalog.
+	if code := a.run([]string{"new_tool"}); code != 0 {
+		t.Fatalf("tool call exit %d, stderr: %s", code, stderr.String())
+	}
+	got, err := os.ReadFile(instructionsPath)
+	if err != nil {
+		t.Fatalf("read instructions: %v", err)
+	}
+	if !strings.Contains(string(got), "`new_tool`: Newly synced.") {
+		t.Fatalf("the lazy sync did not refresh the tool list: %s", got)
+	}
+	if strings.Contains(string(got), "old_tool") {
+		t.Fatalf("the removed tool is still listed: %s", got)
+	}
+}
+
+// doctor --json says which question it answered. A consumer that finds no `auth`
+// row has to be able to tell "not checked" from "checked and gone".
+func TestDoctorJSONReportsWhichModeItRan(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{args: []string{"doctor", "--json"}, want: "local"},
+		{args: []string{"doctor", "--deep", "--json"}, want: "deep"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Chdir(t.TempDir())
+			tools := []tool{{Name: "tools___search_aws", Description: "Search."}}
+			setupInstallCatalog(t, home, tools)
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+				now: time.Now, httpClient: &fakeMCP{tools: tools}, credentials: staticCreds(),
+			}
+			if code := a.run(tc.args); code != 0 {
+				t.Fatalf("doctor exit %d, stderr: %s", code, stderr.String())
+			}
+			var payload struct {
+				Mode string `json:"mode"`
+			}
+			if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+				t.Fatalf("stdout is not a single JSON document: %v\n%s", err, stdout.String())
+			}
+			if payload.Mode != tc.want {
+				t.Fatalf("expected mode %q, got %q", tc.want, payload.Mode)
+			}
+		})
+	}
+}
+
+// A stale cache is not the same failure as a cache from another server or one a
+// zero TTL never reuses, and "age 200h" does not say which. Each branch names
+// the conjunct of catalogIsFresh that actually failed, or the row sends a reader
+// to look at something that is fine.
+//
+// Asserted on cacheStatus rather than through doctor, because doctor cannot
+// exhibit these strings on a healthy machine: every one of them triggers the
+// escalation, the sync succeeds, and the row then correctly describes the fresh
+// catalog it ended with. They reach a user on the run where that sync also
+// failed — so the row has to be right independently of it.
+func TestCacheStatusNamesWhyACatalogIsNotFresh(t *testing.T) {
+	now := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	a := &app{now: func() time.Time { return now }}
+	cfg := effectiveConfig{URL: "http://localhost:8787/mcp", SyncTTL: 168 * time.Hour}
+	fresh := &toolCache{URL: cfg.URL, LastSync: now.Add(-time.Hour), Tools: make([]tool, 3)}
+
+	for _, tc := range []struct {
+		name  string
+		cfg   effectiveConfig
+		cache *toolCache
+		want  string
+		// absent guards the fresh case, where any explanation at all is wrong.
+		absent []string
+	}{
+		{
+			name:   "fresh",
+			cfg:    cfg,
+			cache:  fresh,
+			want:   "3 tools, age 1h0m0s",
+			absent: []string{"older than", "different URL", "sync_ttl is 0"},
+		},
+		{
+			name:  "past the ttl",
+			cfg:   cfg,
+			cache: &toolCache{URL: cfg.URL, LastSync: now.Add(-200 * time.Hour), Tools: make([]tool, 3)},
+			want:  "older than sync_ttl 168h0m0s",
+		},
+		{
+			name:  "another server",
+			cfg:   cfg,
+			cache: &toolCache{URL: "http://localhost:9999/mcp", LastSync: now.Add(-time.Hour), Tools: make([]tool, 3)},
+			want:  "synced from a different URL",
+		},
+		{
+			// A zero TTL disables reuse outright, so age is not the reason and
+			// saying "older than sync_ttl 0s" would send the reader to the clock.
+			name:  "zero ttl",
+			cfg:   effectiveConfig{URL: cfg.URL, SyncTTL: 0},
+			cache: fresh,
+			want:  "sync_ttl is 0 so it is never reused",
+		},
+		{
+			// The pluralisation is load-bearing for nothing, but "1 tools" in the
+			// one-tool case is the kind of wrongness that erodes trust in the rest
+			// of the row.
+			name:  "one tool",
+			cfg:   cfg,
+			cache: &toolCache{URL: cfg.URL, LastSync: now, Tools: make([]tool, 1)},
+			want:  "1 tool, age 0s",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Each case must actually be in the state it claims, or it would assert
+			// a string the code happens to produce for another reason.
+			if wantFresh := tc.name == "fresh" || tc.name == "one tool"; a.catalogIsFresh(tc.cfg, tc.cache, nil) != wantFresh {
+				t.Fatalf("fixture precondition: catalogIsFresh should be %v", wantFresh)
+			}
+			got := a.cacheStatus(tc.cfg, tc.cache)
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("expected %q in the cache row, got %q", tc.want, got)
+			}
+			for _, no := range tc.absent {
+				if strings.Contains(got, no) {
+					t.Fatalf("a fresh catalog must not be explained away with %q, got %q", no, got)
+				}
+			}
+		})
 	}
 }
 
@@ -2234,7 +2603,11 @@ func TestDoctorRefreshesTheInstructionToolList(t *testing.T) {
 		}},
 		credentials: staticCreds(),
 	}
-	if code := a.run([]string{"doctor"}); code != 0 {
+	// --deep: the change under test is one the *server* made, and no local answer
+	// can carry it. The seeded cache is fresh, so a routine doctor refreshes from
+	// that cache and correctly never learns new_tool exists.
+	// TestDoctorRefreshesInstructionsWithoutSyncing covers the local half.
+	if code := a.run([]string{"doctor", "--deep"}); code != 0 {
 		t.Fatalf("doctor exit %d, stderr: %s", code, stderr.String())
 	}
 	got, err := os.ReadFile(instructionsPath)

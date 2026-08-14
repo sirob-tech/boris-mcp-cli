@@ -31,6 +31,20 @@ const (
 	updateCheckTimeout = 15 * time.Second
 	updateApplyTimeout = 5 * time.Minute
 
+	// updateCheckInterval bounds how often doctor, sync and init will ask GitHub
+	// what the latest release is. Without a cadence that question was asked on
+	// every invocation, and since the generated instructions require doctor
+	// before the first BORIS call, that is once per agent session — a network
+	// round trip on the path this CLI most needs to be fast, and one that no
+	// longer hides behind the credential load and catalog sync doctor used to do
+	// anyway.
+	//
+	// A day, because the cost of the delay is bounded and small: releases reach
+	// machines by themselves (see AGENTS.md), so this only decides whether that
+	// takes until the next session or until tomorrow. `bmcp update` and `bmcp
+	// update --check` are explicit requests and ignore it entirely.
+	updateCheckInterval = 24 * time.Hour
+
 	// The release archive is ~12 MB. The caps exist so a redirect to something
 	// unexpected cannot stream indefinitely into memory.
 	maxArchiveBytes   = 128 << 20
@@ -761,9 +775,11 @@ func verifyStagedBinary(staged string, want []byte) error {
 	return nil
 }
 
-// inspectUpdate resolves what version this binary should be on and whether it
-// can get there itself. It never returns nil.
-func (a *app) inspectUpdate(ctx context.Context, cfg effectiveConfig, explicit string) *updateState {
+// localUpdateState answers everything about this install that can be known
+// without the network: where the binary is, who manages it, and what would
+// update it. Checked stays false, which is what tells updateSummary to report
+// the version and claim nothing about whether it is current.
+func (a *app) localUpdateState() *updateState {
 	st := &updateState{Current: normalizeVersion(version)}
 	path, err := a.resolveExecutable()
 	if err != nil {
@@ -776,7 +792,6 @@ func (a *app) inspectUpdate(ctx context.Context, cfg effectiveConfig, explicit s
 	case installSource:
 		// No release corresponds to a source build, so there is nothing to
 		// check against and nothing to suggest.
-		return st
 	case installBrew:
 		st.Action = brewUpgradeCmd
 	case installVersioned:
@@ -785,6 +800,16 @@ func (a *app) inspectUpdate(ctx context.Context, cfg effectiveConfig, explicit s
 		st.Action = ""
 	default:
 		st.Action = "bmcp update"
+	}
+	return st
+}
+
+// inspectUpdate resolves what version this binary should be on and whether it
+// can get there itself. It never returns nil.
+func (a *app) inspectUpdate(ctx context.Context, cfg effectiveConfig, explicit string) *updateState {
+	st := a.localUpdateState()
+	if st.Err != nil || st.Kind == installSource {
+		return st
 	}
 
 	if explicit != "" {
@@ -815,6 +840,53 @@ func (a *app) inspectUpdate(ctx context.Context, cfg effectiveConfig, explicit s
 	return st
 }
 
+// updateCheckState is the cadence marker for maybeAutoUpdate. It lives beside
+// the config rather than in the install receipt next to the binary: the receipt
+// sits in a directory a package manager may own and may have made read-only,
+// and a check that cannot record itself is a check that runs every time.
+type updateCheckState struct {
+	LastCheck time.Time `json:"last_check"`
+}
+
+func updateCheckPath(cfg effectiveConfig) string {
+	return filepath.Join(cfg.Home, "update-check.json")
+}
+
+// updateCheckDue fails open: any unreadable, unparseable or absent marker means
+// check now. The marker is a cache, and losing it should cost one round trip,
+// not silence.
+func (a *app) updateCheckDue(cfg effectiveConfig) bool {
+	b, err := os.ReadFile(updateCheckPath(cfg))
+	if err != nil {
+		return true
+	}
+	var st updateCheckState
+	if err := json.Unmarshal(b, &st); err != nil || st.LastCheck.IsZero() {
+		return true
+	}
+	elapsed := a.now().Sub(st.LastCheck)
+	// A negative interval means the marker is stamped in the future — a clock
+	// that jumped forward and came back, or one machine's home directory synced
+	// onto another. Waiting it out would suspend update checks until real time
+	// caught up, which for a clock skewed by months is indistinguishable from
+	// disabling them.
+	return elapsed < 0 || elapsed >= updateCheckInterval
+}
+
+func (a *app) recordUpdateCheck(cfg effectiveConfig) {
+	if err := os.MkdirAll(cfg.Home, 0o700); err != nil {
+		return
+	}
+	b, err := json.Marshal(updateCheckState{LastCheck: a.now().UTC()})
+	if err != nil {
+		return
+	}
+	// Best effort. A home directory that cannot be written is already reported by
+	// doctor's config check, and failing an update check over it would turn a
+	// cosmetic problem into a loud one on every command.
+	_ = writeFileAtomic(updateCheckPath(cfg), append(b, '\n'), 0o600)
+}
+
 // maybeAutoUpdate runs before doctor, sync and explicit init. Failures here
 // never fail the host command: a GitHub outage must not read as "BORIS is
 // broken".
@@ -823,6 +895,22 @@ func (a *app) maybeAutoUpdate(flags globalFlags) {
 	if err != nil {
 		return
 	}
+	// Resolved before the cadence is consulted so that a build with no release to
+	// check against never records a check it was never going to make.
+	if local := a.localUpdateState(); local.Err != nil || local.Kind == installSource {
+		a.update = local
+		return
+	} else if !a.updateCheckDue(cfg) {
+		// Still reported, so doctor keeps printing a version row. Checked is false
+		// on this state, which is what stops it claiming to be current.
+		a.update = local
+		return
+	}
+	// Recorded before the check, not after, so that a failing check consumes the
+	// interval too. Recording only successes would leave a machine that cannot
+	// reach GitHub retrying on every single command — which is the per-session
+	// round trip this cadence exists to remove, at its worst: a full timeout.
+	a.recordUpdateCheck(cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), updateCheckTimeout)
 	defer cancel()
 

@@ -908,7 +908,10 @@ func TestDoctorJSONCarriesTheUpdateObject(t *testing.T) {
 		lookPath:   func(string) (string, error) { return "", os.ErrNotExist },
 		executable: func() (string, error) { return path, nil },
 	}
-	a.run([]string{"doctor", "--json"})
+	// --deep because the stream-separation assertions below need prose to exist:
+	// a routine doctor answers from local state and prints none. The update object
+	// this test is about is attached either way.
+	a.run([]string{"doctor", "--deep", "--json"})
 
 	var payload struct {
 		Update map[string]any `json:"update"`
@@ -1214,16 +1217,24 @@ func TestRollbackStopsAutoUpdateReinstallingTheRejectedRelease(t *testing.T) {
 	assets := map[string][]byte{"bmcp-" + hostAsset(): releaseArchive(t, []byte("bad new binary"))}
 	assets["checksums.txt"] = checksumsFor(assets)
 	gh := &fakeGitHub{latestTag: "v0.6.0", assets: assets}
+	// A clock the test advances, because update checks are rate limited: a second
+	// run inside updateCheckInterval never reaches GitHub, so on a real clock the
+	// post-rollback sync below would decline to reinstall for the wrong reason.
+	// Stepping a day between runs makes each one a check that genuinely ran, which
+	// is the only arrangement in which the hold is what stopped it.
+	clock := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
 	newApp := func() (*app, *bytes.Buffer) {
 		stderr := &bytes.Buffer{}
 		return &app{
 			stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: stderr,
-			now: time.Now, httpClient: syncableMCP(gh), credentials: staticCreds(),
+			now:        func() time.Time { return clock },
+			httpClient: syncableMCP(gh), credentials: staticCreds(),
 			lookPath:        func(string) (string, error) { return "", os.ErrNotExist },
 			executable:      func() (string, error) { return path, nil },
 			verifySignature: func(string) error { return nil },
 		}, stderr
 	}
+	nextDay := func() { clock = clock.Add(25 * time.Hour) }
 
 	a, stderr := newApp()
 	if code := a.run([]string{"sync"}); code != 0 {
@@ -1244,6 +1255,7 @@ func TestRollbackStopsAutoUpdateReinstallingTheRejectedRelease(t *testing.T) {
 	}
 
 	asReleaseBuild(t, "0.5.0")
+	nextDay()
 	a, stderr = newApp()
 	if code := a.run([]string{"sync"}); code != 0 {
 		t.Fatalf("post-rollback sync exit %d: %s", code, stderr.String())
@@ -1464,5 +1476,109 @@ func TestParseStrictBoolDistinguishesFalseFromGarbage(t *testing.T) {
 	// truthy is built on it and must keep its old behaviour.
 	if truthy("bogus") || !truthy("1") || truthy("0") {
 		t.Fatal("truthy changed behaviour")
+	}
+}
+
+// The generated instructions put `bmcp doctor` in front of every agent session,
+// so an unbounded update check is a GitHub round trip per session — on the path
+// this CLI most needs to be fast, and one that no longer hides behind the
+// credential load and catalog sync doctor used to do anyway.
+func TestUpdateChecksAreRateLimited(t *testing.T) {
+	asReleaseBuild(t, "0.5.0")
+	borisHome := configuredHome(t)
+	t.Setenv("BMCP_HOME", borisHome)
+	t.Setenv("HOME", t.TempDir())
+	// Checked, never applied: this test is about how often GitHub is asked, and
+	// swapping the binary mid-test would change what the next run reports.
+	t.Setenv("BMCP_AUTO_UPDATE", "0")
+	t.Chdir(t.TempDir())
+	path := stagedBinary(t, "old binary")
+
+	clock := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	m := &fakeMCP{
+		tools:  []tool{{Name: "search_aws_memory", Description: "d"}},
+		github: &fakeGitHub{latestTag: "v0.6.0"},
+	}
+	run := func(what string) {
+		var stdout, stderr bytes.Buffer
+		a := &app{
+			stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+			now:        func() time.Time { return clock },
+			httpClient: m, credentials: staticCreds(),
+			lookPath:   func(string) (string, error) { return "", os.ErrNotExist },
+			executable: func() (string, error) { return path, nil },
+		}
+		if code := a.run([]string{"doctor"}); code != 0 {
+			t.Fatalf("%s: doctor exit %d, stdout:\n%s\nstderr: %s", what, code, stdout.String(), stderr.String())
+		}
+	}
+
+	run("first")
+	first := m.githubRequests
+	if first == 0 {
+		t.Fatal("the first run must check: there is no marker yet")
+	}
+
+	clock = clock.Add(updateCheckInterval - time.Hour)
+	run("inside the interval")
+	if m.githubRequests != first {
+		t.Fatalf("a run inside the interval must not reach GitHub, requests went %d -> %d", first, m.githubRequests)
+	}
+
+	clock = clock.Add(2 * time.Hour)
+	run("past the interval")
+	if m.githubRequests <= first {
+		t.Fatalf("a run past the interval must check again, requests stayed at %d", m.githubRequests)
+	}
+}
+
+// A marker stamped in the future — a clock that jumped forward and came back, or
+// one machine's home directory synced onto another — must not suspend update
+// checks until real time catches up. For a clock skewed by months that is
+// indistinguishable from switching them off.
+func TestUpdateCheckMarkerFromTheFutureDoesNotSuspendChecks(t *testing.T) {
+	home := t.TempDir()
+	cfg := effectiveConfig{Home: home}
+	now := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	a := &app{now: func() time.Time { return now }}
+
+	a.recordUpdateCheck(cfg)
+	if a.updateCheckDue(cfg) {
+		t.Fatal("a check just recorded is not due again")
+	}
+	// Precondition: the marker really is on disk, so the assertion above is about
+	// the cadence and not about a write that silently failed.
+	if _, err := os.Stat(updateCheckPath(cfg)); err != nil {
+		t.Fatalf("marker was not written: %v", err)
+	}
+
+	skewed := &app{now: func() time.Time { return now.Add(-90 * 24 * time.Hour) }}
+	if !skewed.updateCheckDue(cfg) {
+		t.Fatal("a marker stamped in the future must not hold off checks")
+	}
+}
+
+// The marker is a cache. Losing or corrupting it should cost one round trip, not
+// silence — a machine that can never write it must still check every time rather
+// than never again.
+func TestUnreadableUpdateCheckMarkerFailsOpen(t *testing.T) {
+	home := t.TempDir()
+	cfg := effectiveConfig{Home: home}
+	a := &app{now: time.Now}
+
+	if !a.updateCheckDue(cfg) {
+		t.Fatal("no marker means due")
+	}
+	if err := os.WriteFile(updateCheckPath(cfg), []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	if !a.updateCheckDue(cfg) {
+		t.Fatal("an unparseable marker means due")
+	}
+	if err := os.WriteFile(updateCheckPath(cfg), []byte(`{"last_check":"0001-01-01T00:00:00Z"}`), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	if !a.updateCheckDue(cfg) {
+		t.Fatal("a zero timestamp means due, not due in the year 2000")
 	}
 }

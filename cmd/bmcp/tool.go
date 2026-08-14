@@ -118,6 +118,22 @@ func (a *app) cacheForCatalog(flags globalFlags, cfg effectiveConfig, allowStale
 			}
 			return nil, err
 		}
+		// The catalog on disk just changed, which makes the tool list embedded in
+		// every installed instruction file the stale copy — and that list, not
+		// tools.json, is what agents actually read.
+		//
+		// This used to be doctor's job, on the reasoning that BORIS.md tells agents
+		// to run doctor before their first call. Doctor no longer syncs when local
+		// state is fresh, so hanging the refresh off doctor would mean hanging it
+		// off nothing. Here it is bounded by the same TTL that bounds syncing, and
+		// it fires on the run that learned the catalog changed rather than on some
+		// later diagnostic.
+		//
+		// User scope only, for the reason refreshExistingInstructions gives: this
+		// path runs unattended from whatever directory an agent is working in, and
+		// a project-scope file is claimed by filename alone. An unchanged catalog
+		// renders byte-identical and is not written at all.
+		a.refreshInstructions(newCache, false)
 		return newCache, nil
 	}
 	return cache, nil

@@ -785,7 +785,9 @@ Before the first BORIS call in a session, run:
 bmcp doctor
 ` + "```" + `
 
-If ` + "`doctor`" + ` fails on config, tell the user to run ` + "`bmcp init`" + `. The BORIS MCP server requires AWS credentials for any account in the AWS Organization; if auth is unavailable, use the normal environment credential workflow available in this harness or explain the credential requirement to the user.
+This is a local check: while the cached tool catalog is fresh it authenticates nothing and contacts no server, so it is cheap enough to run every session. If it fails on config, tell the user to run ` + "`bmcp init`" + `.
+
+If a tool call later fails on authentication or connectivity, run ` + "`bmcp doctor --deep`" + `, which checks credentials, the server and the live catalog for real, and says which of them is at fault. The BORIS MCP server requires AWS credentials for any account in the AWS Organization; if auth is unavailable, use the normal environment credential workflow available in this harness or explain the credential requirement to the user.
 
 Useful commands:
 
