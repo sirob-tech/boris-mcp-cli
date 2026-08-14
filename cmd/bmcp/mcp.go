@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -105,7 +106,53 @@ func pluralize(n int, word string) string {
 // returned nothing, while a non-empty cache already existed. It is a refusal to
 // write, not a transport failure: the cache on disk is untouched and still the
 // last known-good catalog, which is why cacheForCatalog can serve from it.
-var errEmptyCatalog = errors.New("the server returned no tools; keeping the existing cache")
+// The wording is deliberately about refusing the write rather than about
+// keeping a usable cache: on the unreadable-cache branch below there is nothing
+// left to serve from, and cacheForCatalog will not pretend otherwise.
+var errEmptyCatalog = errors.New("the server returned no tools; refusing to overwrite the existing catalog")
+
+// existingCatalogDetail describes the catalog an empty tools/list would destroy,
+// or "" when there is nothing worth protecting and the empty result may be
+// written as the truth.
+//
+// The precondition is "no prior catalog", not "I could read a prior catalog".
+// Those came apart when the cache was unparseable: readCache failed, the guard
+// read that as a first sync, and an empty catalog was written over a file that
+// had held the real one. Any tools.json with bytes in it is treated as a
+// catalog, so a damaged one fails closed.
+//
+// A damaged file cannot say which server it came from, so the URL check below
+// cannot run and a `--url`/BMCP_URL override pointed at a genuinely empty server
+// is refused too. Deleting the file clears it, which is what the caller's error
+// says to do. (`bmcp init --url <other>` cannot reach this at all: cmdInit
+// already removes tools.json when the URL changes.)
+func existingCatalogDetail(path, url string) string {
+	old, err := readCache(path)
+	if err == nil {
+		if len(old.Tools) == 0 {
+			return ""
+		}
+		// A cache from a different server is not a catalog worth protecting:
+		// after `bmcp init --url <other>` an empty result from the new server is
+		// the truth about it. Compared normalized because this check fails
+		// *open* — a cosmetic difference that still addresses the same server,
+		// such as a trailing slash from `--url`, would otherwise disarm the
+		// guard and destroy the catalog it exists to protect.
+		if !sameServer(old.URL, url) {
+			return ""
+		}
+		return fmt.Sprintf("%d %s, synced %s", len(old.Tools), pluralize(len(old.Tools), "tool"),
+			old.LastSync.UTC().Format(time.RFC3339))
+	}
+	// Size is deliberately not considered. A zero-byte tools.json is not an
+	// empty catalog, it is the signature of an in-place write killed after
+	// O_TRUNC and before its first byte — exactly what the old writer could
+	// leave, and exactly the machine that most needs the guard when it upgrades.
+	if _, statErr := os.Stat(path); statErr == nil {
+		return "existing cache is unreadable, so its contents cannot be ruled out"
+	}
+	return ""
+}
 
 type authError struct{ error }
 
@@ -152,8 +199,7 @@ func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, e
 	// replace a good catalog with an empty one stamped LastSync: now. That write
 	// is unrecoverable without the server coming back, and it propagates: `sync`
 	// then rewrites every installed instruction file with the "no tools
-	// available" placeholder, while pruneOldBackups drops the older .bak-* copies
-	// that could have restored them.
+	// available" placeholder, spending a backup generation each time it runs.
 	//
 	// Only a catalog that already had tools is protected. A first sync against a
 	// genuinely empty server still writes, because there is nothing to lose.
@@ -161,17 +207,12 @@ func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, e
 	// Leaving the cache untouched also leaves LastSync stale, so the next command
 	// retries rather than waiting out the TTL — one round trip per command during
 	// the outage, and recovery the moment upstream returns.
-	// The URL check matters: a cache from a different server is not a catalog
-	// worth protecting, and after `bmcp init --url <other>` an empty result from
-	// the new server is the truth about it. It is compared normalized because the
-	// guard fails *open* — a cosmetic difference that still addresses the same
-	// server, such as a trailing slash from `--url`, would otherwise disarm it
-	// and destroy the catalog it exists to protect.
+	//
+	// existingCatalogDetail decides what counts as a catalog worth protecting.
 	if len(tools) == 0 {
-		if old, readErr := readCache(cfg.ToolsPath); readErr == nil && len(old.Tools) > 0 && sameServer(old.URL, cfg.URL) {
-			return nil, fmt.Errorf("%w (%d %s, synced %s).\nIf the catalog really is empty now, delete %s and sync again",
-				errEmptyCatalog, len(old.Tools), pluralize(len(old.Tools), "tool"),
-				old.LastSync.UTC().Format(time.RFC3339), cfg.ToolsPath)
+		if detail := existingCatalogDetail(cfg.ToolsPath, cfg.URL); detail != "" {
+			return nil, fmt.Errorf("%w (%s).\nIf the catalog really is empty now, delete %s and sync again",
+				errEmptyCatalog, detail, cfg.ToolsPath)
 		}
 	}
 	cache := &toolCache{Version: 1, URL: cfg.URL, LastSync: a.now().UTC(), Server: server, Tools: tools}
@@ -233,26 +274,87 @@ func (c *mcpClient) initialize(ctx context.Context) (serverInfo, error) {
 	return serverInfo{Name: result.ServerInfo.Name, ProtocolVersion: result.ProtocolVersion, Instructions: result.Instructions}, nil
 }
 
+// maxToolPages bounds the cursor loop below. SyncTimeout already bounds
+// wall-clock, but a server that returns a fresh cursor forever would otherwise
+// spend all of it accumulating pages.
+//
+// Set high enough that it is a runaway backstop rather than a catalog limit: a
+// server free to choose its own page size is free to choose one, and refusing
+// its 51st tool would be this client's bug, not the server's.
+const maxToolPages = 1000
+
+// listTools follows tools/list pagination to the end of the catalog.
+//
+// tools/list is a paginated MCP method: a server may answer with a page plus a
+// nextCursor, and a compliant client keeps asking until the cursor is gone.
+// BORIS returns everything in one page today, so this is latent — it stops
+// being latent the moment the catalog crosses whatever page size the server
+// picks, and nothing on the client side would say so. A short catalog is
+// written to tools.json stamped LastSync: now, rendered into every installed
+// instruction file, and then reads to an agent as "that tool does not exist"
+// rather than "the catalog is truncated".
+//
+// The empty-catalog guard in syncTools does not cover this: it refuses a
+// catalog with zero tools, and 1 of 13 is not zero. So anything short of a
+// complete catalog has to fail here rather than be returned as the truth.
 func (c *mcpClient) listTools(ctx context.Context) ([]tool, error) {
-	body, err := c.rpc(ctx, jsonRPCRequest{JSONRPC: "2.0", ID: 2, Method: "tools/list"}, true)
-	if err != nil {
-		return nil, err
+	// Non-nil so a genuinely empty catalog marshals to `"tools": []` rather than
+	// `"tools": null` — tools.json is a documented file that people read with jq,
+	// and iterating null is an error there.
+	tools := []tool{}
+	cursor := ""
+	for page := 0; page < maxToolPages; page++ {
+		req := jsonRPCRequest{JSONRPC: "2.0", ID: 2 + page, Method: "tools/list"}
+		if cursor != "" {
+			params, err := json.Marshal(map[string]string{"cursor": cursor})
+			if err != nil {
+				return nil, err
+			}
+			req.Params = params
+		}
+		body, err := c.rpc(ctx, req, true)
+		if err != nil {
+			return nil, err
+		}
+		// Tools is a pointer so a page that omits it, or sends null, is told
+		// apart from one that sends []. Decoding into a plain slice made both
+		// look like an empty final page: the accumulated tools from earlier
+		// pages were then returned as a complete catalog, and being non-empty
+		// they sailed past the empty-catalog guard and overwrote the real one.
+		// ListToolsResult requires the array, so anything else is a broken page,
+		// not an empty one.
+		var result struct {
+			Tools *[]struct {
+				Name        string          `json:"name"`
+				Description string          `json:"description"`
+				InputSchema json.RawMessage `json:"inputSchema"`
+			} `json:"tools"`
+			NextCursor string `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			return nil, err
+		}
+		if result.Tools == nil {
+			return nil, fmt.Errorf("remote MCP returned a tools/list page with no tools array; refusing a possibly truncated catalog of %d %s",
+				len(tools), pluralize(len(tools), "tool"))
+		}
+		for _, t := range *result.Tools {
+			tools = append(tools, tool{Name: t.Name, Description: t.Description, InputSchema: nonEmptySchema(t.InputSchema)})
+		}
+		if result.NextCursor == "" {
+			return tools, nil
+		}
+		// A cursor that does not advance is a server bug that would otherwise
+		// look like a slow sync, then stop at the page cap with a misleading
+		// error about catalog size.
+		if result.NextCursor == cursor {
+			return nil, fmt.Errorf("remote MCP repeated the same tools/list cursor; refusing a possibly truncated catalog of %d %s",
+				len(tools), pluralize(len(tools), "tool"))
+		}
+		cursor = result.NextCursor
 	}
-	var result struct {
-		Tools []struct {
-			Name        string          `json:"name"`
-			Description string          `json:"description"`
-			InputSchema json.RawMessage `json:"inputSchema"`
-		} `json:"tools"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
-	}
-	tools := make([]tool, 0, len(result.Tools))
-	for _, t := range result.Tools {
-		tools = append(tools, tool{Name: t.Name, Description: t.Description, InputSchema: nonEmptySchema(t.InputSchema)})
-	}
-	return tools, nil
+	return nil, fmt.Errorf("remote MCP returned more than %d pages of tools/list; refusing a possibly truncated catalog of %d %s",
+		maxToolPages, len(tools), pluralize(len(tools), "tool"))
 }
 
 func (c *mcpClient) callTool(ctx context.Context, name string, input map[string]any) ([]byte, error) {
@@ -305,6 +407,13 @@ func (c *mcpClient) rpc(ctx context.Context, rpcReq jsonRPCRequest, expectRespon
 	var rpcResp jsonRPCResponse
 	if err := json.Unmarshal(payload, &rpcResp); err != nil {
 		return nil, fmt.Errorf("invalid MCP response: %w", err)
+	}
+	// The response has to be the answer to the request that was just sent. This
+	// was academic while every session issued one request per id; paging makes a
+	// session send several, so a server that echoes a stale id would have its
+	// earlier page counted twice and the catalog silently reshaped.
+	if id, ok := rpcResp.ID.(float64); ok && int(id) != rpcReq.ID {
+		return nil, fmt.Errorf("remote MCP answered request %d with a response for %d", rpcReq.ID, int(id))
 	}
 	if rpcResp.Error != nil {
 		return nil, fmt.Errorf("MCP error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)

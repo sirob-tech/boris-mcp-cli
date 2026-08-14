@@ -28,6 +28,17 @@ type fakeMCP struct {
 	// listCalls counts tools/list round trips. A degraded server must not be
 	// asked more than once per command, so the count is the assertion.
 	listCalls int
+	// pageSize > 0 makes tools/list paginate, the way a compliant MCP server is
+	// free to. cursorFor overrides the cursor a page advertises, so a test can
+	// hand back one that never terminates.
+	pageSize  int
+	cursorFor func(next int) string
+	// malformedPageAt is the 1-based tools/list page that answers with a
+	// well-formed JSON-RPC success carrying no tools array at all.
+	malformedPageAt int
+	// staleIDPageAt is the 1-based tools/list page that answers with the id of
+	// the request before it, as a server confusing two in-flight pages would.
+	staleIDPageAt int
 }
 
 func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
@@ -56,19 +67,57 @@ func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
 		return respond("")
 	case "tools/list":
 		m.listCalls++
-		toolsOut := make([]map[string]any, 0, len(m.tools))
-		for _, t := range m.tools {
+		if m.malformedPageAt == m.listCalls {
+			env, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": rpc.ID, "result": json.RawMessage(`{}`)})
+			return respond(string(env))
+		}
+		page := m.tools
+		result := map[string]any{}
+		if m.pageSize > 0 {
+			var params struct {
+				Cursor string `json:"cursor"`
+			}
+			_ = json.Unmarshal(rpc.Params, &params)
+			start := 0
+			if params.Cursor != "" {
+				// Tolerant: a test driving cursorFor hands back opaque values it
+				// never expects the server to interpret.
+				if _, err := fmt.Sscanf(params.Cursor, "offset-%d", &start); err != nil || start < 0 || start > len(m.tools) {
+					start = 0
+				}
+			}
+			end := start + m.pageSize
+			if end > len(m.tools) {
+				end = len(m.tools)
+			}
+			page = m.tools[start:end]
+			if next := m.cursorFor; next != nil {
+				result["nextCursor"] = next(end)
+			} else if end < len(m.tools) {
+				result["nextCursor"] = fmt.Sprintf("offset-%d", end)
+			}
+		}
+		toolsOut := make([]map[string]any, 0, len(page))
+		for _, t := range page {
 			toolsOut = append(toolsOut, map[string]any{
 				"name":        t.Name,
 				"description": t.Description,
 				"inputSchema": json.RawMessage(nonEmptySchema(t.InputSchema)),
 			})
 		}
-		result, _ := json.Marshal(map[string]any{"tools": toolsOut})
-		env, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 2, "result": json.RawMessage(result)})
+		result["tools"] = toolsOut
+		payload, _ := json.Marshal(result)
+		// Echoing the request id, as JSON-RPC requires. A hardcoded id passed
+		// only because nothing checked it, which made the fake unable to notice
+		// a client that mismatched pages against responses.
+		id := rpc.ID
+		if m.staleIDPageAt == m.listCalls {
+			id--
+		}
+		env, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "result": json.RawMessage(payload)})
 		return respond(string(env))
 	case "tools/call":
-		env, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 3, "result": json.RawMessage(m.callResult)})
+		env, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": rpc.ID, "result": json.RawMessage(m.callResult)})
 		return respond(string(env))
 	}
 	return respond(`{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"unexpected"}}`)
@@ -898,29 +947,639 @@ func TestInstallClaudeCodeGlobalWritesReferenceAndBackup(t *testing.T) {
 	}
 }
 
-func TestWriteFileWithBackupKeepsOnlyLatestBackup(t *testing.T) {
+// Keeping a single backup made any two consecutive bad writes unrecoverable:
+// the first backed up the good file, the second backed up the damaged one and
+// deleted the good copy. Several generations have to survive a write, and the
+// oldest beyond that has to go so the .bak-* set stays bounded.
+func TestWriteFileWithBackupKeepsSeveralGenerations(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "BORIS.md")
-	oldBackup := path + ".bak-20260607T000000Z"
-	if err := os.WriteFile(path, []byte("v1\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("good\n"), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
-	if err := os.WriteFile(oldBackup, []byte("older\n"), 0o600); err != nil {
-		t.Fatalf("write old backup: %v", err)
+	// Literal counts, not backupGenerations: a test parameterized by the
+	// constant it is testing passes at one generation too, which is the
+	// regression. Five pre-existing plus the one this write takes is one more
+	// than can survive, so exactly the oldest is expected to go.
+	const wantKept = 5
+	oldest := path + ".bak-20260601T000000.000000000Z"
+	preexisting := []string{
+		oldest,
+		path + ".bak-20260602T000000.000000000Z",
+		path + ".bak-20260603T000000.000000000Z",
+		path + ".bak-20260604T000000.000000000Z",
+		path + ".bak-20260605T000000.000000000Z",
 	}
-	result := writeFileWithBackup(path, []byte("v2\n"))
+	for i, backup := range preexisting {
+		if err := os.WriteFile(backup, []byte(fmt.Sprintf("gen%d\n", i)), 0o600); err != nil {
+			t.Fatalf("write backup %s: %v", backup, err)
+		}
+	}
+
+	result := writeFileWithBackup(path, []byte("damaged\n"))
 	if !result.Changed || result.Backup == "" {
 		t.Fatalf("expected changed file with backup, got: %#v", result)
 	}
+
 	backups, err := filepath.Glob(path + ".bak-*")
 	if err != nil {
 		t.Fatalf("glob backups: %v", err)
 	}
-	if len(backups) != 1 || backups[0] != result.Backup {
-		t.Fatalf("expected only latest backup %q, got %#v", result.Backup, backups)
+	if len(backups) != wantKept {
+		t.Fatalf("expected %d backups, got %#v", wantKept, backups)
 	}
-	if _, err := os.Stat(oldBackup); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("old backup should be pruned, stat err: %v", err)
+	// The copy this write just took must be one of them, or the write that
+	// damaged the file left nothing to restore from.
+	if _, err := os.Stat(result.Backup); err != nil {
+		t.Fatalf("backup from this write should survive: %v", err)
+	}
+	if got, err := os.ReadFile(result.Backup); err != nil || string(got) != "good\n" {
+		t.Fatalf("backup should hold the pre-write content, got %q, err %v", got, err)
+	}
+	if _, err := os.Stat(oldest); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("oldest backup should be pruned, stat err: %v", err)
+	}
+}
+
+// The stamp in a backup name used to have one-second resolution, so two writes
+// inside the same second landed on the same name — the second overwriting the
+// first backup, collapsing two generations into one and destroying the good
+// copy when the first write was the good one.
+func TestWriteFileWithBackupSurvivesTwoWritesInQuickSuccession(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "BORIS.md")
+	if err := os.WriteFile(path, []byte("good\n"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	first := writeFileWithBackup(path, []byte("damaged\n"))
+	second := writeFileWithBackup(path, []byte("damaged again\n"))
+	if first.Backup == "" || second.Backup == "" {
+		t.Fatalf("expected both writes to back up, got %q and %q", first.Backup, second.Backup)
+	}
+	if first.Backup == second.Backup {
+		t.Fatalf("both writes reused backup path %q", first.Backup)
+	}
+	if got, err := os.ReadFile(first.Backup); err != nil || string(got) != "good\n" {
+		t.Fatalf("good copy should still be restorable, got %q, err %v", got, err)
+	}
+}
+
+// tools/list is paginated, and ignoring nextCursor silently produced a short
+// catalog: written to tools.json stamped LastSync: now, rendered into every
+// instruction file, and then indistinguishable to an agent from a tool that
+// does not exist. The empty-catalog guard does not cover it — 1 of 5 is not 0.
+func TestSyncFollowsToolsListPagination(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___good_tool", Description: "Known good tool."}})
+
+	all := []tool{
+		{Name: "tools___alpha", Description: "A."},
+		{Name: "tools___bravo", Description: "B."},
+		{Name: "tools___charlie", Description: "C."},
+		{Name: "tools___delta", Description: "D."},
+		{Name: "tools___echo", Description: "E."},
+	}
+	m := &fakeMCP{tools: all, pageSize: 2}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now,
+		httpClient: m, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"sync"}); code != 0 {
+		t.Fatalf("sync exit code %d, stderr: %s", code, stderr.String())
+	}
+	if m.listCalls != 3 {
+		t.Fatalf("expected 3 tools/list pages for 5 tools at 2 per page, got %d", m.listCalls)
+	}
+	cache, err := readCache(filepath.Join(borisHome, "tools.json"))
+	if err != nil {
+		t.Fatalf("readCache: %v", err)
+	}
+	if len(cache.Tools) != len(all) {
+		t.Fatalf("expected %d tools, got %d: %#v", len(all), len(cache.Tools), cache.Tools)
+	}
+	for i, want := range all {
+		if cache.Tools[i].Name != want.Name {
+			t.Fatalf("tool %d: expected %q, got %q", i, want.Name, cache.Tools[i].Name)
+		}
+	}
+}
+
+// A first sync against a genuinely empty server is allowed to write, because
+// there is nothing to lose. tools.json is a documented file people read with
+// jq, so the empty catalog has to serialize as [] — iterating null is an error
+// there, and an accumulator declared as a nil slice marshals to null.
+func TestFirstSyncOfAnEmptyCatalogWritesAnEmptyArray(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// Configured but never synced, so the guard sees no prior catalog to protect.
+	borisHome := setupInstallCatalog(t, home, nil)
+	if err := os.Remove(filepath.Join(borisHome, "tools.json")); err != nil {
+		t.Fatalf("remove seeded cache: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now,
+		httpClient: &fakeMCP{tools: []tool{}}, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"sync"}); code != 0 {
+		t.Fatalf("first sync should be allowed to write, exit %d, stderr: %s", code, stderr.String())
+	}
+	raw, err := os.ReadFile(filepath.Join(borisHome, "tools.json"))
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+	if !strings.Contains(string(raw), `"tools": []`) {
+		t.Fatalf("expected an empty JSON array for tools, got: %s", raw)
+	}
+}
+
+// A server that always hands back a cursor must not be able to spin out the
+// sync timeout, and the partial catalog it produced must never be written: a
+// truncated catalog reported as success is the failure this whole guard exists
+// to prevent.
+func TestSyncRefusesAnUnboundedToolsListCursor(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___good_tool", Description: "Known good tool."}})
+	cachePath := filepath.Join(borisHome, "tools.json")
+	before, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+
+	m := &fakeMCP{
+		tools:    []tool{{Name: "tools___alpha", Description: "A."}, {Name: "tools___bravo", Description: "B."}},
+		pageSize: 1,
+		// Never terminates: every page advertises a further one.
+		cursorFor: func(next int) string { return fmt.Sprintf("offset-%d", next%2) },
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now,
+		httpClient: m, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"sync"}); code == 0 {
+		t.Fatalf("sync should refuse an unbounded cursor, stderr: %s", stderr.String())
+	}
+	// Exactly the cap: fewer would mean it gave up early for some other reason,
+	// more would mean the cap does not bound anything.
+	if m.listCalls != maxToolPages {
+		t.Fatalf("expected the page cap of %d to stop it, got %d calls", maxToolPages, m.listCalls)
+	}
+	after, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("cache was overwritten with a partial catalog:\nbefore %s\nafter %s", before, after)
+	}
+}
+
+// The subtlest way a short catalog can still be written: a later page answers
+// with a JSON-RPC success carrying no tools array. Decoded into a plain slice
+// that reads as an empty final page, so the tools gathered so far look like a
+// complete catalog — and being non-empty they clear the empty-catalog guard and
+// overwrite the real one, reported as success.
+func TestSyncRefusesAToolsListPageWithNoToolsArray(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{
+		{Name: "tools___good_tool", Description: "Known good tool."},
+		{Name: "tools___other_tool", Description: "Another known tool."},
+	})
+	cachePath := filepath.Join(borisHome, "tools.json")
+	before, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+
+	m := &fakeMCP{
+		tools: []tool{
+			{Name: "tools___alpha", Description: "A."},
+			{Name: "tools___bravo", Description: "B."},
+			{Name: "tools___charlie", Description: "C."},
+			{Name: "tools___delta", Description: "D."},
+		},
+		pageSize:        2,
+		malformedPageAt: 2,
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now,
+		httpClient: m, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"sync"}); code == 0 {
+		t.Fatalf("sync should refuse a page with no tools array, stderr: %s", stderr.String())
+	}
+	after, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("cache was overwritten with a partial catalog:\nbefore %s\nafter %s", before, after)
+	}
+}
+
+// One request per id made response ids academic; paging puts several in one
+// session, so a server that answers a page with the id of the one before it
+// would have that earlier page counted twice and the catalog silently reshaped.
+func TestSyncRefusesAToolsListPageAnsweringTheWrongRequest(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___good_tool", Description: "Known good tool."}})
+	cachePath := filepath.Join(borisHome, "tools.json")
+	before, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+
+	m := &fakeMCP{
+		tools: []tool{
+			{Name: "tools___alpha", Description: "A."},
+			{Name: "tools___bravo", Description: "B."},
+			{Name: "tools___charlie", Description: "C."},
+			{Name: "tools___delta", Description: "D."},
+		},
+		pageSize:      2,
+		staleIDPageAt: 2,
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now,
+		httpClient: m, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"sync"}); code == 0 {
+		t.Fatalf("sync should refuse a mismatched response id, stderr: %s", stderr.String())
+	}
+	after, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("cache was overwritten:\nbefore %s\nafter %s", before, after)
+	}
+}
+
+// A cursor that does not advance is the other way a server can loop forever,
+// and it deserves an error that names the cause rather than the page cap.
+func TestSyncRefusesARepeatedToolsListCursor(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___good_tool", Description: "Known good tool."}})
+
+	m := &fakeMCP{
+		tools:     []tool{{Name: "tools___alpha", Description: "A."}, {Name: "tools___bravo", Description: "B."}},
+		pageSize:  1,
+		cursorFor: func(int) string { return "stuck" },
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now,
+		httpClient: m, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"sync"}); code == 0 {
+		t.Fatalf("sync should refuse a repeated cursor, stderr: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "repeated the same tools/list cursor") {
+		t.Fatalf("error should name the repeated cursor, got: %s", stderr.String())
+	}
+	// Two round trips: the first page, then the one that repeats the cursor.
+	if m.listCalls != 2 {
+		t.Fatalf("expected 2 tools/list calls before giving up, got %d", m.listCalls)
+	}
+}
+
+// An interrupted in-place write leaves a truncated file. tools.json is the case
+// that matters: readCache then fails, which is what the empty-catalog guard in
+// syncTools is preconditioned against, so the guard silently stops engaging.
+//
+// A reader that opened the file before the write is the observable difference
+// between replacing an inode and truncating one, and it is what a half-finished
+// write would expose. Asserting only the final content would pass against the
+// os.WriteFile this replaced.
+func TestWriteFileAtomicReplacesRatherThanTruncates(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tools.json")
+	if err := os.WriteFile(path, []byte("first\n"), 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	reader, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open reader: %v", err)
+	}
+	defer reader.Close()
+
+	if err := writeFileAtomic(path, []byte("second\n"), 0o600); err != nil {
+		t.Fatalf("writeFileAtomic: %v", err)
+	}
+
+	held, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read from the pre-existing handle: %v", err)
+	}
+	if string(held) != "first\n" {
+		t.Fatalf("a reader open across the write saw %q; the old file was modified in place", held)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "second\n" {
+		t.Fatalf("expected the new content at the path, got %q, err %v", got, err)
+	}
+	// The temp file must not outlive the write: a stray .tools.json.tmp* next to
+	// the real file is the partial content this exists to avoid.
+	leftovers, err := filepath.Glob(filepath.Join(dir, ".tools.json.tmp*"))
+	if err != nil {
+		t.Fatalf("glob temps: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("temp files left behind: %#v", leftovers)
+	}
+}
+
+// Replacing the inode is what makes the write atomic, and it is also what makes
+// it capable of two silent regressions os.WriteFile could not have: resetting a
+// mode the user chose, and turning a symlinked instruction file into a regular
+// one — detaching it from the dotfiles repo that was managing it.
+func TestWriteFileAtomicPreservesModeAndSymlinks(t *testing.T) {
+	dir := t.TempDir()
+
+	tightened := filepath.Join(dir, "BORIS.md")
+	if err := os.WriteFile(tightened, []byte("old\n"), 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	// 0o644 is what writeFileWithBackup passes for instruction files.
+	if err := writeFileAtomic(tightened, []byte("new\n"), 0o644); err != nil {
+		t.Fatalf("writeFileAtomic: %v", err)
+	}
+	info, err := os.Stat(tightened)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("a mode the user tightened was reset to %v", info.Mode().Perm())
+	}
+
+	target := filepath.Join(dir, "dotfiles-BORIS.md")
+	link := filepath.Join(dir, "linked-BORIS.md")
+	if err := os.WriteFile(target, []byte("old\n"), 0o644); err != nil {
+		t.Fatalf("seed link target: %v", err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if err := writeFileAtomic(link, []byte("new\n"), 0o644); err != nil {
+		t.Fatalf("writeFileAtomic through symlink: %v", err)
+	}
+	linkInfo, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("lstat link: %v", err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the symlink was replaced by a regular file")
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || string(got) != "new\n" {
+		t.Fatalf("the link target should hold the new content, got %q, err %v", got, err)
+	}
+}
+
+// A directory whose name carries glob metacharacters used to make
+// filepath.Glob's pattern match nothing and return no error, so pruning became
+// a silent no-op and backups grew without bound.
+func TestPruneOldBackupsHandlesGlobMetacharactersInThePath(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "service[1]")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(dir, "BORIS.md")
+	if err := os.WriteFile(path, []byte("v0\n"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	for i := 0; i < 8; i++ {
+		if result := writeFileWithBackup(path, []byte(fmt.Sprintf("v%d\n", i+1))); !result.Changed {
+			t.Fatalf("write %d did not change the file", i)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	backups := 0
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "BORIS.md.bak-") {
+			backups++
+		}
+	}
+	if backups != 5 {
+		t.Fatalf("expected pruning to cap backups at 5, got %d", backups)
+	}
+}
+
+// A truncated tools.json disarms the empty-catalog guard, because the guard can
+// only refuse an empty catalog when it can read the old one. Atomic writes are
+// what keep that state from existing; this pins the consequence if it ever does.
+//
+// Zero bytes is the case that matters most and is easiest to wave through: it is
+// not an empty catalog, it is an in-place write killed after O_TRUNC and before
+// its first byte — what the old writer left behind, on exactly the machine that
+// is about to upgrade to the binary with this guard in it.
+func TestCorruptCacheDoesNotLetAnEmptyCatalogThrough(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		spoil func(good []byte) []byte
+	}{
+		{name: "half written", spoil: func(good []byte) []byte { return good[:len(good)/2] }},
+		{name: "zero bytes", spoil: func([]byte) []byte { return nil }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___good_tool", Description: "Known good tool."}})
+			cachePath := filepath.Join(borisHome, "tools.json")
+			good, err := os.ReadFile(cachePath)
+			if err != nil {
+				t.Fatalf("read cache: %v", err)
+			}
+			if err := os.WriteFile(cachePath, tc.spoil(good), 0o600); err != nil {
+				t.Fatalf("spoil cache: %v", err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin:       strings.NewReader(""),
+				stdout:      &stdout,
+				stderr:      &stderr,
+				now:         time.Now,
+				httpClient:  &fakeMCP{tools: []tool{}},
+				credentials: staticCreds(),
+			}
+			if code := a.run([]string{"sync"}); code == 0 {
+				t.Fatalf("sync reported success writing an empty catalog over a corrupt cache, stderr: %s", stderr.String())
+			}
+		})
+	}
+}
+
+// The integration point #31 is actually about. The helper's own tests pass
+// against an in-place writer wired into writeCache, so the wiring needs its own
+// assertion: a reader holding tools.json across a sync must not observe the
+// file being rewritten under it.
+func TestSyncWritesTheCacheAtomically(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___good_tool", Description: "Known good tool."}})
+	cachePath := filepath.Join(borisHome, "tools.json")
+	before, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+	reader, err := os.Open(cachePath)
+	if err != nil {
+		t.Fatalf("open reader: %v", err)
+	}
+	defer reader.Close()
+
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now,
+		httpClient:  &fakeMCP{tools: []tool{{Name: "tools___fresh_tool", Description: "Newly listed."}}},
+		credentials: staticCreds(),
+	}
+	if code := a.run([]string{"sync"}); code != 0 {
+		t.Fatalf("sync exit code %d, stderr: %s", code, stderr.String())
+	}
+
+	held, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read from the pre-existing handle: %v", err)
+	}
+	if !bytes.Equal(held, before) {
+		t.Fatal("a reader open across the sync saw the cache change; writeCache is not going through writeFileAtomic")
+	}
+	if got, err := os.ReadFile(cachePath); err != nil || !strings.Contains(string(got), "tools___fresh_tool") {
+		t.Fatalf("the new catalog should be at the path, got %q, err %v", got, err)
+	}
+}
+
+// Ordering backups by the timestamp in the name trusts the clock that wrote it.
+// A backup stamped with a future date — a clock that jumped forward and came
+// back — sorts last by name forever, so it survives every prune while genuinely
+// recent copies below it are deleted as "oldest". That is the two-bad-writes
+// loss again, wearing a different hat. mtime is what the filesystem observed.
+func TestPruneOldBackupsIgnoresAFutureDatedName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "BORIS.md")
+	if err := os.WriteFile(path, []byte("good\n"), 0o644); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	// Four damaged backups whose names claim 2099 but which were written long
+	// before the good copy this write is about to take.
+	longAgo := time.Now().Add(-72 * time.Hour)
+	for i := 0; i < 4; i++ {
+		backup := fmt.Sprintf("%s.bak-20990101T00000%d.000000000Z", path, i)
+		if err := os.WriteFile(backup, []byte("damaged\n"), 0o600); err != nil {
+			t.Fatalf("write backup: %v", err)
+		}
+		if err := os.Chtimes(backup, longAgo, longAgo); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+	}
+
+	first := writeFileWithBackup(path, []byte("damaged\n"))
+	if first.Backup == "" {
+		t.Fatal("expected the first write to take a backup")
+	}
+	if second := writeFileWithBackup(path, []byte("damaged again\n")); second.Backup == "" {
+		t.Fatal("expected the second write to take a backup")
+	}
+
+	got, err := os.ReadFile(first.Backup)
+	if err != nil {
+		t.Fatalf("the only good copy was pruned in favour of future-dated names: %v", err)
+	}
+	if string(got) != "good\n" {
+		t.Fatalf("expected the good copy, got %q", got)
+	}
+}
+
+// A dotfiles setup that symlinks an instruction file into place before it has
+// ever been written leaves a dangling link. EvalSymlinks fails on one, and
+// falling back to the link's own path means the rename replaces the link —
+// detaching it from the repo meant to be managing it.
+func TestWriteFileAtomicFollowsADanglingSymlink(t *testing.T) {
+	dir := t.TempDir()
+	targetDir := filepath.Join(dir, "dotfiles")
+	if err := os.MkdirAll(targetDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	target := filepath.Join(targetDir, "BORIS.md")
+	link := filepath.Join(dir, "BORIS.md")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	if err := writeFileAtomic(link, []byte("new\n"), 0o644); err != nil {
+		t.Fatalf("writeFileAtomic through a dangling symlink: %v", err)
+	}
+	linkInfo, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("lstat link: %v", err)
+	}
+	if linkInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the dangling symlink was replaced by a regular file")
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "new\n" {
+		t.Fatalf("the link target should have been created with the content, got %q, err %v", got, err)
+	}
+}
+
+// A write that fails must not cost a backup generation. Pruning beside the
+// backup rather than after the replacement spent one on a write that never
+// happened, deleting a good restore point in exchange for nothing — and the
+// README promises rotation only "when a file changes".
+func TestFailedWriteDoesNotConsumeABackupGeneration(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root, directory permissions do not deny the write")
+	}
+	dir := t.TempDir()
+	targetDir := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(targetDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	target := filepath.Join(targetDir, "target.md")
+	if err := os.WriteFile(target, []byte("good\n"), 0o644); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	// The link is what gets written; the backup lands beside it in a writable
+	// directory, while the resolved target sits in one that denies writes.
+	path := filepath.Join(dir, "BORIS.md")
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	oldest := path + ".bak-20260601T000000.000000000Z"
+	for i, backup := range []string{
+		oldest,
+		path + ".bak-20260602T000000.000000000Z",
+		path + ".bak-20260603T000000.000000000Z",
+		path + ".bak-20260604T000000.000000000Z",
+		path + ".bak-20260605T000000.000000000Z",
+	} {
+		if err := os.WriteFile(backup, []byte(fmt.Sprintf("gen%d\n", i)), 0o600); err != nil {
+			t.Fatalf("write backup: %v", err)
+		}
+	}
+	if err := os.Chmod(targetDir, 0o500); err != nil {
+		t.Fatalf("chmod target dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(targetDir, 0o700) })
+
+	if result := writeFileWithBackup(path, []byte("new\n")); result.Changed {
+		t.Fatal("the write into a read-only directory should have failed")
+	}
+	if _, err := os.Stat(oldest); err != nil {
+		t.Fatalf("a failed write pruned the oldest backup: %v", err)
 	}
 }
 

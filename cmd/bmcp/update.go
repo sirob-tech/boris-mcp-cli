@@ -362,7 +362,7 @@ func amendReceipt(binary string, mutate func(*installReceipt)) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(receiptPath(binary), append(b, '\n'), 0o644)
+	return writeFileAtomic(receiptPath(binary), append(b, '\n'), 0o644)
 }
 
 func (a *app) updateHTTPClient() httpDoer {

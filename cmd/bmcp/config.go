@@ -237,7 +237,7 @@ func writeConfig(path string, cfg configFile) error {
 	fmt.Fprintf(&b, "connect_timeout = %q\n", cfg.ConnectTimeout.String())
 	fmt.Fprintf(&b, "sync_timeout = %q\n", cfg.SyncTimeout.String())
 	fmt.Fprintf(&b, "call_timeout = %q\n", cfg.CallTimeout.String())
-	return os.WriteFile(path, []byte(b.String()), 0o600)
+	return writeFileAtomic(path, []byte(b.String()), 0o600)
 }
 
 func applyDefaults(cfg *configFile) {
