@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -52,9 +53,32 @@ type schemaProperty struct {
 func (a *app) cacheForCatalog(flags globalFlags, cfg effectiveConfig, allowStale bool) (*toolCache, error) {
 	cache, cacheErr := readCache(cfg.ToolsPath)
 	due := cacheErr != nil || cache.URL != cfg.URL || cfg.SyncTTL == 0 || a.now().Sub(cache.LastSync) > cfg.SyncTTL
+	// A refusal earlier in this run already established that upstream is listing
+	// nothing and that the cache on disk is the last known-good catalog. Asking
+	// again in the same process cannot produce a better answer, and the second ask
+	// is a full handshake against a server that is already struggling.
+	//
+	// sameServer is re-checked rather than assumed: `due` can also be true because
+	// the cache belongs to a different URL, and serving a mismatched catalog
+	// without syncing would be worse than the round trip this saves. The single
+	// real caller keeps one config for the whole command, so this only guards
+	// against a future one that does not.
+	if due && a.refusedEmptyCatalog && cacheErr == nil && sameServer(cache.URL, cfg.URL) {
+		return cache, nil
+	}
 	if due {
 		newCache, err := a.syncTools(context.Background(), cfg)
 		if err != nil {
+			// errEmptyCatalog is a refusal to overwrite, not a failure to reach the
+			// server: syncTools only returns it when the cache in hand is non-empty
+			// and belongs to this URL. That makes it the last known-good catalog,
+			// usable even where a merely stale one would be refused — a tool call
+			// should not start failing because upstream briefly listed no tools.
+			if errors.Is(err, errEmptyCatalog) && cacheErr == nil {
+				a.refusedEmptyCatalog = true
+				fmt.Fprintf(a.stderr, "Warning: %s\n", err)
+				return cache, nil
+			}
 			if allowStale && cacheErr == nil {
 				fmt.Fprintf(a.stderr, "Warning: sync failed, using stale cache: %s\n", err)
 				return cache, nil

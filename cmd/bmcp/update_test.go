@@ -702,6 +702,17 @@ func configuredHome(t *testing.T) string {
 	return home
 }
 
+// syncableMCP is a fake server that lists the same tool configuredHome seeds, so
+// `bmcp sync` against it succeeds.
+//
+// A fake with no tools makes sync exit 4 by design: an empty tools/list must not
+// overwrite a non-empty cache. These tests are about auto-update, so they should
+// not be exercising that refusal by accident — before the guard existed they
+// were quietly asserting auto-update behaviour across a catalog-wiping sync.
+func syncableMCP(gh *fakeGitHub) *fakeMCP {
+	return &fakeMCP{tools: []tool{{Name: "search_aws_memory", Description: "d"}}, github: gh}
+}
+
 // jsonTail returns the JSON document at the end of a stream that also carries
 // human prose — doctor --json shares stderr with "Syncing tools...".
 func jsonTail(t *testing.T, s string) []byte {
@@ -815,7 +826,7 @@ func TestAutoUpdateDisabledNudgesInsteadOfSwapping(t *testing.T) {
 
 	assets := map[string][]byte{"bmcp-" + hostAsset(): releaseArchive(t, []byte("new binary"))}
 	assets["checksums.txt"] = checksumsFor(assets)
-	m := &fakeMCP{github: &fakeGitHub{latestTag: "v0.6.0", assets: assets}}
+	m := syncableMCP(&fakeGitHub{latestTag: "v0.6.0", assets: assets})
 	var stdout, stderr bytes.Buffer
 	a := &app{
 		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
@@ -842,7 +853,7 @@ func TestAutoUpdateAppliesOnSyncWhenEnabled(t *testing.T) {
 
 	assets := map[string][]byte{"bmcp-" + hostAsset(): releaseArchive(t, []byte("new binary"))}
 	assets["checksums.txt"] = checksumsFor(assets)
-	m := &fakeMCP{github: &fakeGitHub{latestTag: "v0.6.0", assets: assets}}
+	m := syncableMCP(&fakeGitHub{latestTag: "v0.6.0", assets: assets})
 	var stdout, stderr bytes.Buffer
 	a := &app{
 		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
@@ -981,7 +992,7 @@ func TestAutoUpdateStandsDownWhenAVersionIsPinned(t *testing.T) {
 
 	assets := map[string][]byte{"bmcp-" + hostAsset(): releaseArchive(t, []byte("downgraded"))}
 	assets["checksums.txt"] = checksumsFor(assets)
-	m := &fakeMCP{github: &fakeGitHub{latestTag: "v0.6.0", assets: assets}}
+	m := syncableMCP(&fakeGitHub{latestTag: "v0.6.0", assets: assets})
 	var stdout, stderr bytes.Buffer
 	a := &app{
 		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
@@ -1207,7 +1218,7 @@ func TestRollbackStopsAutoUpdateReinstallingTheRejectedRelease(t *testing.T) {
 		stderr := &bytes.Buffer{}
 		return &app{
 			stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: stderr,
-			now: time.Now, httpClient: &fakeMCP{github: gh}, credentials: staticCreds(),
+			now: time.Now, httpClient: syncableMCP(gh), credentials: staticCreds(),
 			lookPath:        func(string) (string, error) { return "", os.ErrNotExist },
 			executable:      func() (string, error) { return path, nil },
 			verifySignature: func(string) error { return nil },
@@ -1268,7 +1279,7 @@ func TestAutoUpdateNeverMovesBackwards(t *testing.T) {
 	a := &app{
 		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
 		now: time.Now, credentials: staticCreds(),
-		httpClient:      &fakeMCP{github: &fakeGitHub{latestTag: "v0.6.0", assets: assets}},
+		httpClient:      syncableMCP(&fakeGitHub{latestTag: "v0.6.0", assets: assets}),
 		lookPath:        func(string) (string, error) { return "", os.ErrNotExist },
 		executable:      func() (string, error) { return path, nil },
 		verifySignature: func(string) error { return nil },
@@ -1292,7 +1303,7 @@ func TestBareUpdateDoesNotDowngradeAMachineAheadOfTheRelease(t *testing.T) {
 		return &app{
 			stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: stderr,
 			now: time.Now, credentials: staticCreds(),
-			httpClient:      &fakeMCP{github: &fakeGitHub{latestTag: "v0.6.0", assets: assets}},
+			httpClient:      syncableMCP(&fakeGitHub{latestTag: "v0.6.0", assets: assets}),
 			lookPath:        func(string) (string, error) { return "", os.ErrNotExist },
 			executable:      func() (string, error) { return path, nil },
 			verifySignature: func(string) error { return nil },

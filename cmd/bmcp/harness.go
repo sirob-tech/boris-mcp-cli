@@ -225,6 +225,18 @@ func (a *app) installHarness(name, scope string, cache *toolCache) (installResul
 	if !ok {
 		return installResult{}, fmt.Errorf("unknown harness: %s", name)
 	}
+	// The same rule refreshExistingInstructions follows, for the same reason: with
+	// no tools to render, these files would be written with the "no tools
+	// available" placeholder in place of the catalog, and pruneOldBackups would
+	// drop the older .bak-* copy that could have restored them.
+	//
+	// This path is not only reached by an explicit `bmcp install`. An all-defaults
+	// interactive `bmcp init` accepts the harness prompts for you, so a machine
+	// whose cache is empty would silently overwrite good instruction files without
+	// the user ever typing "install".
+	if cache == nil || len(cache.Tools) == 0 {
+		return installResult{}, errors.New("the local tool catalog is empty, so the instructions would list no tools; run `bmcp sync` first")
+	}
 	base, err := installBase(scope, h.userDir, h.projectDir)
 	if err != nil {
 		return installResult{}, err
@@ -463,6 +475,16 @@ func printRefreshResult(w io.Writer, result installResult) {
 }
 
 func refreshExistingInstructions(cache *toolCache) []installResult {
+	// Belt and braces behind the syncTools guard. With no tools to render, every
+	// managed file would be rewritten with renderInstructionToolList's "no tools
+	// available" placeholder in place of the catalog, and pruneOldBackups would
+	// then delete the older .bak-* copies that could have restored them. A
+	// catalog that cannot improve these files must not be able to damage them,
+	// however the empty cache arrived — including one an older binary already
+	// wrote before that guard existed.
+	if cache == nil || len(cache.Tools) == 0 {
+		return nil
+	}
 	var results []installResult
 	seen := map[string]bool{}
 	home, _ := os.UserHomeDir()

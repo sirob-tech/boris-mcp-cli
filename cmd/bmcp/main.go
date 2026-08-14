@@ -64,6 +64,13 @@ type app struct {
 	// command wants to report it. Only doctor reads it.
 	update           *updateState
 	warnedAutoUpdate bool
+	// refusedEmptyCatalog records that syncTools already declined to overwrite the
+	// cache this run. Without it a single `bmcp <tool>` call syncs twice —
+	// cmdDynamic resolves the tool, then runCall resolves it again — because the
+	// refusal deliberately leaves LastSync stale, so the second lookup is still
+	// due. Two handshakes per call against an already-degraded server, and the
+	// warning printed twice.
+	refusedEmptyCatalog bool
 }
 
 func main() {
