@@ -313,7 +313,9 @@ Project-scope targets:
 - Kiro: `./.kiro/steering/boris.md`
 
 Existing files are modified in place. When a file changes, a timestamped
-`.bak-<timestamp>` backup is created and printed.
+`.bak-<timestamp>` backup is created and printed. The five most recent backups
+of a file are kept, so a bad write is still recoverable after a later one has
+happened.
 
 Refresh tools and installed instructions:
 

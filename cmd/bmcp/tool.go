@@ -70,10 +70,16 @@ func (a *app) cacheForCatalog(flags globalFlags, cfg effectiveConfig, allowStale
 		newCache, err := a.syncTools(context.Background(), cfg)
 		if err != nil {
 			// errEmptyCatalog is a refusal to overwrite, not a failure to reach the
-			// server: syncTools only returns it when the cache in hand is non-empty
-			// and belongs to this URL. That makes it the last known-good catalog,
-			// usable even where a merely stale one would be refused — a tool call
-			// should not start failing because upstream briefly listed no tools.
+			// server, so the cache on disk is still the last known-good catalog —
+			// usable even where a merely stale one would be refused, because a tool
+			// call should not start failing because upstream briefly listed no
+			// tools.
+			//
+			// cacheErr == nil is load-bearing, not belt and braces: syncTools also
+			// returns errEmptyCatalog when the cache exists but could not be parsed,
+			// which is precisely the case with nothing to serve. readCache returns
+			// (nil, err) there, so dropping the conjunct would return (nil, nil) and
+			// cmdList would dereference it.
 			if errors.Is(err, errEmptyCatalog) && cacheErr == nil {
 				a.refusedEmptyCatalog = true
 				fmt.Fprintf(a.stderr, "Warning: %s\n", err)
@@ -110,7 +116,7 @@ func writeCache(path string, cache *toolCache) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(b, '\n'), 0o600)
+	return writeFileAtomic(path, append(b, '\n'), 0o600)
 }
 
 func schemaHash(raw json.RawMessage) string {

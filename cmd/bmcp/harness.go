@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -227,8 +228,8 @@ func (a *app) installHarness(name, scope string, cache *toolCache) (installResul
 	}
 	// The same rule refreshExistingInstructions follows, for the same reason: with
 	// no tools to render, these files would be written with the "no tools
-	// available" placeholder in place of the catalog, and pruneOldBackups would
-	// drop the older .bak-* copy that could have restored them.
+	// available" placeholder in place of the catalog, spending a backup
+	// generation on every run until no copy that could restore them is left.
 	//
 	// This path is not only reached by an explicit `bmcp install`. An all-defaults
 	// interactive `bmcp init` accepts the harness prompts for you, so a machine
@@ -393,6 +394,119 @@ func containsLegacyInstructionRef(line string, refs []string) bool {
 	return false
 }
 
+// writeFileAtomic writes through a temp file in the same directory and renames
+// it over the target, so a reader sees either the whole old file or the whole
+// new one. An in-place write interrupted by SIGKILL, a full disk or a lost
+// power rail leaves a truncated file instead, and for tools.json that is worse
+// than losing it outright: readCache fails, the empty-catalog guard in
+// syncTools is preconditioned on being able to read the old catalog, so it does
+// not engage — and an empty tools/list is then written as the truth.
+func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
+	path = resolveSymlink(path)
+	// A file that already exists keeps the mode it has. os.WriteFile applied
+	// perm only at creation, so a BORIS.md someone had tightened to 0600 stayed
+	// tightened; recreating the inode on every write would otherwise reset it to
+	// the constant this is called with.
+	mode, preserve := perm, false
+	if info, err := os.Stat(path); err == nil {
+		mode, preserve = info.Mode().Perm(), true
+	}
+	f, tmp, err := createTempFile(filepath.Dir(path), "."+filepath.Base(path), mode)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		f.Close()
+		// A no-op once the rename succeeded; on any earlier failure this is what
+		// keeps a partial write from being left behind next to the good file.
+		os.Remove(tmp)
+	}()
+	if preserve {
+		// The umask applied at creation may have narrowed a preserved mode, and
+		// a umask has no business editing a mode the user already chose. It
+		// still applies to a file being created for the first time, which is
+		// what os.WriteFile did.
+		if err := f.Chmod(mode); err != nil {
+			return err
+		}
+	}
+	if _, err := f.Write(content); err != nil {
+		return err
+	}
+	// Sync before the rename. Without it the rename can reach disk before the
+	// data does, which after a crash leaves a file that exists, has the right
+	// name, and is empty — the one state the empty-catalog guard cannot see.
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// Best effort, and only about durability: the rename is already atomic for
+	// any reader, but until the directory entry is flushed a power loss can roll
+	// it back to the previous file. Losing the newer of two intact files is an
+	// acceptable outcome, and not every filesystem allows this, so a failure
+	// here is not worth failing the write over.
+	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+		_ = dir.Sync()
+		dir.Close()
+	}
+	return nil
+}
+
+// resolveSymlink returns what path ultimately names, so a write lands on the
+// link's target rather than on the link.
+//
+// os.WriteFile opened the target and wrote through it; a rename replaces the
+// link itself with a regular file, so an instruction file a dotfiles manager had
+// symlinked into place would silently detach from the repo holding it. update.go
+// guards the binary against exactly this, and the instruction files are the ones
+// people actually symlink.
+//
+// Readlink rather than filepath.EvalSymlinks, which fails on a link whose target
+// does not exist yet and would leave that link to be replaced — a dotfiles setup
+// that symlinks a file before first writing it is the normal case, not an
+// exotic one. A bounded walk, since a symlink cycle otherwise never terminates.
+func resolveSymlink(path string) string {
+	for i := 0; i < 16; i++ {
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			return path
+		}
+		target, err := os.Readlink(path)
+		if err != nil {
+			return path
+		}
+		if filepath.IsAbs(target) {
+			path = target
+		} else {
+			path = filepath.Join(filepath.Dir(path), target)
+		}
+	}
+	return path
+}
+
+// createTempFile is os.CreateTemp with a caller-chosen mode. os.CreateTemp
+// hardcodes 0600, and correcting that with Chmod would bypass the umask —
+// os.WriteFile honoured it, and a new file appearing more permissive than the
+// user's umask allows is not a change this should make quietly.
+func createTempFile(dir, prefix string, perm os.FileMode) (*os.File, string, error) {
+	for i := 0; i < 1000; i++ {
+		name := filepath.Join(dir, fmt.Sprintf("%s.tmp%d-%d", prefix, os.Getpid(), i))
+		f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+		if err == nil {
+			return f, name, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, "", err
+		}
+	}
+	return nil, "", fmt.Errorf("no free temp filename next to %s", filepath.Join(dir, prefix))
+}
+
 func writeFileWithBackup(path string, content []byte) installFileResult {
 	result := installFileResult{Path: path}
 	old, err := os.ReadFile(path)
@@ -404,10 +518,9 @@ func writeFileWithBackup(path string, content []byte) installFileResult {
 		if err := os.MkdirAll(filepath.Dir(backup), 0o700); err != nil {
 			return installFileResult{}
 		}
-		if err := os.WriteFile(backup, old, 0o600); err != nil {
+		if err := writeFileAtomic(backup, old, 0o600); err != nil {
 			return installFileResult{}
 		}
-		pruneOldBackups(path, backup)
 		result.Backup = backup
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return installFileResult{}
@@ -415,28 +528,97 @@ func writeFileWithBackup(path string, content []byte) installFileResult {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return installFileResult{}
 	}
-	if err := os.WriteFile(path, content, 0o644); err != nil {
+	if err := writeFileAtomic(path, content, 0o644); err != nil {
 		return installFileResult{}
+	}
+	// Pruning only after the target is actually replaced. Doing it beside the
+	// backup spent a generation on a write that then failed — ENOSPC part-way
+	// through, since the small backup fits where the larger new file does not —
+	// which deletes a good restore point in exchange for nothing, and breaks the
+	// README's promise that a backup rotates "when a file changes".
+	if result.Backup != "" {
+		pruneOldBackups(path, result.Backup)
 	}
 	result.Changed = true
 	return result
 }
 
 func backupPath(path string) string {
-	stamp := time.Now().UTC().Format("20060102T150405Z")
+	// Nanosecond resolution, fixed width. A one-second stamp let two writes
+	// inside the same second land on the same name, so the second overwrote the
+	// backup the first had just taken — collapsing two generations into one and,
+	// when the first write was the good one, destroying exactly the copy worth
+	// keeping. Probing for a free name instead would break the other property
+	// pruneOldBackups depends on: it reuses a slot that pruning just freed, so
+	// the lexically smallest name ends up holding the newest content and the
+	// oldest-first sort starts deleting the wrong file.
+	stamp := time.Now().UTC().Format("20060102T150405.000000000Z")
 	return fmt.Sprintf("%s.bak-%s", path, stamp)
 }
 
+// backupGenerations is how many .bak-* copies survive a write. One is not
+// enough: the first bad write backs up the good file, the second backs up the
+// damaged file and deletes the good one, so two consecutive bad writes leave no
+// restore point at all. That amplifier is what turned #14 from recoverable into
+// permanent data loss. The bytes.Equal short-circuit in writeFileWithBackup
+// cannot stand in for it either — renderInstructionToolList embeds a _Synced:
+// line, so every sync produces different bytes and a rotation is guaranteed
+// even when the tool list is unchanged. The files are a few KB.
+const backupGenerations = 5
+
 func pruneOldBackups(path, keep string) {
-	matches, err := filepath.Glob(path + ".bak-*")
+	// Listed and prefix-matched rather than globbed. filepath.Glob reads `[`, `*`
+	// and `?` in the path as pattern syntax, so a project directory named
+	// something like `service[1]` made the pattern match nothing and returned no
+	// error — pruning silently became a no-op and the .bak-* set grew without
+	// bound, in the one place a silent no-op is hardest to notice.
+	dir, base := filepath.Split(path)
+	listDir := dir
+	if listDir == "" {
+		listDir = "."
+	}
+	entries, err := os.ReadDir(listDir)
 	if err != nil {
 		return
 	}
-	for _, match := range matches {
-		if match == keep {
+	// keep is held back rather than sorted with the rest: it is the newest by
+	// construction, but a backup written under a skewed clock could sort after
+	// it, and pruning the copy this write just took would defeat the point.
+	//
+	// Ordered by mtime, not by the timestamp in the name. The name is only as
+	// honest as the clock that wrote it, and a backup stamped with a future date
+	// — a clock that jumped forward and came back — sorts last by name forever.
+	// It then survives every prune while the genuinely recent copies below it
+	// are deleted as "oldest", which is precisely the two-bad-writes loss this
+	// retention exists to prevent. mtime is what the filesystem observed.
+	prefix := base + ".bak-"
+	type backup struct {
+		path string
+		at   time.Time
+	}
+	others := make([]backup, 0, len(entries))
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), prefix) {
 			continue
 		}
-		_ = os.Remove(match)
+		full := filepath.Join(dir, entry.Name())
+		if full == keep {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		others = append(others, backup{path: full, at: info.ModTime()})
+	}
+	sort.Slice(others, func(i, j int) bool {
+		if others[i].at.Equal(others[j].at) {
+			return others[i].path < others[j].path
+		}
+		return others[i].at.Before(others[j].at)
+	})
+	for i := 0; i < len(others)-(backupGenerations-1); i++ {
+		_ = os.Remove(others[i].path)
 	}
 }
 
@@ -477,8 +659,8 @@ func printRefreshResult(w io.Writer, result installResult) {
 func refreshExistingInstructions(cache *toolCache) []installResult {
 	// Belt and braces behind the syncTools guard. With no tools to render, every
 	// managed file would be rewritten with renderInstructionToolList's "no tools
-	// available" placeholder in place of the catalog, and pruneOldBackups would
-	// then delete the older .bak-* copies that could have restored them. A
+	// available" placeholder in place of the catalog, spending a backup
+	// generation on every run until no copy that could restore them is left. A
 	// catalog that cannot improve these files must not be able to damage them,
 	// however the empty cache arrived — including one an older binary already
 	// wrote before that guard existed.
