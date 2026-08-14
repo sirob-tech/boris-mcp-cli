@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.6.0...v0.7.0) (2026-08-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* `bmcp doctor --json` writes its JSON document to stdout instead of stderr. Anything reading it off stderr must now read stdout. Prose such as "Syncing tools..." stays on stderr. Human-readable `bmcp doctor` output is unchanged, as is the exit code in both modes.
+
+### Bug Fixes
+
+* answer `--help` and `-h` instead of exiting 1 ([#26](https://github.com/sirob-tech/boris-mcp-cli/issues/26)) ([d4a34d8](https://github.com/sirob-tech/boris-mcp-cli/commit/d4a34d88093cf3c62498265f4533fccfc4b33699))
+* move the `doctor --json` document to stdout ([#29](https://github.com/sirob-tech/boris-mcp-cli/issues/29)) ([0e7ea26](https://github.com/sirob-tech/boris-mcp-cli/commit/0e7ea2685727647452d14bb22343f3f2d9e4d2b2))
+* refuse to overwrite a good tool cache with an empty catalog ([#27](https://github.com/sirob-tech/boris-mcp-cli/issues/27)) ([01ce332](https://github.com/sirob-tech/boris-mcp-cli/commit/01ce332f278d07be061fd5079c49b608db022a45))
+
 ## [0.6.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.5.0...v0.6.0) (2026-08-14)
 
 
