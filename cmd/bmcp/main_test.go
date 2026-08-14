@@ -492,7 +492,7 @@ func TestListEmptyCatalogExitsZeroWithEmptyStdout(t *testing.T) {
 // the record shape; only last_sync drops out, and only when it is zero.
 func TestToolRecordKeepsEveryFieldButAZeroLastSync(t *testing.T) {
 	var out bytes.Buffer
-	if err := writeToolRecords(&out, []tool{{Name: "tools___search_aws"}}, time.Time{}); err != nil {
+	if err := writeToolRecords(&out, []tool{{Name: "tools___search_aws"}}, time.Time{}, false); err != nil {
 		t.Fatalf("writeToolRecords: %v", err)
 	}
 	if got := out.String(); got != `{"name":"tools___search_aws","display_name":"search_aws","description":""}`+"\n" {
@@ -4231,5 +4231,207 @@ func TestSchemaDiff(t *testing.T) {
 		if !kinds[want] {
 			t.Fatalf("missing diff kind %q in %#v", want, diff)
 		}
+	}
+}
+
+// The point of --schemas: one local invocation answers both "which tools exist"
+// and "how do I call them". Agents made 144 describe calls across 54 sessions to
+// get the second answer a tool at a time.
+func TestListWithSchemasCarriesEverySchemaInOneInvocation(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	tools := []tool{
+		{
+			Name:        "tools___search_aws",
+			Description: "Search.",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+		},
+		{
+			Name:        "tools___list_resources",
+			Description: "List.",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"resource_type":{"type":"string"}}}`),
+		},
+	}
+	setupInstallCatalog(t, home, tools)
+	var stdout, stderr bytes.Buffer
+	m := &fakeMCP{tools: tools}
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: m, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"list", "--schemas"}); code != 0 {
+		t.Fatalf("list exit %d, stderr: %s", code, stderr.String())
+	}
+	// Local: the catalog is fresh, so this costs no round trip either.
+	if m.listCalls != 0 {
+		t.Fatalf("a fresh catalog must be served from disk, got %d tools/list calls", m.listCalls)
+	}
+
+	lines := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
+	if len(lines) != len(tools) {
+		t.Fatalf("expected one record per tool, got %d lines:\n%s", len(lines), stdout.String())
+	}
+	byName := map[string]map[string]any{}
+	for _, line := range lines {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("record is not valid JSON: %v\n%s", err, line)
+		}
+		byName[record["name"].(string)] = record
+	}
+	schema, ok := byName["tools___search_aws"]["input_schema"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected an input_schema object, got: %v", byName["tools___search_aws"]["input_schema"])
+	}
+	props, ok := schema["properties"].(map[string]any)
+	if !ok || props["query"] == nil {
+		t.Fatalf("the schema should carry its properties, got: %v", schema)
+	}
+	if req, _ := schema["required"].([]any); len(req) != 1 || req[0] != "query" {
+		t.Fatalf("the schema should carry its required list, got: %v", schema["required"])
+	}
+	// The fields a caller could already rely on stay where they were.
+	if byName["tools___list_resources"]["display_name"] != "list_resources" {
+		t.Fatalf("--schemas must not disturb the existing record shape: %v", byName["tools___list_resources"])
+	}
+}
+
+// writeCache stores the catalog with MarshalIndent, which re-indents the
+// embedded raw schema, so the bytes on disk contain newlines. One record would
+// then span as many lines as its schema has fields, and `head` would split
+// records: the single guarantee NDJSON makes here.
+//
+// It holds because encoding/json compacts a RawMessage as it encodes it, so
+// there is deliberately no compaction step in writeToolRecords to point at. This
+// pins the property rather than an implementation of it — it is what would fail
+// if the records were ever assembled by hand, or the schema carried through some
+// type that is not a RawMessage.
+func TestListWithSchemasStaysOneRecordPerLine(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	nested := json.RawMessage(`{"type":"object","properties":{"scope":{"type":"object","properties":{"account_id":{"type":"string"},"region":{"type":"string"}}}}}`)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search.", InputSchema: nested}})
+
+	// Precondition: the cache really did land on disk indented, or this test
+	// would pass against a fixture that never had the problem.
+	raw, err := os.ReadFile(filepath.Join(home, ".bmcp", "tools.json"))
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+	if !strings.Contains(string(raw), "\"account_id\": {") {
+		t.Fatalf("fixture precondition: expected an indented schema on disk, got:\n%s", raw)
+	}
+
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: &fakeMCP{}, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"list", "--schemas"}); code != 0 {
+		t.Fatalf("list exit %d, stderr: %s", code, stderr.String())
+	}
+	lines := strings.Split(strings.TrimSuffix(stdout.String(), "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("one tool must render as one line, got %d:\n%s", len(lines), stdout.String())
+	}
+	// Every line independently parseable is what lets a caller truncate safely.
+	var record map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+		t.Fatalf("record is not valid JSON: %v\n%s", err, lines[0])
+	}
+	if record["input_schema"] == nil {
+		t.Fatalf("expected the schema to survive compaction: %s", lines[0])
+	}
+}
+
+// The default is unchanged. A caller asking which tools exist should not pay for
+// schemas it will not read — on the live catalog they more than double the
+// output.
+func TestListWithoutSchemasIsUnchanged(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	tools := []tool{{
+		Name:        "tools___search_aws",
+		Description: "Search.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+	}}
+	setupInstallCatalog(t, home, tools)
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: &fakeMCP{}, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"list"}); code != 0 {
+		t.Fatalf("list exit %d, stderr: %s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "input_schema") {
+		t.Fatalf("plain list must not carry schemas: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), `"display_name":"search_aws"`) {
+		t.Fatalf("plain list should still carry the record: %s", stdout.String())
+	}
+}
+
+// --schemas in the human view is describe for every tool. Rejecting the
+// combination would be a usage papercut for the one caller least able to guess
+// which half of it was wrong.
+func TestListWithSchemasInHumanOutputDescribesEveryTool(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	tools := []tool{
+		{
+			Name:        "tools___search_aws",
+			Description: "Search.",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string","description":"What to search for"}},"required":["query"]}`),
+		},
+		{
+			Name:        "tools___list_resources",
+			Description: "List.",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"resource_type":{"type":"string"}}}`),
+		},
+	}
+	setupInstallCatalog(t, home, tools)
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: &fakeMCP{}, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"list", "--schemas", "--output", "human"}); code != 0 {
+		t.Fatalf("list exit %d, stderr: %s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"search_aws",
+		"query (string, required) - What to search for",
+		"list_resources",
+		"resource_type (string, optional)",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("expected %q in the human view, got:\n%s", want, stdout.String())
+		}
+	}
+}
+
+// --schemas is list's alone. Admitting it everywhere would make `bmcp <tool>
+// --schemas` a tool argument named schemas on some future catalog and silently
+// nothing on this one.
+func TestSchemasFlagIsScopedToList(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: &fakeMCP{}, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"doctor", "--schemas"}); code == 0 {
+		t.Fatalf("--schemas must not be accepted by doctor, stdout:\n%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "unknown flag for command: --schemas") {
+		t.Fatalf("expected a flag error naming --schemas, got: %s", stderr.String())
 	}
 }

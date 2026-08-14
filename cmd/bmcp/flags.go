@@ -43,6 +43,10 @@ type globalFlags struct {
 	// the server, and the live catalog. Without it doctor answers from local
 	// state alone whenever that state is trustworthy — see cmdDoctor.
 	doctorDeep bool
+	// listSchemas adds each tool's input schema to `bmcp list`, so the catalog and
+	// every schema in it arrive in one local invocation instead of a list followed
+	// by a describe per tool.
+	listSchemas bool
 }
 
 const (
@@ -87,6 +91,8 @@ const (
 	// `bmcp <tool> --deep` — which is a tool argument named deep on some future
 	// catalog, and silently nothing on this one.
 	scopeDoctor
+	// scopeList is scopePostCommand plus `--schemas`.
+	scopeList
 )
 
 func parseGlobalFlags(args []string) (globalFlags, []string, error) {
@@ -160,6 +166,8 @@ func parseFlags(flags globalFlags, args []string, scope flagScope) (globalFlags,
 			flags.noAutoUpdate = true
 		case arg == "--deep" && scope == scopeDoctor:
 			flags.doctorDeep = true
+		case arg == "--schemas" && scope == scopeList:
+			flags.listSchemas = true
 		case arg == "--check" && scope == scopeUpdate:
 			flags.updateCheck = true
 		case arg == "--rollback" && scope == scopeUpdate:

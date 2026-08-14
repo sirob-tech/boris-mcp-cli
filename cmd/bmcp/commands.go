@@ -58,7 +58,7 @@ var commands = []command{
 	// costs the round trip an alias does not. It shadows a remote tool literally
 	// named `tools`, which the namespace prefix (`tools___<name>`) makes an
 	// implausible name for a tool inside it.
-	{names: []string{"list", "ls", "tools"}, run: (*app).cmdList},
+	{names: []string{"list", "ls", "tools"}, scope: scopeList, run: (*app).cmdList},
 	{names: []string{"describe", "d"}, run: (*app).cmdDescribe},
 	{names: []string{"call"}, run: (*app).cmdCall},
 	{names: []string{"install"}, rawArgs: true, run: (*app).cmdInstall},
@@ -396,7 +396,7 @@ func (a *app) refreshInstructions(cache *toolCache, includeProject bool) refresh
 // be a complete, parseable record.
 func (a *app) cmdList(flags globalFlags, args []string) int {
 	if len(args) != 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: bmcp list [--output ndjson|json|human]")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp list [--schemas] [--output ndjson|json|human]")
 	}
 	cfg, _, err := a.requireConfig(flags)
 	if err != nil {
@@ -412,9 +412,17 @@ func (a *app) cmdList(flags globalFlags, args []string) int {
 		fmt.Fprintf(a.stderr, "%d tools synced %s\n", len(cache.Tools), cache.LastSync.UTC().Format(time.RFC3339))
 	}
 	if flags.output == outputHuman {
-		err = renderToolList(a.stdout, cache.Tools)
+		// --schemas in the human view is `describe` for every tool, which is what
+		// the flag means in the machine view too. Rejecting the combination would
+		// be a usage papercut for the one caller — a person — least able to guess
+		// which half of it was wrong.
+		if flags.listSchemas {
+			err = renderToolListWithSchemas(a.stdout, cache.Tools)
+		} else {
+			err = renderToolList(a.stdout, cache.Tools)
+		}
 	} else {
-		err = writeToolRecords(a.stdout, cache.Tools, cache.LastSync)
+		err = writeToolRecords(a.stdout, cache.Tools, cache.LastSync, flags.listSchemas)
 	}
 	if err != nil {
 		return a.fail(flags, exitGeneric, "output_failed", err.Error())
@@ -817,12 +825,16 @@ func usage(w io.Writer) {
   bmcp install <claude-code|codex|opencode|cursor|kiro|all> [--scope user|project]
   bmcp sync
   bmcp doctor [--deep]
-  bmcp list|ls|tools [--output ndjson|json|human]
+  bmcp list|ls|tools [--schemas] [--output ndjson|json|human]
   bmcp describe|d <tool>
   bmcp call <tool> ['{"arg":"value"}']
   bmcp <exact_tool_name> --arg value
   bmcp update [--check] [--to <version>] [--rollback]
   bmcp version
+
+Flags for bmcp list:
+  --schemas                    Include each tool's input schema, so the catalog
+                               and every schema arrive in one invocation
 
 Flags for bmcp doctor:
   --deep                       Also check credentials, the server and the live
