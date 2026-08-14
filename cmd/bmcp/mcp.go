@@ -70,11 +70,26 @@ func sameServer(a, b string) bool {
 	if erra != nil || errb != nil {
 		return false
 	}
-	// TrimRight, not TrimSuffix: `/mcp//` has to collapse to `/mcp` too, or the
-	// guard is disarmed by one extra keystroke.
 	norm := func(u *url.URL) string {
-		return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host) +
-			strings.TrimRight(u.Path, "/") + "?" + u.RawQuery
+		scheme := strings.ToLower(u.Scheme)
+		host := strings.ToLower(u.Hostname())
+		// Brackets come back for IPv6: Hostname() strips them, and without them
+		// `[::1]:8787` and a host literally named `::1` would collide.
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+		// A default port spelled out is the same origin as one left off, and this
+		// is the direction that matters: a false negative here disarms the guard
+		// and destroys the catalog, where a false positive only preserves it.
+		if port := u.Port(); port != "" && !(scheme == "https" && port == "443") && !(scheme == "http" && port == "80") {
+			host += ":" + port
+		}
+		// EscapedPath, not Path: Path is percent-decoded, so `/a%2Fb` and `/a/b`
+		// would compare equal despite being different request targets.
+		//
+		// TrimRight, not TrimSuffix: `/mcp//` has to collapse to `/mcp` too, or the
+		// guard is disarmed by one extra keystroke.
+		return scheme + "://" + host + strings.TrimRight(u.EscapedPath(), "/") + "?" + u.RawQuery
 	}
 	return norm(ua) == norm(ub)
 }

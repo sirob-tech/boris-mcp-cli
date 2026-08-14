@@ -57,7 +57,13 @@ func (a *app) cacheForCatalog(flags globalFlags, cfg effectiveConfig, allowStale
 	// nothing and that the cache on disk is the last known-good catalog. Asking
 	// again in the same process cannot produce a better answer, and the second ask
 	// is a full handshake against a server that is already struggling.
-	if due && a.refusedEmptyCatalog && cacheErr == nil {
+	//
+	// sameServer is re-checked rather than assumed: `due` can also be true because
+	// the cache belongs to a different URL, and serving a mismatched catalog
+	// without syncing would be worse than the round trip this saves. The single
+	// real caller keeps one config for the whole command, so this only guards
+	// against a future one that does not.
+	if due && a.refusedEmptyCatalog && cacheErr == nil && sameServer(cache.URL, cfg.URL) {
 		return cache, nil
 	}
 	if due {

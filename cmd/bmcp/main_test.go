@@ -1130,6 +1130,11 @@ func TestSameServer(t *testing.T) {
 		{"https://a.example/mcp", "https://A.EXAMPLE/mcp"},
 		{"https://a.example/mcp", "https://a.example/mcp?"},
 		{"https://a.example/mcp?x=1", "https://a.example/mcp/?x=1"},
+		// A default port spelled out is the same origin as one left off. This is
+		// the direction that loses data if it is wrong.
+		{"https://a.example/mcp", "https://a.example:443/mcp"},
+		{"http://a.example/mcp", "http://a.example:80/mcp"},
+		{"https://[::1]/mcp", "https://[::1]:443/mcp"},
 	}
 	for _, pair := range same {
 		if !sameServer(pair[0], pair[1]) {
@@ -1145,6 +1150,12 @@ func TestSameServer(t *testing.T) {
 		{"https://a.example/mcp", "http://a.example/mcp"},
 		{"https://a.example/mcp?x=1", "https://a.example/mcp?x=2"},
 		{"https://a.example/mcp", "https://a.example/mcp/sub"},
+		// A non-default port is part of the identity.
+		{"https://a.example/mcp", "https://a.example:8443/mcp"},
+		{"https://[::1]/mcp", "https://[::2]/mcp"},
+		// Percent-encoding is preserved: these are different request targets, and
+		// comparing the decoded path would conflate them.
+		{"https://a.example/a%2Fb", "https://a.example/a/b"},
 	}
 	for _, pair := range different {
 		if sameServer(pair[0], pair[1]) {
