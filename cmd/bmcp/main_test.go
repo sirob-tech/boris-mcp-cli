@@ -2180,7 +2180,7 @@ func TestRefreshExistingInstructionsIgnoresAnEmptyCache(t *testing.T) {
 		t.Fatalf("write instructions: %v", err)
 	}
 	for _, cache := range []*toolCache{nil, {Version: 1, Tools: []tool{}}} {
-		if results := refreshExistingInstructions(cache); len(results) != 0 {
+		if results := refreshExistingInstructions(cache, true); len(results) != 0 {
 			t.Fatalf("expected no refresh for an empty cache, got %+v", results)
 		}
 	}
@@ -2190,6 +2190,337 @@ func TestRefreshExistingInstructionsIgnoresAnEmptyCache(t *testing.T) {
 	}
 	if string(got) != good {
 		t.Fatalf("instructions were rewritten: %s", got)
+	}
+}
+
+// `bmcp sync` refreshed the tool list agents read; `bmcp doctor` refreshed only
+// tools.json. BORIS.md tells agents to run doctor, and never mentions sync — so
+// a tool added, renamed or removed upstream stayed invisible to every agent
+// indefinitely, and the names they did read could point at tools the server had
+// stopped serving.
+func TestDoctorRefreshesTheInstructionToolList(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// Anywhere but the repository. refreshExistingInstructions consults the
+	// working directory, which under `go test` is the package directory, and a
+	// test that writes a BORIS.md into the source tree passes while quietly
+	// leaving an untracked file and a .bak- beside it.
+	t.Chdir(t.TempDir())
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___old_tool", Description: "Old description."}})
+	oldCache, err := readCache(filepath.Join(borisHome, "tools.json"))
+	if err != nil {
+		t.Fatalf("read seeded cache: %v", err)
+	}
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	// Seeded with a genuinely generated document rather than a hand-written stub,
+	// so this exercises replacing one rendered catalog with another — which is
+	// what happens in the field, and what makes the "old_tool is gone" assertion
+	// mean something.
+	instructionsPath := filepath.Join(claudeDir, "BORIS.md")
+	if err := os.WriteFile(instructionsPath, []byte(borisInstructionsMarkdown(oldCache)), 0o644); err != nil {
+		t.Fatalf("write instructions: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:  strings.NewReader(""),
+		stdout: &stdout,
+		stderr: &stderr,
+		now:    time.Now,
+		httpClient: &fakeMCP{tools: []tool{
+			{Name: "tools___new_tool", Description: "Newly synced infrastructure context."},
+		}},
+		credentials: staticCreds(),
+	}
+	if code := a.run([]string{"doctor"}); code != 0 {
+		t.Fatalf("doctor exit %d, stderr: %s", code, stderr.String())
+	}
+	got, err := os.ReadFile(instructionsPath)
+	if err != nil {
+		t.Fatalf("read refreshed instructions: %v", err)
+	}
+	if !strings.Contains(string(got), "`new_tool`: Newly synced infrastructure context.") {
+		t.Fatalf("doctor did not refresh the tool list: %s", got)
+	}
+	// "old_tool" and not "old": the generated prose is full of common words, and a
+	// fixture token that appears in it would make this assertion fail for reasons
+	// having nothing to do with the catalog.
+	if strings.Contains(string(got), "old_tool") {
+		t.Fatalf("the removed tool is still listed: %s", got)
+	}
+}
+
+// doctor runs unattended, every agent session, from whatever directory an agent
+// happens to be working in. A project-scope instruction file is claimed by
+// filename alone — nothing in a BORIS.md marks it as ours — so refreshing
+// project scope from doctor would rewrite an unrelated file of that name in
+// someone's repository. `bmcp sync` still refreshes it, because a human typed
+// that in a directory they chose.
+func TestDoctorLeavesProjectScopeInstructionsAlone(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	project := t.TempDir()
+	t.Chdir(project)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___old_tool", Description: "Old description."}})
+
+	// Not ours: someone else's file that happens to carry the name.
+	projectPath := filepath.Join(project, "BORIS.md")
+	mine := "# Our own BORIS notes\n\nNothing to do with bmcp.\n"
+	if err := os.WriteFile(projectPath, []byte(mine), 0o644); err != nil {
+		t.Fatalf("write project file: %v", err)
+	}
+	kiroPath := filepath.Join(project, ".kiro", "steering", "boris.md")
+	if err := os.MkdirAll(filepath.Dir(kiroPath), 0o700); err != nil {
+		t.Fatalf("mkdir kiro: %v", err)
+	}
+	if err := os.WriteFile(kiroPath, []byte(mine), 0o644); err != nil {
+		t.Fatalf("write kiro file: %v", err)
+	}
+
+	newApp := func(stdout, stderr *bytes.Buffer) *app {
+		return &app{
+			stdin:  strings.NewReader(""),
+			stdout: stdout,
+			stderr: stderr,
+			now:    time.Now,
+			httpClient: &fakeMCP{tools: []tool{
+				{Name: "tools___new_tool", Description: "Newly synced infrastructure context."},
+			}},
+			credentials: staticCreds(),
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := newApp(&stdout, &stderr).run([]string{"doctor"}); code != 0 {
+		t.Fatalf("doctor exit %d, stderr: %s", code, stderr.String())
+	}
+	for _, path := range []string{projectPath, kiroPath} {
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if string(got) != mine {
+			t.Fatalf("doctor rewrote a project-scope file it does not own\n%s:\n%s", path, got)
+		}
+		if backups := backupsFor(t, path); len(backups) != 0 {
+			t.Fatalf("doctor left backups beside %s: %v", path, backups)
+		}
+	}
+
+	// The counterpart: sync still does refresh project scope, so this is a
+	// narrowing of doctor and not a silent removal of the feature.
+	stdout.Reset()
+	stderr.Reset()
+	if code := newApp(&stdout, &stderr).run([]string{"sync"}); code != 0 {
+		t.Fatalf("sync exit %d, stderr: %s", code, stderr.String())
+	}
+	got, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatalf("read project file after sync: %v", err)
+	}
+	if !strings.Contains(string(got), "`new_tool`") {
+		t.Fatalf("sync should still refresh project scope, got: %s", got)
+	}
+}
+
+// Once doctor refreshes instruction files it runs against them every agent
+// session, so a refresh against an unchanged catalog has to be a true no-op. It
+// is one only because renderInstructionToolList is a pure function of the
+// catalog: the render used to carry a sync timestamp, which made every run
+// produce different bytes, defeated writeFileWithBackup's bytes.Equal
+// short-circuit, and rotated a backup generation per session — five sessions and
+// the last copy predating any damage is gone, the amplifier backupGenerations
+// exists to prevent.
+//
+// The clock advances between runs precisely to pin that: if anything time-varying
+// creeps back into the render, these runs stop being identical and this test
+// fails.
+func TestRepeatedDoctorRunsDoNotSpendBackupGenerations(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	setupInstallCatalog(t, home, []tool{{Name: "tools___old_tool", Description: "Old description."}})
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	instructionsPath := filepath.Join(claudeDir, "BORIS.md")
+	original := "# BORIS\n\n- `old_tool`: Old description.\n"
+	if err := os.WriteFile(instructionsPath, []byte(original), 0o644); err != nil {
+		t.Fatalf("write instructions: %v", err)
+	}
+
+	// One reading per run, advanced between runs rather than on every call. A
+	// clock that moved on each call would hand syncTools and doctor's cache-age
+	// row different times within a single run, which no real run does — it printed
+	// a negative cache age, and a minute of age on a cache that same run wrote.
+	base := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	runClock := base
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         func() time.Time { return runClock },
+		httpClient:  &fakeMCP{tools: []tool{{Name: "tools___new_tool", Description: "Newly synced infrastructure context."}}},
+		credentials: staticCreds(),
+	}
+
+	run := func(i int) {
+		runClock = base.Add(time.Duration(i) * time.Minute)
+		stdout.Reset()
+		stderr.Reset()
+		if code := a.run([]string{"doctor"}); code != 0 {
+			t.Fatalf("doctor run %d exit %d, stderr: %s", i, code, stderr.String())
+		}
+	}
+	run(0)
+	afterFirst, err := os.ReadFile(instructionsPath)
+	if err != nil {
+		t.Fatalf("read instructions: %v", err)
+	}
+	// mtime, not just content: a rewrite with identical bytes still churns the
+	// file, and dotfiles under version control notice.
+	firstInfo, err := os.Stat(instructionsPath)
+	if err != nil {
+		t.Fatalf("stat instructions: %v", err)
+	}
+	for i := 1; i < 8; i++ {
+		run(i)
+		if strings.Contains(stderr.String(), "Refreshed BORIS instructions") {
+			t.Fatalf("run %d announced a refresh against an unchanged catalog: %s", i, stderr.String())
+		}
+	}
+
+	backups := backupsFor(t, instructionsPath)
+	// One, from the first run — the only run that changed the catalog. The seven
+	// after it found the same catalog and wrote nothing.
+	if len(backups) != 1 {
+		t.Fatalf("expected one backup from the single real change, got %d: %v", len(backups), backups)
+	}
+	kept, err := os.ReadFile(backups[0])
+	if err != nil {
+		t.Fatalf("read backup: %v", err)
+	}
+	if string(kept) != original {
+		t.Fatalf("the surviving restore point should still hold the pre-refresh file, got: %s", kept)
+	}
+
+	afterLast, err := os.ReadFile(instructionsPath)
+	if err != nil {
+		t.Fatalf("read instructions: %v", err)
+	}
+	if !bytes.Equal(afterFirst, afterLast) {
+		t.Fatalf("an unchanged catalog must render identically:\nfirst %s\nlast %s", afterFirst, afterLast)
+	}
+	lastInfo, err := os.Stat(instructionsPath)
+	if err != nil {
+		t.Fatalf("stat instructions: %v", err)
+	}
+	if !lastInfo.ModTime().Equal(firstInfo.ModTime()) {
+		t.Fatal("the repeat runs rewrote the file; an unchanged catalog must not touch it at all")
+	}
+}
+
+// A render that does not vary with time is what makes the per-session doctor
+// refresh free, so pin that the renderer is a pure function of the catalog.
+// Anything reintroduced here that changes run to run re-arms the backup-eviction
+// bug this replaced.
+func TestInstructionRenderIsAPureFunctionOfTheCatalog(t *testing.T) {
+	tools := []tool{{Name: "tools___search_aws", Description: "Search."}}
+	early := &toolCache{Version: 1, URL: "http://localhost:8787/mcp", LastSync: time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC), Tools: tools}
+	later := &toolCache{Version: 1, URL: "http://localhost:8787/mcp", LastSync: time.Date(2027, 1, 2, 3, 4, 5, 0, time.UTC), Tools: tools}
+	never := &toolCache{Version: 1, URL: "http://localhost:8787/mcp", Tools: tools}
+
+	want := borisInstructionsMarkdown(early)
+	for name, cache := range map[string]*toolCache{"a later sync": later, "no sync timestamp at all": never} {
+		if got := borisInstructionsMarkdown(cache); got != want {
+			t.Fatalf("%s changed the render:\n%s", name, got)
+		}
+	}
+	if strings.Contains(want, "_Synced:") {
+		t.Fatalf("the sync timestamp is back in the render:\n%s", want)
+	}
+	// The catalog itself must of course still move the bytes.
+	changed := &toolCache{Version: 1, URL: "http://localhost:8787/mcp", LastSync: early.LastSync,
+		Tools: []tool{{Name: "tools___search_aws", Description: "Search."}, {Name: "tools___other", Description: "Other."}}}
+	if borisInstructionsMarkdown(changed) == want {
+		t.Fatal("a changed catalog must change the render")
+	}
+}
+
+// The report is the only signal that a refresh failed: the exit code is pinned
+// at 0 on purpose, so a refresh that silently did nothing would leave agents
+// reading a stale catalog with nothing anywhere saying so.
+func TestDoctorReportsInstructionFilesItCouldNotWrite(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory permissions this test relies on")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	setupInstallCatalog(t, home, []tool{{Name: "tools___old_tool", Description: "Old description."}})
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	instructionsPath := filepath.Join(claudeDir, "BORIS.md")
+	if err := os.WriteFile(instructionsPath, []byte("# BORIS\n\n- `old_tool`: Old description.\n"), 0o644); err != nil {
+		t.Fatalf("write instructions: %v", err)
+	}
+	// Readable, so the refresh is attempted and gets as far as writing.
+	if err := os.Chmod(claudeDir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(claudeDir, 0o700) })
+
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		httpClient:  &fakeMCP{tools: []tool{{Name: "tools___new_tool", Description: "New."}}},
+		credentials: staticCreds(),
+	}
+	// Exit 0 regardless: BORIS.md teaches agents to read a failing doctor as
+	// "BORIS is broken" and stop, and an unwritable ~/.claude is not that.
+	if code := a.run([]string{"doctor"}); code != 0 {
+		t.Fatalf("a failed refresh must not fail doctor, exit %d, stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Could not write") {
+		t.Fatalf("a failed refresh must be reported, stderr: %s", stderr.String())
+	}
+
+	// Prose on stderr is no use to a fleet watching `ok`, which stays true here on
+	// purpose. The JSON document has to carry the failure too.
+	stdout.Reset()
+	stderr.Reset()
+	if code := a.run([]string{"doctor", "--json"}); code != 0 {
+		t.Fatalf("doctor --json exit %d, stderr: %s", code, stderr.String())
+	}
+	var payload struct {
+		OK           bool `json:"ok"`
+		Instructions *struct {
+			Refreshed int `json:"refreshed"`
+			Failed    int `json:"failed"`
+		} `json:"instructions"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not a single JSON document: %v\n%s", err, stdout.String())
+	}
+	if payload.Instructions == nil {
+		t.Fatalf("doctor --json must report the refresh, got: %s", stdout.String())
+	}
+	if payload.Instructions.Failed == 0 {
+		t.Fatalf("the failed write must be counted, got: %s", stdout.String())
+	}
+	// Naming a remedy that goes through this same code path and fails the same
+	// way would be a per-session instruction to do something that cannot work.
+	if strings.Contains(stderr.String(), "bmcp sync` to retry") {
+		t.Fatalf("the report should not prescribe a remedy that fails identically: %s", stderr.String())
 	}
 }
 
@@ -2272,6 +2603,31 @@ func TestSyncMigratesLegacyCodexAgentsReference(t *testing.T) {
 		!strings.Contains(string(agents), "`new_tool`: Newly synced infrastructure context.") {
 		t.Fatalf("AGENTS.md was not migrated: %s", agents)
 	}
+}
+
+// backupsFor lists the .bak-* copies of a file. Deliberately not filepath.Glob:
+// pruneOldBackups abandoned Glob because a directory named like `service[1]` is
+// read as pattern syntax and matches nothing while returning no error. These are
+// the tests guarding that very decision, so using Glob here would let them pass
+// identically against the implementation it was replaced for — and the absence
+// assertions would be the ones to go vacuous.
+func backupsFor(t *testing.T, path string) []string {
+	t.Helper()
+	dir, base := filepath.Split(path)
+	if dir == "" {
+		dir = "."
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir %s: %v", dir, err)
+	}
+	var found []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), base+".bak-") {
+			found = append(found, filepath.Join(dir, entry.Name()))
+		}
+	}
+	return found
 }
 
 func setupInstallCatalog(t *testing.T, home string, tools []tool) string {

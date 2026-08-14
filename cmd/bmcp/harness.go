@@ -323,7 +323,16 @@ func writeManagedInstructionBlock(path, name, content string, legacyRefs []strin
 func refreshManagedInstructionBlock(path, name, content string, legacyRefs []string) (installFileResult, bool) {
 	old, err := os.ReadFile(path)
 	if err != nil {
-		return installFileResult{}, false
+		// "Could not read it" and "it is not ours" are different answers, and
+		// collapsing them hid the case the failure report exists for: an
+		// unreadable AGENTS.md — the file Codex and OpenCode auto-load — was
+		// dropped before it could be counted, so a refresh that failed on exactly
+		// the file that matters printed nothing at all. Only a genuine absence
+		// means "not managed".
+		if errors.Is(err, os.ErrNotExist) {
+			return installFileResult{}, false
+		}
+		return installFileResult{}, true
 	}
 	if !hasManagedInstructionBlock(string(old), name) && !hasLegacyInstructionRef(string(old), legacyRefs) {
 		return installFileResult{}, false
@@ -511,6 +520,10 @@ func writeFileWithBackup(path string, content []byte) installFileResult {
 	result := installFileResult{Path: path}
 	old, err := os.ReadFile(path)
 	if err == nil {
+		// The load-bearing short-circuit now that renderInstructionToolList emits
+		// no timestamp: a refresh against an unchanged catalog produces identical
+		// bytes and returns here, so the per-session doctor refresh writes
+		// nothing, rotates nothing, and touches no mtime.
 		if bytes.Equal(old, content) {
 			return result
 		}
@@ -560,10 +573,14 @@ func backupPath(path string) string {
 // enough: the first bad write backs up the good file, the second backs up the
 // damaged file and deletes the good one, so two consecutive bad writes leave no
 // restore point at all. That amplifier is what turned #14 from recoverable into
-// permanent data loss. The bytes.Equal short-circuit in writeFileWithBackup
-// cannot stand in for it either — renderInstructionToolList embeds a _Synced:
-// line, so every sync produces different bytes and a rotation is guaranteed
-// even when the tool list is unchanged. The files are a few KB.
+// permanent data loss. The files are a few KB.
+//
+// Five is only enough because rotations are rare, and they are rare only
+// because renderInstructionToolList is a pure function of the catalog. It used
+// to embed a sync timestamp, which made every render unique and every refresh a
+// rotation — tolerable when only `bmcp sync` refreshed, fatal once `bmcp doctor`
+// does it every agent session. Anything time-varying put back into that render
+// re-arms it.
 const backupGenerations = 5
 
 func pruneOldBackups(path, keep string) {
@@ -638,8 +655,28 @@ func printInstallResult(w io.Writer, result installResult) {
 
 func printRefreshResult(w io.Writer, result installResult) {
 	changed := false
+	failed := 0
 	for _, file := range result.Files {
+		// writeFileWithBackup discards the path on every error return, so a failed
+		// write is indistinguishable from any other failed write here. Reporting
+		// the count is still the difference between a refresh that quietly did
+		// nothing and one an operator can act on: these files are what agents read
+		// to learn which tools exist, and a stale catalog sends them at tools that
+		// no longer exist.
+		if file.Path == "" {
+			failed++
+			continue
+		}
 		changed = changed || file.Changed
+	}
+	if failed > 0 {
+		// No "run `bmcp sync` to retry": sync writes through this same function
+		// and fails the same way, and doctor runs every agent session, so that
+		// advice would be a per-session instruction to do something that cannot
+		// work. Name the consequence instead — a stale tool list is the thing the
+		// reader has to weigh — and let them decide.
+		fmt.Fprintf(w, "Could not write %d BORIS instruction file(s) for %s (%s scope); agents there keep reading the previous tool list.\n",
+			failed, harnessDisplayName(result.Harness), result.Scope)
 	}
 	if !changed {
 		return
@@ -656,7 +693,24 @@ func printRefreshResult(w io.Writer, result installResult) {
 	}
 }
 
-func refreshExistingInstructions(cache *toolCache) []installResult {
+// refreshExistingInstructions rewrites instruction files that already exist.
+//
+// includeProject decides whether the current working directory is in scope, and
+// the two callers answer differently on purpose. `bmcp sync` is typed by a human
+// who knows which directory they are standing in, so it refreshes what it finds
+// there. `bmcp doctor` is what the generated instructions tell every agent to
+// run before its first BORIS call, from whatever repository the agent happens to
+// be working in — so for doctor the answer is no. Project-scope refresh stays
+// the explicit act it has always been.
+//
+// The distinction matters because a project-scope file is claimed by filename
+// alone. `BORIS.md` and `.kiro/steering/boris.md` are rewritten whole, with no
+// marker proving bmcp wrote them, so an unrelated file of that name in someone's
+// repository is indistinguishable from one of ours. Under `sync` that costs a
+// user who ran the wrong command in the wrong directory one file and leaves a
+// .bak- beside it. Under `doctor` it would be every agent session, unattended,
+// everywhere.
+func refreshExistingInstructions(cache *toolCache, includeProject bool) []installResult {
 	// Belt and braces behind the syncTools guard. With no tools to render, every
 	// managed file would be rewritten with renderInstructionToolList's "no tools
 	// available" placeholder in place of the catalog, spending a backup
@@ -682,7 +736,7 @@ func refreshExistingInstructions(cache *toolCache) []installResult {
 			return filepath.Join(home, h.userDir)
 		}},
 		{"project", func(h harness) string {
-			if cwd == "" {
+			if cwd == "" || !includeProject {
 				return ""
 			}
 			if h.projectDir != "" {
@@ -761,10 +815,24 @@ func renderInstructionToolList(cache *toolCache) string {
 	if cache == nil || len(cache.Tools) == 0 {
 		return "- No tools were available in the local BORIS cache. Run `bmcp sync`, then reinstall or sync instructions."
 	}
+	// No sync timestamp. It used to head this list, and it made every render
+	// unique: the same catalog produced different bytes on every sync, so
+	// writeFileWithBackup's bytes.Equal short-circuit never fired and each
+	// refresh rotated a backup generation. That was survivable while only `bmcp
+	// sync` refreshed these files; once `bmcp doctor` does it, it is once per
+	// agent session, and five sessions evict every restore point.
+	//
+	// Suppressing the backup for a stamp-only rewrite was the obvious repair and
+	// the wrong one: it needs a matcher that decides whether two documents differ
+	// "only in the stamp", and every way that matcher can be fooled is a real
+	// content change that silently loses its restore point. Deleting the input
+	// deletes the question. An unchanged catalog now renders byte-identical and
+	// is not written at all.
+	//
+	// Freshness did not live here anyway: `bmcp list` reports last_sync and
+	// `bmcp doctor` reports the cache age, both from tools.json, which is the
+	// authority.
 	var b strings.Builder
-	if !cache.LastSync.IsZero() {
-		fmt.Fprintf(&b, "_Synced: %s_\n\n", cache.LastSync.UTC().Format(time.RFC3339))
-	}
 	for _, t := range cache.Tools {
 		desc := normalizeWhitespace(t.Description)
 		if desc == "" {
