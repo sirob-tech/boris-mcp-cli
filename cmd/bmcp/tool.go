@@ -53,6 +53,13 @@ type schemaProperty struct {
 func (a *app) cacheForCatalog(flags globalFlags, cfg effectiveConfig, allowStale bool) (*toolCache, error) {
 	cache, cacheErr := readCache(cfg.ToolsPath)
 	due := cacheErr != nil || cache.URL != cfg.URL || cfg.SyncTTL == 0 || a.now().Sub(cache.LastSync) > cfg.SyncTTL
+	// A refusal earlier in this run already established that upstream is listing
+	// nothing and that the cache on disk is the last known-good catalog. Asking
+	// again in the same process cannot produce a better answer, and the second ask
+	// is a full handshake against a server that is already struggling.
+	if due && a.refusedEmptyCatalog && cacheErr == nil {
+		return cache, nil
+	}
 	if due {
 		newCache, err := a.syncTools(context.Background(), cfg)
 		if err != nil {
@@ -62,6 +69,7 @@ func (a *app) cacheForCatalog(flags globalFlags, cfg effectiveConfig, allowStale
 			// usable even where a merely stale one would be refused — a tool call
 			// should not start failing because upstream briefly listed no tools.
 			if errors.Is(err, errEmptyCatalog) && cacheErr == nil {
+				a.refusedEmptyCatalog = true
 				fmt.Fprintf(a.stderr, "Warning: %s\n", err)
 				return cache, nil
 			}

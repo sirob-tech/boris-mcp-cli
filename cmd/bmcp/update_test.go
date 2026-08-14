@@ -1279,7 +1279,7 @@ func TestAutoUpdateNeverMovesBackwards(t *testing.T) {
 	a := &app{
 		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
 		now: time.Now, credentials: staticCreds(),
-		httpClient:      &fakeMCP{github: &fakeGitHub{latestTag: "v0.6.0", assets: assets}},
+		httpClient:      syncableMCP(&fakeGitHub{latestTag: "v0.6.0", assets: assets}),
 		lookPath:        func(string) (string, error) { return "", os.ErrNotExist },
 		executable:      func() (string, error) { return path, nil },
 		verifySignature: func(string) error { return nil },
@@ -1303,7 +1303,7 @@ func TestBareUpdateDoesNotDowngradeAMachineAheadOfTheRelease(t *testing.T) {
 		return &app{
 			stdin: strings.NewReader(""), stdout: &bytes.Buffer{}, stderr: stderr,
 			now: time.Now, credentials: staticCreds(),
-			httpClient:      &fakeMCP{github: &fakeGitHub{latestTag: "v0.6.0", assets: assets}},
+			httpClient:      syncableMCP(&fakeGitHub{latestTag: "v0.6.0", assets: assets}),
 			lookPath:        func(string) (string, error) { return "", os.ErrNotExist },
 			executable:      func() (string, error) { return path, nil },
 			verifySignature: func(string) error { return nil },

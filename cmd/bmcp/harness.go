@@ -225,6 +225,18 @@ func (a *app) installHarness(name, scope string, cache *toolCache) (installResul
 	if !ok {
 		return installResult{}, fmt.Errorf("unknown harness: %s", name)
 	}
+	// The same rule refreshExistingInstructions follows, for the same reason: with
+	// no tools to render, these files would be written with the "no tools
+	// available" placeholder in place of the catalog, and pruneOldBackups would
+	// drop the older .bak-* copy that could have restored them.
+	//
+	// This path is not only reached by an explicit `bmcp install`. An all-defaults
+	// interactive `bmcp init` accepts the harness prompts for you, so a machine
+	// whose cache is empty would silently overwrite good instruction files without
+	// the user ever typing "install".
+	if cache == nil || len(cache.Tools) == 0 {
+		return installResult{}, errors.New("the local tool catalog is empty, so the instructions would list no tools; run `bmcp sync` first")
+	}
 	base, err := installBase(scope, h.userDir, h.projectDir)
 	if err != nil {
 		return installResult{}, err

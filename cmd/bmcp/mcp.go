@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -50,6 +51,40 @@ type rpcError struct {
 }
 
 var errUpstream = errors.New("upstream tool failure")
+
+// sameServer reports whether two configured URLs address the same MCP endpoint,
+// ignoring differences that cannot change which server answers: a trailing
+// slash, and the case of the scheme and host. Anything it cannot parse falls
+// back to exact comparison.
+//
+// This is deliberately narrow. It exists so the empty-catalog guard is not
+// disarmed by a cosmetic spelling, not to decide cache validity in general —
+// cacheForCatalog still treats any string difference as a reason to re-sync,
+// which costs a round trip and never loses data.
+func sameServer(a, b string) bool {
+	if a == b {
+		return true
+	}
+	ua, erra := url.Parse(a)
+	ub, errb := url.Parse(b)
+	if erra != nil || errb != nil {
+		return false
+	}
+	// TrimRight, not TrimSuffix: `/mcp//` has to collapse to `/mcp` too, or the
+	// guard is disarmed by one extra keystroke.
+	norm := func(u *url.URL) string {
+		return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host) +
+			strings.TrimRight(u.Path, "/") + "?" + u.RawQuery
+	}
+	return norm(ua) == norm(ub)
+}
+
+func pluralize(n int, word string) string {
+	if n == 1 {
+		return word
+	}
+	return word + "s"
+}
 
 // errEmptyCatalog reports a tools/list that succeeded at the transport level and
 // returned nothing, while a non-empty cache already existed. It is a refusal to
@@ -113,10 +148,15 @@ func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, e
 	// the outage, and recovery the moment upstream returns.
 	// The URL check matters: a cache from a different server is not a catalog
 	// worth protecting, and after `bmcp init --url <other>` an empty result from
-	// the new server is the truth about it.
+	// the new server is the truth about it. It is compared normalized because the
+	// guard fails *open* — a cosmetic difference that still addresses the same
+	// server, such as a trailing slash from `--url`, would otherwise disarm it
+	// and destroy the catalog it exists to protect.
 	if len(tools) == 0 {
-		if old, readErr := readCache(cfg.ToolsPath); readErr == nil && len(old.Tools) > 0 && old.URL == cfg.URL {
-			return nil, fmt.Errorf("%w (%d tools, synced %s)", errEmptyCatalog, len(old.Tools), old.LastSync.UTC().Format(time.RFC3339))
+		if old, readErr := readCache(cfg.ToolsPath); readErr == nil && len(old.Tools) > 0 && sameServer(old.URL, cfg.URL) {
+			return nil, fmt.Errorf("%w (%d %s, synced %s).\nIf the catalog really is empty now, delete %s and sync again",
+				errEmptyCatalog, len(old.Tools), pluralize(len(old.Tools), "tool"),
+				old.LastSync.UTC().Format(time.RFC3339), cfg.ToolsPath)
 		}
 	}
 	cache := &toolCache{Version: 1, URL: cfg.URL, LastSync: a.now().UTC(), Server: server, Tools: tools}

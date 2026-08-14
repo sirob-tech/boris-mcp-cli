@@ -25,6 +25,9 @@ type fakeMCP struct {
 	// is what makes the "tool calls never check for updates" tests meaningful.
 	github         *fakeGitHub
 	githubRequests int
+	// listCalls counts tools/list round trips. A degraded server must not be
+	// asked more than once per command, so the count is the assertion.
+	listCalls int
 }
 
 func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
@@ -52,6 +55,7 @@ func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
 	case "notifications/initialized":
 		return respond("")
 	case "tools/list":
+		m.listCalls++
 		toolsOut := make([]map[string]any, 0, len(m.tools))
 		for _, t := range m.tools {
 			toolsOut = append(toolsOut, map[string]any{
@@ -1067,6 +1071,231 @@ func TestEmptyCatalogIsWrittenWhenThereIsNothingToProtect(t *testing.T) {
 			t.Fatalf("another server's catalog should not have been preserved, got %d tools", len(got.Tools))
 		}
 	})
+}
+
+// The guard keys off the cache's URL, so a cosmetic difference that still
+// addresses the same server must not disarm it. It fails open, so getting this
+// wrong destroys the catalog it exists to protect.
+func TestEmptyCatalogGuardSurvivesACosmeticURLDifference(t *testing.T) {
+	// Only spellings validateURL accepts, since it runs first: it requires https
+	// except for a literal lowercase `http://localhost`, so scheme- and host-case
+	// variants cannot reach the guard at all and are covered by TestSameServer.
+	for _, override := range []string{
+		"http://localhost:8787/mcp/",  // one trailing slash
+		"http://localhost:8787/mcp//", // more than one
+		"http://localhost:8787/mcp?",  // empty query
+	} {
+		t.Run(override, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___good_tool", Description: "Known good."}})
+			cachePath := filepath.Join(borisHome, "tools.json")
+			before, err := os.ReadFile(cachePath)
+			if err != nil {
+				t.Fatalf("read cache: %v", err)
+			}
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin:       strings.NewReader(""),
+				stdout:      &stdout,
+				stderr:      &stderr,
+				now:         time.Now,
+				httpClient:  &fakeMCP{tools: []tool{}},
+				credentials: staticCreds(),
+			}
+			if code := a.run([]string{"--url", override, "sync"}); code != exitSync {
+				t.Fatalf("sync should still refuse, exit %d, stderr: %s", code, stderr.String())
+			}
+			after, err := os.ReadFile(cachePath)
+			if err != nil {
+				t.Fatalf("read cache after: %v", err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatalf("cache was rewritten via %s:\nbefore %s\nafter %s", override, before, after)
+			}
+		})
+	}
+}
+
+// sameServer decides whether the empty-catalog guard engages, and it fails open,
+// so a false negative destroys the catalog the guard protects. A false positive
+// only preserves a catalog from a genuinely different server, which the next
+// successful sync replaces anyway.
+func TestSameServer(t *testing.T) {
+	same := [][2]string{
+		{"https://a.example/mcp", "https://a.example/mcp"},
+		{"https://a.example/mcp", "https://a.example/mcp/"},
+		{"https://a.example/mcp", "https://a.example/mcp//"},
+		{"https://a.example/mcp", "HTTPS://a.example/mcp"},
+		{"https://a.example/mcp", "https://A.EXAMPLE/mcp"},
+		{"https://a.example/mcp", "https://a.example/mcp?"},
+		{"https://a.example/mcp?x=1", "https://a.example/mcp/?x=1"},
+	}
+	for _, pair := range same {
+		if !sameServer(pair[0], pair[1]) {
+			t.Errorf("sameServer(%q, %q) = false, want true", pair[0], pair[1])
+		}
+	}
+	// Differences that can change which server answers must stay distinct, or the
+	// guard would preserve another server's catalog.
+	different := [][2]string{
+		{"https://a.example/mcp", "https://b.example/mcp"},
+		{"https://a.example/mcp", "https://a.example/other"},
+		{"https://a.example/mcp", "https://a.example:8443/mcp"},
+		{"https://a.example/mcp", "http://a.example/mcp"},
+		{"https://a.example/mcp?x=1", "https://a.example/mcp?x=2"},
+		{"https://a.example/mcp", "https://a.example/mcp/sub"},
+	}
+	for _, pair := range different {
+		if sameServer(pair[0], pair[1]) {
+			t.Errorf("sameServer(%q, %q) = true, want false", pair[0], pair[1])
+		}
+	}
+}
+
+// The refusal must name a way out. Without one, a server whose catalog is
+// genuinely empty now leaves sync, doctor and init failing forever — and `bmcp
+// init` is not an escape, since it only clears the cache when the URL changes.
+func TestRefusalNamesTheEscapeHatch(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___good_tool", Description: "Known good."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		httpClient:  &fakeMCP{tools: []tool{}},
+		credentials: staticCreds(),
+	}
+	if code := a.run([]string{"sync"}); code != exitSync {
+		t.Fatalf("exit %d, stderr: %s", code, stderr.String())
+	}
+	cachePath := filepath.Join(borisHome, "tools.json")
+	if !strings.Contains(stderr.String(), cachePath) {
+		t.Fatalf("the refusal should name the cache path to delete, got: %s", stderr.String())
+	}
+	// Singular, because the count is 1 — the message is only ever read on the
+	// degraded path, which is exactly when it should not look sloppy.
+	if !strings.Contains(stderr.String(), "1 tool,") {
+		t.Fatalf("expected a singular tool count, got: %s", stderr.String())
+	}
+}
+
+// The refusal deliberately leaves LastSync stale so the next command retries.
+// Within one command that must not turn into repeated handshakes: cmdDynamic
+// resolves the tool and then runCall resolves it again, so an unmemoised refusal
+// asks a struggling server twice and warns twice.
+func TestRefusedSyncAsksTheServerOnlyOncePerCommand(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{
+		Name:        "tools___search_aws",
+		Description: "Search.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+	}})
+	m := &fakeMCP{tools: []tool{}, callResult: []byte(`{"content":[{"type":"text","text":"served"}]}`)}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:  strings.NewReader(""),
+		stdout: &stdout,
+		stderr: &stderr,
+		// Past the TTL, so the catalog lookup is due and the refusal happens here.
+		now:         func() time.Time { return time.Now().Add(400 * time.Hour) },
+		httpClient:  m,
+		credentials: staticCreds(),
+	}
+	if code := a.run([]string{"search_aws", "--query", "vpc"}); code != 0 {
+		t.Fatalf("tool call exit %d, stderr: %s", code, stderr.String())
+	}
+	if m.listCalls != 1 {
+		t.Fatalf("expected 1 tools/list for one tool call, got %d", m.listCalls)
+	}
+	if got := strings.Count(stderr.String(), "returned no tools"); got != 1 {
+		t.Fatalf("expected the warning once, got %d:\n%s", got, stderr.String())
+	}
+}
+
+// doctor is the one command that should still fail during the refusal. Tool calls
+// keep working off the preserved cache, but an empty upstream catalog *is* a
+// BORIS-side fault, and the precedent in cmdDoctor is that only non-BORIS
+// failures (a GitHub outage) are kept out of the exit code.
+func TestDoctorFailsWhileUpstreamListsNoTools(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___good_tool", Description: "Known good."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		httpClient:  &fakeMCP{tools: []tool{}},
+		credentials: staticCreds(),
+	}
+	if code := a.run([]string{"doctor"}); code != exitGeneric {
+		t.Fatalf("doctor should fail while the catalog is empty, exit %d", code)
+	}
+	if !strings.Contains(stdout.String(), "remote") || !strings.Contains(stdout.String(), "returned no tools") {
+		t.Fatalf("the remote check should report the refusal, got:\n%s", stdout.String())
+	}
+	// The cache row still reports the preserved catalog, so the two rows together
+	// say "upstream is empty, your catalog survived".
+	if !strings.Contains(stdout.String(), "1 tools") {
+		t.Fatalf("the cache row should still report the preserved catalog, got:\n%s", stdout.String())
+	}
+}
+
+// installHarness renders the same catalog into the same files, so it needs the
+// same rule as refreshExistingInstructions. This path is not only reached by an
+// explicit `bmcp install`: an all-defaults interactive `bmcp init` accepts the
+// harness prompts, so without the guard a machine with an empty cache would
+// overwrite good instruction files without the user typing "install".
+func TestInstallRefusesAnEmptyCatalogRatherThanWipingInstructions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{})
+	// A fresh, non-due cache with no tools: what an older binary left behind.
+	if err := writeCache(filepath.Join(borisHome, "tools.json"), &toolCache{
+		Version: 1, URL: "http://localhost:8787/mcp", LastSync: time.Now().UTC(), Tools: []tool{},
+	}); err != nil {
+		t.Fatalf("writeCache: %v", err)
+	}
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	path := filepath.Join(claudeDir, "BORIS.md")
+	good := "# BORIS\n\n- `good_tool`: Known good tool.\n"
+	if err := os.WriteFile(path, []byte(good), 0o644); err != nil {
+		t.Fatalf("write instructions: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:       strings.NewReader(""),
+		stdout:      &stdout,
+		stderr:      &stderr,
+		now:         time.Now,
+		httpClient:  &fakeMCP{tools: []tool{}},
+		credentials: staticCreds(),
+	}
+	if code := a.run([]string{"install", "claude-code"}); code == 0 {
+		t.Fatalf("install should refuse an empty catalog, stderr: %s", stderr.String())
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read instructions: %v", err)
+	}
+	if string(got) != good {
+		t.Fatalf("instructions were overwritten: %s", got)
+	}
+	if matches, _ := filepath.Glob(path + ".bak-*"); len(matches) != 0 {
+		t.Fatalf("a refusal should not have produced a backup: %v", matches)
+	}
+	if !strings.Contains(stderr.String(), "bmcp sync") {
+		t.Fatalf("the refusal should name the recovery command, got: %s", stderr.String())
+	}
 }
 
 // Belt and braces behind the syncTools guard: an empty cache that arrived some
