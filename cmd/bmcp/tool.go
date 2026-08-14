@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -55,6 +56,15 @@ func (a *app) cacheForCatalog(flags globalFlags, cfg effectiveConfig, allowStale
 	if due {
 		newCache, err := a.syncTools(context.Background(), cfg)
 		if err != nil {
+			// errEmptyCatalog is a refusal to overwrite, not a failure to reach the
+			// server: syncTools only returns it when the cache in hand is non-empty
+			// and belongs to this URL. That makes it the last known-good catalog,
+			// usable even where a merely stale one would be refused — a tool call
+			// should not start failing because upstream briefly listed no tools.
+			if errors.Is(err, errEmptyCatalog) && cacheErr == nil {
+				fmt.Fprintf(a.stderr, "Warning: %s\n", err)
+				return cache, nil
+			}
 			if allowStale && cacheErr == nil {
 				fmt.Fprintf(a.stderr, "Warning: sync failed, using stale cache: %s\n", err)
 				return cache, nil

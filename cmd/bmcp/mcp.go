@@ -51,6 +51,12 @@ type rpcError struct {
 
 var errUpstream = errors.New("upstream tool failure")
 
+// errEmptyCatalog reports a tools/list that succeeded at the transport level and
+// returned nothing, while a non-empty cache already existed. It is a refusal to
+// write, not a transport failure: the cache on disk is untouched and still the
+// last known-good catalog, which is why cacheForCatalog can serve from it.
+var errEmptyCatalog = errors.New("the server returned no tools; keeping the existing cache")
+
 type authError struct{ error }
 
 func isAuthErr(err error) bool {
@@ -64,6 +70,9 @@ func errorName(err error) string {
 	}
 	if errors.Is(err, errUpstream) {
 		return "upstream_tool_failure"
+	}
+	if errors.Is(err, errEmptyCatalog) {
+		return "empty_catalog"
 	}
 	return "failure"
 }
@@ -88,6 +97,28 @@ func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, e
 		tools[i].SchemaHash = schemaHash(tools[i].InputSchema)
 	}
 	sort.Slice(tools, func(i, j int) bool { return tools[i].Name < tools[j].Name })
+	// A tools/list that succeeds and returns nothing — a partial upstream outage,
+	// a gateway misconfiguration, an auth scope resolving to no tools — must not
+	// replace a good catalog with an empty one stamped LastSync: now. That write
+	// is unrecoverable without the server coming back, and it propagates: `sync`
+	// then rewrites every installed instruction file with the "no tools
+	// available" placeholder, while pruneOldBackups drops the older .bak-* copies
+	// that could have restored them.
+	//
+	// Only a catalog that already had tools is protected. A first sync against a
+	// genuinely empty server still writes, because there is nothing to lose.
+	//
+	// Leaving the cache untouched also leaves LastSync stale, so the next command
+	// retries rather than waiting out the TTL — one round trip per command during
+	// the outage, and recovery the moment upstream returns.
+	// The URL check matters: a cache from a different server is not a catalog
+	// worth protecting, and after `bmcp init --url <other>` an empty result from
+	// the new server is the truth about it.
+	if len(tools) == 0 {
+		if old, readErr := readCache(cfg.ToolsPath); readErr == nil && len(old.Tools) > 0 && old.URL == cfg.URL {
+			return nil, fmt.Errorf("%w (%d tools, synced %s)", errEmptyCatalog, len(old.Tools), old.LastSync.UTC().Format(time.RFC3339))
+		}
+	}
 	cache := &toolCache{Version: 1, URL: cfg.URL, LastSync: a.now().UTC(), Server: server, Tools: tools}
 	if err := writeCache(cfg.ToolsPath, cache); err != nil {
 		return nil, err

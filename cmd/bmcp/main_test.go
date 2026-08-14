@@ -905,6 +905,199 @@ func TestSyncRefreshesExistingInstructions(t *testing.T) {
 	}
 }
 
+// A tools/list that succeeds at the transport level and returns nothing used to
+// replace a known-good catalog with an empty one stamped LastSync: now, then
+// rewrite every installed instruction file with the "no tools available"
+// placeholder — while pruneOldBackups deleted the older .bak-* copies that could
+// have restored them. Recovery needed the server back *and* a fresh sync.
+func TestEmptyCatalogDoesNotOverwriteAGoodCacheOrInstructions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___good_tool", Description: "Known good tool."}})
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	instructionsPath := filepath.Join(claudeDir, "BORIS.md")
+	good := "# BORIS\n\n- `good_tool`: Known good tool.\n"
+	if err := os.WriteFile(instructionsPath, []byte(good), 0o644); err != nil {
+		t.Fatalf("write instructions: %v", err)
+	}
+	cachePath := filepath.Join(borisHome, "tools.json")
+	before, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:  strings.NewReader(""),
+		stdout: &stdout,
+		stderr: &stderr,
+		now:    time.Now,
+		// An empty catalog: transport fine, zero tools.
+		httpClient:  &fakeMCP{tools: []tool{}},
+		credentials: staticCreds(),
+	}
+	if code := a.run([]string{"sync"}); code != exitSync {
+		t.Fatalf("sync should refuse an empty catalog, exit %d, stderr: %s", code, stderr.String())
+	}
+
+	after, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache after: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("cache was rewritten:\nbefore %s\nafter %s", before, after)
+	}
+	got, err := os.ReadFile(instructionsPath)
+	if err != nil {
+		t.Fatalf("read instructions after: %v", err)
+	}
+	if string(got) != good {
+		t.Fatalf("instructions were rewritten: %s", got)
+	}
+	if strings.Contains(string(got), "No tools were available") {
+		t.Fatalf("instructions carry the empty placeholder: %s", got)
+	}
+	if matches, _ := filepath.Glob(instructionsPath + ".bak-*"); len(matches) != 0 {
+		t.Fatalf("a refusal should not have produced a backup: %v", matches)
+	}
+	if !strings.Contains(stderr.String(), "returned no tools") {
+		t.Fatalf("stderr should explain the refusal, got: %s", stderr.String())
+	}
+}
+
+// The refusal protects data; it must not make the CLI unusable while upstream is
+// degraded. The cache was left untouched precisely because it is still good, so
+// a tool call has to keep working off it — cmdCall asks for a fresh catalog
+// (allowStale=false) and would otherwise fail hard.
+func TestToolCallsStillWorkAfterAnEmptyCatalogIsRefused(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{
+		Name:        "tools___search_aws",
+		Description: "Search.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+	}})
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:  strings.NewReader(""),
+		stdout: &stdout,
+		stderr: &stderr,
+		// Forces the TTL check to treat the cache as due, so syncTools runs and
+		// returns the refusal on this very call.
+		now:         func() time.Time { return time.Now().Add(400 * time.Hour) },
+		httpClient:  &fakeMCP{tools: []tool{}, callResult: []byte(`{"content":[{"type":"text","text":"served"}]}`)},
+		credentials: staticCreds(),
+	}
+	if code := a.run([]string{"search_aws", "--query", "vpc"}); code != 0 {
+		t.Fatalf("tool call exit %d, stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "served") {
+		t.Fatalf("expected the call to be served from the preserved cache, stdout: %s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "returned no tools") {
+		t.Fatalf("stderr should warn that the catalog came back empty, got: %s", stderr.String())
+	}
+}
+
+// The guard protects existing data; it must not block the two cases where an
+// empty catalog is the truth.
+func TestEmptyCatalogIsWrittenWhenThereIsNothingToProtect(t *testing.T) {
+	t.Run("no prior cache", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		borisHome := filepath.Join(home, ".bmcp")
+		t.Setenv("BMCP_HOME", borisHome)
+		var stdout, stderr bytes.Buffer
+		a := &app{
+			stdin:       strings.NewReader(""),
+			stdout:      &stdout,
+			stderr:      &stderr,
+			now:         time.Now,
+			httpClient:  &fakeMCP{tools: []tool{}},
+			credentials: staticCreds(),
+			interactive: func() bool { return false },
+		}
+		if code := a.run([]string{"init", "--url", "http://localhost:8787/mcp"}); code != 0 {
+			t.Fatalf("first init exit %d, stderr: %s", code, stderr.String())
+		}
+		cache, err := readCache(filepath.Join(borisHome, "tools.json"))
+		if err != nil {
+			t.Fatalf("read cache: %v", err)
+		}
+		if len(cache.Tools) != 0 {
+			t.Fatalf("expected the empty catalog to be written, got %d tools", len(cache.Tools))
+		}
+	})
+
+	// A cache from a different server is not a catalog worth keeping: after
+	// pointing bmcp at another URL, that server's empty list is the truth.
+	t.Run("cache belongs to another url", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___old_server_tool", Description: "From the old server."}})
+		cachePath := filepath.Join(borisHome, "tools.json")
+		cache, err := readCache(cachePath)
+		if err != nil {
+			t.Fatalf("read cache: %v", err)
+		}
+		cache.URL = "http://localhost:9999/other"
+		if err := writeCache(cachePath, cache); err != nil {
+			t.Fatalf("writeCache: %v", err)
+		}
+		var stdout, stderr bytes.Buffer
+		a := &app{
+			stdin:       strings.NewReader(""),
+			stdout:      &stdout,
+			stderr:      &stderr,
+			now:         time.Now,
+			httpClient:  &fakeMCP{tools: []tool{}},
+			credentials: staticCreds(),
+		}
+		if code := a.run([]string{"sync"}); code != 0 {
+			t.Fatalf("sync exit %d, stderr: %s", code, stderr.String())
+		}
+		got, err := readCache(cachePath)
+		if err != nil {
+			t.Fatalf("read cache after: %v", err)
+		}
+		if len(got.Tools) != 0 {
+			t.Fatalf("another server's catalog should not have been preserved, got %d tools", len(got.Tools))
+		}
+	})
+}
+
+// Belt and braces behind the syncTools guard: an empty cache that arrived some
+// other way — hand-edited, or written by a binary predating the guard — must
+// still not be able to overwrite a populated instruction file.
+func TestRefreshExistingInstructionsIgnoresAnEmptyCache(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	path := filepath.Join(claudeDir, "BORIS.md")
+	good := "# BORIS\n\n- `good_tool`: Known good tool.\n"
+	if err := os.WriteFile(path, []byte(good), 0o644); err != nil {
+		t.Fatalf("write instructions: %v", err)
+	}
+	for _, cache := range []*toolCache{nil, {Version: 1, Tools: []tool{}}} {
+		if results := refreshExistingInstructions(cache); len(results) != 0 {
+			t.Fatalf("expected no refresh for an empty cache, got %+v", results)
+		}
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read instructions: %v", err)
+	}
+	if string(got) != good {
+		t.Fatalf("instructions were rewritten: %s", got)
+	}
+}
+
 func TestSyncRefreshesExistingKiroSteering(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

@@ -463,6 +463,16 @@ func printRefreshResult(w io.Writer, result installResult) {
 }
 
 func refreshExistingInstructions(cache *toolCache) []installResult {
+	// Belt and braces behind the syncTools guard. With no tools to render, every
+	// managed file would be rewritten with renderInstructionToolList's "no tools
+	// available" placeholder in place of the catalog, and pruneOldBackups would
+	// then delete the older .bak-* copies that could have restored them. A
+	// catalog that cannot improve these files must not be able to damage them,
+	// however the empty cache arrived — including one an older binary already
+	// wrote before that guard existed.
+	if cache == nil || len(cache.Tools) == 0 {
+		return nil
+	}
 	var results []installResult
 	seen := map[string]bool{}
 	home, _ := os.UserHomeDir()
