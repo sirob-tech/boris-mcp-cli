@@ -49,6 +49,13 @@ because no job checked whether the release was installable.
 `smoke` is what tells it which way to go, and it tests over the public download
 URLs — an authenticated check would pass on a release the public cannot fetch.
 
+`ci.yml` runs on the same push to `main` as the release, so `update-e2e` lands
+inside that window on every release commit. It checks that the latest release
+has the artifacts it needs and skips with a `::notice` when it does not, rather
+than reporting a 404 it caused by racing. Do not turn that skip into a retry:
+it would make `ci.yml` wait on a pipeline it does not own, and `smoke` already
+covers whether the published release is installable.
+
 ### Before releasing
 
 `.github/workflows/release-preflight.yml` runs the whole signing and

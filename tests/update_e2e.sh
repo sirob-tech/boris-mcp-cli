@@ -7,6 +7,9 @@
 # that only exist in reality: the actual release layout, the actual checksums
 # file, and — on macOS — the actual Developer ID signature on the shipped
 # artifact. This script is the only thing that does.
+#
+# It therefore depends on a release that has artifacts, and skips when the
+# latest one does not have them yet — see the asset check below.
 
 set -eu
 
@@ -30,6 +33,15 @@ info() {
   printf '[e2e] %s\n' "$1"
 }
 
+# A skip is a pass with a reason, and a pass nobody can tell apart from a real
+# one is how a check stops meaning anything. The annotation puts the reason on
+# the run summary rather than 200 lines into a green job's log.
+skip() {
+  printf '[e2e] SKIP: %s\n' "$1"
+  [ -z "${GITHUB_ACTIONS:-}" ] || printf '::notice title=update-e2e skipped::%s\n' "$1"
+  exit 0
+}
+
 digest() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -45,6 +57,34 @@ LATEST=$(curl -sI "https://github.com/${REPO}/releases/latest" \
 [ -n "$LATEST" ] || fail "could not resolve the latest release tag"
 LATEST_PLAIN=${LATEST#v}
 info "latest release: $LATEST"
+
+# release-please publishes the release object minutes before GoReleaser puts
+# anything in it, and both workflows start from the same push to main — so on
+# every release commit this script resolves LATEST to a release that is real,
+# is what /releases/latest returns, and is empty. Downloading from it 404s, and
+# that 404 says nothing about the code under test.
+#
+# Skip rather than fail: "the published release is installable" is already
+# owned by `smoke` in release.yml, which runs after GoReleaser and retries. A
+# check that is red on every release commit trains everyone to ignore red CI on
+# exactly the commits where a broken release would otherwise be silent.
+#
+# Only a 404 is that not-yet state. Any other non-200 is an anomaly worth
+# failing on, or the skip becomes a way for real breakage to pass quietly.
+ASSET="bmcp-$(go env GOOS)-$(go env GOARCH).tar.gz"
+for want in "$ASSET" checksums.txt; do
+  url="https://github.com/${REPO}/releases/download/${LATEST}/${want}"
+  # curl writes %{http_code} even when it exits non-zero — 000 if it never got a
+  # response — so take what it printed and only invent a value if it printed
+  # nothing at all.
+  code=$(curl -sIL -o /dev/null -w '%{http_code}' "$url") || true
+  [ -n "$code" ] || code=000
+  case "$code" in
+    200) ;;
+    404) skip "release $LATEST has no $want yet (release.yml is probably still building it) — nothing to update to" ;;
+    *) fail "HEAD $url returned HTTP $code" ;;
+  esac
+done
 
 info "building an old bmcp that still looks like a release build"
 (
