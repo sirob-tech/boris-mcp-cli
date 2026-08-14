@@ -3041,6 +3041,805 @@ func TestGeneratedInstructionsDoNotDependOnJQ(t *testing.T) {
 	}
 }
 
+// The live catalog has three tools with a nested `scope` object. Describe walked
+// only the top level, so `scope` rendered with no fields at all and the only
+// shape guidance was the `{"Key":"value"}` placeholder — which Validate accepts,
+// because it checks an object argument for being a map and nothing more. `Key`
+// then reached the server as a filter key that does not exist.
+func TestDescribeRendersNestedObjectFields(t *testing.T) {
+	tl := tool{
+		Name: "tools___search_infrastructure_by_description",
+		InputSchema: json.RawMessage(`{
+			"type":"object",
+			"required":["query"],
+			"properties":{
+				"query":{"type":"string","description":"What to look for"},
+				"scope":{"type":"object","description":"Exact-match filters","properties":{
+					"account_id":{"type":"string","description":"12-digit AWS account ID"},
+					"region":{"type":"string"},
+					"type":{"type":"string"}
+				}}
+			}
+		}`),
+	}
+	var out bytes.Buffer
+	tl.Describe(&out)
+	got := out.String()
+
+	// Indented under scope, not flush with the top-level arguments: the nesting is
+	// the part that says these are fields *of* scope rather than more arguments.
+	for _, want := range []string{
+		"  scope (object, optional) - Exact-match filters\n",
+		"    account_id (string, optional) - 12-digit AWS account ID\n",
+		"    region (string, optional)\n",
+		"    type (string, optional)\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("describe should render %q, got:\n%s", want, got)
+		}
+	}
+	// Both examples must name a field the schema declares. This is the half that
+	// stops the garbage shipping: an agent copying the example now sends a real key.
+	if !strings.Contains(got, `--scope '{"account_id":"value"}'`) {
+		t.Fatalf("subcommand example should name a real field, got:\n%s", got)
+	}
+	if !strings.Contains(got, `"scope":{"account_id":"value"}`) {
+		t.Fatalf("JSON example should name a real field, got:\n%s", got)
+	}
+	if strings.Contains(got, `"Key"`) {
+		t.Fatalf("no example may still offer the Key placeholder, got:\n%s", got)
+	}
+}
+
+// An object with no declared fields is the `filters` case: the shape lives in the
+// description prose, and there is no real key to name. The placeholder stays,
+// because inventing one would be worse than admitting there is nothing to say.
+func TestDescribeKeepsPlaceholderForFieldlessObject(t *testing.T) {
+	tl := tool{
+		Name:        "tools___search",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"filters":{"type":"object","description":"See above"}}}`),
+	}
+	var out bytes.Buffer
+	tl.Describe(&out)
+	got := out.String()
+	if !strings.Contains(got, `--filters '{"Key":"value"}'`) {
+		t.Fatalf("fieldless object should keep the placeholder, got:\n%s", got)
+	}
+	// The JSON example keeps `{}` rather than the placeholder: it sends nothing,
+	// which beats sending a key the server does not know.
+	if !strings.Contains(got, `'{"filters":{}}'`) {
+		t.Fatalf("JSON example should send an empty object, got:\n%s", got)
+	}
+}
+
+func TestDescribeRendersArrayItemFieldsAndPrefersRequiredInExamples(t *testing.T) {
+	tl := tool{
+		Name: "tools___tag_resources",
+		InputSchema: json.RawMessage(`{
+			"type":"object",
+			"properties":{
+				"tags":{"type":"array","items":{"type":"object","required":["key"],"properties":{
+					"key":{"type":"string"},"value":{"type":"string"}
+				}}},
+				"names":{"type":"array","items":{"type":"string"}},
+				"scope":{"type":"object","required":["region"],"properties":{
+					"account_id":{"type":"string"},"region":{"type":"string"}
+				}}
+			}
+		}`),
+	}
+	var out bytes.Buffer
+	tl.Describe(&out)
+	got := out.String()
+	// "array of object" rather than "array": it is what attributes the indented
+	// fields to the items instead of to the array.
+	for _, want := range []string{
+		"  tags (array of object, optional)\n",
+		"    key (string, required)\n",
+		"    value (string, optional)\n",
+		"  names (array of string, optional)\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("describe should render %q, got:\n%s", want, got)
+		}
+	}
+	// region, not the alphabetically-first account_id: an example built from a
+	// required field is a payload the server can accept as written.
+	if !strings.Contains(got, `--scope '{"region":"value"}'`) {
+		t.Fatalf("object example should prefer a required field, got:\n%s", got)
+	}
+}
+
+// Every rendered example has to be valid JSON, because the point of an example is
+// that it can be copied. A property with no recognisable type renders as a
+// placeholder, and a bare `...` was survivable only while it could appear at the
+// top level alone — nested inside an object or array it makes the whole example
+// unparseable, so the CLI rejects its own printed example. Enum-only and `anyOf`
+// sub-fields (what Pydantic emits) are exactly that case.
+func TestDescribeExamplesAreAlwaysValidJSON(t *testing.T) {
+	tl := tool{
+		Name: "tools___q",
+		InputSchema: json.RawMessage(`{
+			"type":"object",
+			"properties":{
+				"untyped":{"description":"no type at all"},
+				"scope":{"type":"object","required":["kind"],"properties":{"kind":{"enum":["a","b"]}}},
+				"rows":{"type":"array","items":{"anyOf":[{"type":"string"}]}}
+			}
+		}`),
+	}
+	var out bytes.Buffer
+	tl.Describe(&out)
+	got := out.String()
+
+	// The JSON-call line, parsed as the payload `bmcp call` would receive.
+	_, payload, ok := strings.Cut(got, "bmcp call q '")
+	if !ok {
+		t.Fatalf("could not find the JSON call example in:\n%s", got)
+	}
+	payload, _, _ = strings.Cut(payload, "'\n")
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Fatalf("the JSON call example must parse: %v\ngot: %s", err, payload)
+	}
+	// And the subcommand line: every object/array flag value must parse too, since
+	// ParseFlags decodes them.
+	if err := tl.Validate(decoded); err != nil {
+		t.Fatalf("the example payload must also pass validation: %v", err)
+	}
+	for _, frag := range []string{`--scope '`, `--rows '`} {
+		_, rest, found := strings.Cut(got, frag)
+		if !found {
+			t.Fatalf("missing %s in:\n%s", frag, got)
+		}
+		value, _, _ := strings.Cut(rest, "'")
+		var v any
+		if err := json.Unmarshal([]byte(value), &v); err != nil {
+			t.Fatalf("flag example %s%s' must parse: %v", frag, value, err)
+		}
+	}
+}
+
+// An example must satisfy the schema, not merely parse. One required field named
+// out of two is a payload the server rejects for a missing key, and a type
+// placeholder in a field constrained to an enum is rejected for a bad value —
+// both leave the caller with an example that cannot be used as printed.
+func TestDescribeExamplesSatisfyTheSchemaTheyCameFrom(t *testing.T) {
+	tl := tool{
+		Name: "tools___q",
+		InputSchema: json.RawMessage(`{
+			"type":"object",
+			"properties":{
+				"scope":{"type":"object","required":["account_id","region"],"properties":{
+					"account_id":{"type":"string"},
+					"region":{"type":"string"},
+					"note":{"type":"string"}
+				}},
+				"mode":{"type":"object","required":["kind"],"properties":{
+					"kind":{"enum":["fast","thorough"]}
+				}},
+				"pinned":{"type":"object","required":["v"],"properties":{
+					"v":{"const":7}
+				}}
+			}
+		}`),
+	}
+	var out bytes.Buffer
+	tl.Describe(&out)
+	got := out.String()
+	for _, want := range []string{
+		// Both required fields, and not the optional one.
+		`--scope '{"account_id":"value","region":"value"}'`,
+		// A value the enum actually allows.
+		`--mode '{"kind":"fast"}'`,
+		// const wins over the declared type.
+		`--pinned '{"v":7}'`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("example should be %s, got:\n%s", want, got)
+		}
+	}
+}
+
+// The declared type decides which keyword describes the shape: JSON Schema reads
+// `items` for an array and `properties` for an object. A schema carrying both used
+// to print the array's `properties` under a heading taken from its `items`, so the
+// fields shown belonged to neither.
+func TestDescribeFollowsItemsForADeclaredArray(t *testing.T) {
+	tl := tool{
+		Name: "tools___t",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{
+			"rows":{"type":"array","properties":{"wrong":{"type":"string"}},
+			        "items":{"type":"object","properties":{"right":{"type":"string"}}}}
+		}}`),
+	}
+	var out bytes.Buffer
+	tl.Describe(&out)
+	got := out.String()
+	if !strings.Contains(got, "  rows (array of object, optional)\n") {
+		t.Fatalf("heading should describe the items, got:\n%s", got)
+	}
+	if !strings.Contains(got, "    right (string, optional)\n") {
+		t.Fatalf("an array's fields come from items, got:\n%s", got)
+	}
+	if strings.Contains(got, "wrong") {
+		t.Fatalf("properties must not be read off a declared array, got:\n%s", got)
+	}
+}
+
+// An items schema with fields but no declared type is an object by construction.
+// Labelling it a bare "array" while indenting its fields underneath is the exact
+// ambiguity the "array of object" spelling exists to remove.
+func TestDescribeNamesArrayItemsThatDeclareNoType(t *testing.T) {
+	tl := tool{
+		Name: "tools___tag",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{
+			"tags":{"type":"array","items":{"properties":{"key":{"type":"string"}}}}
+		}}`),
+	}
+	var out bytes.Buffer
+	tl.Describe(&out)
+	if got := out.String(); !strings.Contains(got, "  tags (array of object, optional)\n") {
+		t.Fatalf("an items schema with properties should be named as such, got:\n%s", got)
+	}
+}
+
+// Nesting deeper than one level is rendered rather than truncated. Recursion is
+// safe here because the tree comes from an unmarshalled schema — nothing resolves
+// $ref, so a cycle is not representable.
+func TestDescribeRendersDeeplyNestedFields(t *testing.T) {
+	tl := tool{
+		Name:        "tools___q",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"a":{"type":"object","properties":{"b":{"type":"object","properties":{"c":{"type":"string"}}}}}}}`),
+	}
+	var out bytes.Buffer
+	tl.Describe(&out)
+	got := out.String()
+	for _, want := range []string{"  a (object,", "    b (object,", "      c (string,"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("describe should render %q, got:\n%s", want, got)
+		}
+	}
+	// The example follows the nesting too, rather than bottoming out at `{}`.
+	if !strings.Contains(got, `'{"a":{"b":{"c":"value"}}}'`) {
+		t.Fatalf("example should follow the nesting, got:\n%s", got)
+	}
+}
+
+// Version discovery used to require the exact `bmcp version` subcommand, so an
+// agent reaching for the conventional spelling got "unknown global flag" and
+// exit 1 — which reads as a broken CLI rather than a wrong spelling.
+func TestVersionFlagsPrintVersionWithoutConfig(t *testing.T) {
+	// No config and no catalog: the version cannot depend on either.
+	t.Setenv("BMCP_HOME", filepath.Join(t.TempDir(), "absent"))
+	for _, args := range [][]string{
+		{"--version"},
+		{"-V"},
+		{"--non-interactive", "--version"},
+		// After `--` the flag cannot fire, because `--` stops flag interpretation.
+		// The command-table aliases are what keep these working.
+		{"--", "--version"},
+		{"--", "-V"},
+		// help wins, and the post-command and with-arguments forms are errors —
+		// both asserted separately below.
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+				now: time.Now, httpClient: failingDoer{},
+			}
+			if code := a.run(args); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if !strings.HasPrefix(stdout.String(), "bmcp ") {
+				t.Fatalf("version should go to stdout, got stdout %q stderr %q", stdout.String(), stderr.String())
+			}
+			if strings.Contains(stdout.String(), "Usage:") {
+				t.Fatalf("--version must not print usage: %s", stdout.String())
+			}
+			if strings.Contains(stderr.String(), "unknown") {
+				t.Fatalf("stderr should not report an unknown flag, got: %s", stderr.String())
+			}
+		})
+	}
+}
+
+// Ordering, which the table above cannot express: help is the broader question,
+// so it answers first, and it held that position before --version existed.
+func TestHelpWinsOverVersion(t *testing.T) {
+	t.Setenv("BMCP_HOME", filepath.Join(t.TempDir(), "absent"))
+	for _, args := range [][]string{{"--help", "--version"}, {"--version", "--help"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now, httpClient: failingDoer{}}
+			if code := a.run(args); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), "Usage:") {
+				t.Fatalf("help should win, got: %s", stdout.String())
+			}
+		})
+	}
+}
+
+// --version must not silently swallow a command or its arguments. `bmcp update
+// --to 0.7.0 --version` reporting success while updating nothing is the exact trap
+// that made the update flag `--to` rather than `--version`, and before this change
+// each of these was a hard error. Rejecting them keeps that true.
+func TestVersionFlagRefusesToSwallowACommand(t *testing.T) {
+	t.Setenv("BMCP_HOME", filepath.Join(t.TempDir(), "absent"))
+	for _, tc := range []struct {
+		args []string
+		code int
+	}{
+		// Post-command: parseFlags accepts --version in the global scope only, so
+		// these are flag errors. `install` is rawArgs and rejects it itself.
+		{[]string{"doctor", "--version"}, exitGeneric},
+		{[]string{"list", "-V"}, exitGeneric},
+		{[]string{"update", "--to", "0.7.0", "--version"}, exitGeneric},
+		{[]string{"update", "--version", "0.7.0"}, exitGeneric},
+		{[]string{"install", "--version"}, exitValidation},
+		// Global position, but with a command or tool still to run.
+		{[]string{"--version", "doctor"}, exitValidation},
+		{[]string{"-V", "some_tool", "--arg", "x"}, exitValidation},
+		// Through the command aliases, which reach cmdVersion with their arguments
+		// intact and so are not covered by run()'s guard on the flag.
+		{[]string{"--", "--version", "doctor"}, exitValidation},
+		{[]string{"--", "-V", "doctor"}, exitValidation},
+		{[]string{"version", "garbage"}, exitValidation},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now, httpClient: failingDoer{}}
+			if code := a.run(tc.args); code != tc.code {
+				t.Fatalf("exit code %d, want %d, stderr: %s", code, tc.code, stderr.String())
+			}
+			if strings.HasPrefix(stdout.String(), "bmcp ") {
+				t.Fatalf("must not report the version and abandon the command, got: %q", stdout.String())
+			}
+		})
+	}
+}
+
+// Same guarantee TestHelpNeverReachesTheNetwork pins for help: a release build is
+// needed for it to mean anything, because under `go test` inspectUpdate
+// short-circuits as a source build before any request is built.
+func TestVersionFlagNeverReachesTheNetwork(t *testing.T) {
+	asReleaseBuild(t, "0.5.0")
+	t.Setenv("BMCP_HOME", configuredHome(t))
+	t.Setenv("HOME", t.TempDir())
+	path := stagedBinary(t, "old binary")
+
+	for _, args := range [][]string{{"--version"}, {"-V"}, {"--", "--version"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			// github is nil, so any GitHub request becomes an error and is counted.
+			m := &fakeMCP{tools: []tool{{Name: "search_aws_memory", Description: "d"}}}
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+				now: time.Now, httpClient: m, credentials: staticCreds(),
+				lookPath:   func(string) (string, error) { return "", os.ErrNotExist },
+				executable: func() (string, error) { return path, nil },
+			}
+			if code := a.run(args); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if m.githubRequests != 0 {
+				t.Fatalf("%v made %d GitHub requests; reporting the version must not check for updates", args, m.githubRequests)
+			}
+			if m.listCalls != 0 {
+				t.Fatalf("%v made %d tools/list calls; the version must not need the catalog", args, m.listCalls)
+			}
+		})
+	}
+	if got, _ := os.ReadFile(path); string(got) != "old binary" {
+		t.Fatalf("reporting the version may not replace the binary, got %q", got)
+	}
+}
+
+// A mistyped command used to fall through to dynamic tool resolution, which loads
+// config, can sync, and on an unconfigured interactive machine runs the whole
+// first-run setup — so a typo was answered with a prompt for a URL.
+func TestMistypedCommandIsCorrectedFromLocalStateAlone(t *testing.T) {
+	cases := []struct{ typo, want string }{
+		{"doctr", "bmcp doctor"},
+		{"lst", "bmcp list"},
+		{"instal", "bmcp install"},
+		{"describ", "bmcp describe"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.typo, func(t *testing.T) {
+			// No config, no catalog, and interactive: the pre-fix path would have
+			// prompted here rather than answering.
+			t.Setenv("BMCP_HOME", filepath.Join(t.TempDir(), "absent"))
+			m := &fakeMCP{}
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+				now: time.Now, httpClient: m,
+				credentials: func(context.Context, effectiveConfig) (aws.Credentials, string, error) {
+					t.Fatal("a typo must not load credentials")
+					return aws.Credentials{}, "", nil
+				},
+				interactive: func() bool { return true },
+			}
+			if code := a.run([]string{tc.typo}); code != exitValidation {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "Did you mean the command: "+tc.want+"?") {
+				t.Fatalf("should name the nearest command, got: %s", stderr.String())
+			}
+			// The recovery routes are named whether or not a suggestion was found.
+			if !strings.Contains(stderr.String(), "`bmcp list` for the current tool catalog") {
+				t.Fatalf("should name the recovery routes, got: %s", stderr.String())
+			}
+			if m.listCalls != 0 {
+				t.Fatalf("a typo made %d tools/list calls", m.listCalls)
+			}
+			// stderr, not stdout: cmdInit writes its prompts to stderr, so the same
+			// assertion against stdout could never have fired.
+			if strings.Contains(stderr.String(), "BORIS MCP URL") {
+				t.Fatalf("a typo must not start first-run setup, got: %s", stderr.String())
+			}
+		})
+	}
+}
+
+// The safety property behind the short-circuit above. Command names are short, so
+// a real tool name can land within an edit of one; when it does, the catalog wins
+// and the call goes through.
+//
+// The fixture is asserted to be a near miss rather than described as one. It was
+// `sync_status` first, which is seven edits from `sync` — so nearestCommand
+// returned "", the guard never fired, and the test proved nothing while its
+// comment claimed it pinned the mechanism. A fixture precondition is the only
+// thing that stops that recurring.
+func TestToolNamedLikeACommandStillReachesTheServer(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{
+		Name:        "tools___syncs",
+		Description: "One edit from the sync command.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"q":{"type":"string"}}}`),
+	}})
+	if near := nearestCommand("syncs"); near != "sync" {
+		t.Fatalf("fixture must be a near miss for a command, got nearestCommand(%q) = %q", "syncs", near)
+	}
+	m := &fakeMCP{
+		tools:      []tool{{Name: "tools___syncs"}},
+		callResult: []byte(`{"content":[{"type":"text","text":"{\"ok\":true}"}]}`),
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: m, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"--non-interactive", "syncs", "--q", "x"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `{"ok":true}`) {
+		t.Fatalf("the tool should have been called, got stdout %q stderr %q", stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Did you mean the command") {
+		t.Fatalf("a real tool must not be corrected to a command: %s", stderr.String())
+	}
+}
+
+// The bar for answering locally: a stale catalog must not be allowed to refuse a
+// name, because the server grows tools and a new one whose name reads like a typo
+// would otherwise be refused locally and never synced for. Here the cache is past
+// its TTL and does not list the tool, and the sync that follows finds it.
+func TestStaleCatalogSyncsRatherThanCorrectingARealTool(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___already_known"}})
+	if near := nearestCommand("syncs"); near != "sync" {
+		t.Fatalf("fixture must be a near miss for a command, got %q", near)
+	}
+	m := &fakeMCP{
+		tools:      []tool{{Name: "tools___already_known"}, {Name: "tools___syncs"}},
+		callResult: []byte(`{"content":[{"type":"text","text":"{\"ok\":true}"}]}`),
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		// Past the TTL, so the cache on disk is not what a tool call would use.
+		now:        func() time.Time { return time.Now().Add(defaultTTL + time.Hour) },
+		httpClient: m, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"--non-interactive", "syncs"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `{"ok":true}`) {
+		t.Fatalf("a tool absent from a stale cache must still be reachable, got stdout %q stderr %q", stdout.String(), stderr.String())
+	}
+}
+
+// The remaining cost of the guard, stated so a future change cannot widen it
+// quietly: with no config there is nothing to sync with, so a real tool that reads
+// like a typo is refused from the spelling alone. That is the deliberate trade —
+// a typo must not open the first-run prompt — and the message names the way out.
+func TestToolNamedLikeACommandIsRefusedWithoutConfig(t *testing.T) {
+	t.Setenv("BMCP_HOME", filepath.Join(t.TempDir(), "absent"))
+	m := &fakeMCP{tools: []tool{{Name: "tools___syncs"}}}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: m, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"--non-interactive", "syncs"}); code != exitValidation {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if m.listCalls != 0 {
+		t.Fatalf("made %d tools/list calls; the point is that it does not sync", m.listCalls)
+	}
+	if !strings.Contains(stderr.String(), "`bmcp list` for the current tool catalog") {
+		t.Fatalf("should name the way out, got: %s", stderr.String())
+	}
+}
+
+// Both near misses at once, which is the shape the separate labels exist for and
+// which no other test produces — TestMistypedCommandIsCorrectedFromLocalStateAlone
+// runs with no catalog, so it only ever sees the command half.
+func TestMistypedCommandNamesBothNearMisses(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___docto"}})
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: &fakeMCP{},
+		credentials: func(context.Context, effectiveConfig) (aws.Credentials, string, error) {
+			t.Fatal("a typo must not load credentials")
+			return aws.Credentials{}, "", nil
+		},
+	}
+	if code := a.run([]string{"--non-interactive", "doctr"}); code != exitValidation {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	for _, want := range []string{
+		"Did you mean the tool: docto?",
+		"Did you mean the command: bmcp doctor?",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("should report %q, got: %s", want, stderr.String())
+		}
+	}
+}
+
+// The recovery line is unconditional. A token close to nothing gets no suggestion,
+// and that is exactly the caller with the least idea what to do next — it used to
+// be the only one told nothing at all.
+func TestUnknownNameWithNoSuggestionStillNamesARecovery(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws_memory"}})
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: &fakeMCP{tools: []tool{{Name: "tools___search_aws_memory"}}},
+		credentials: staticCreds(),
+	}
+	if code := a.run([]string{"--non-interactive", "describe", "totally_unrelated"}); code != exitValidation {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Did you mean") {
+		t.Fatalf("fixture must be far from everything for this test to mean anything: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "`bmcp list` for the current tool catalog") {
+		t.Fatalf("an unknown name with no suggestion should still name a next step, got: %s", stderr.String())
+	}
+}
+
+// unknown_command is a new failure name, and machine consumers read the envelope
+// rather than the prose. The multi-line message has to survive as one JSON string
+// rather than breaking the document into unparseable lines.
+func TestUnknownCommandJSONErrorIsParseableOnStderr(t *testing.T) {
+	t.Setenv("BMCP_HOME", filepath.Join(t.TempDir(), "absent"))
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now, httpClient: &fakeMCP{}}
+	if code := a.run([]string{"--json", "doctr"}); code != exitValidation {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Fatalf("an error must not write to stdout, got %q", stdout.String())
+	}
+	var env struct {
+		OK      bool   `json:"ok"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stderr.String())), &env); err != nil {
+		t.Fatalf("stderr should be one parseable document: %v (got %q)", err, stderr.String())
+	}
+	if env.OK || env.Error != "unknown_command" {
+		t.Fatalf("unexpected envelope: %+v", env)
+	}
+	if !strings.Contains(env.Message, "Did you mean the command: bmcp doctor?") {
+		t.Fatalf("the suggestion should survive into the JSON message, got %q", env.Message)
+	}
+}
+
+// The suggestion rules, which nothing else pins. Flat edit distance failed in both
+// directions: short command names swallowed unrelated tokens, and truncations —
+// the most natural way to get a command name wrong — lost to them.
+func TestNearestCommandRules(t *testing.T) {
+	for _, tc := range []struct{ typed, want string }{
+		// Truncations resolve by prefix, however many edits away they are.
+		{"doc", "doctor"},
+		{"desc", "describe"},
+		{"ver", "version"},
+		{"inst", "install"},
+		{"tool", "list"}, // through the `tools` alias
+		// Ordinary misspellings resolve by distance.
+		{"doctr", "doctor"},
+		{"lst", "list"},
+		{"instal", "install"},
+		{"describ", "describe"},
+		{"upgrade", "update"},
+		{"uninstall", "install"},
+		// Transpositions. Two adjacent characters swapped is one of the commonest
+		// ways to mistype a word, and it costs two plain Levenshtein edits — so
+		// under the tight limit short command names need, every one of these fell
+		// through to the first-run prompt that #38 is about. editDistance counts a
+		// swap as one.
+		{"lsit", "list"},
+		{"snyc", "sync"},
+		{"inti", "init"},
+		{"clal", "call"},
+		{"doctro", "doctor"},
+		// Plausible tool names must NOT be captured: every one of these is within
+		// three edits of a four-letter command, and `init` and `sync` both have
+		// side effects, so a confident wrong answer is worse than none.
+		{"cost", ""},
+		{"logs", ""},
+		{"info", ""},
+		{"cells", ""},
+		{"hosts", ""},
+		{"index", ""},
+		{"sync_x", ""},
+		{"run", ""},
+		{"aws", ""},
+	} {
+		t.Run(tc.typed, func(t *testing.T) {
+			if got := nearestCommand(tc.typed); got != tc.want {
+				t.Fatalf("nearestCommand(%q) = %q, want %q", tc.typed, got, tc.want)
+			}
+		})
+	}
+}
+
+// The shared threshold, untouched by the command rules above: it still serves
+// --flag and tool-name suggestions, where the candidates are long enough for three
+// edits to be a good bet. The refactor rewrote `dist <= 3` on a sentinel of 99 as a
+// sentinel of 4 with `d < dist`, and nothing would have caught a one-off shift.
+func TestNearestSuggestionThreshold(t *testing.T) {
+	for _, tc := range []struct{ typed, want string }{
+		{"doctor", "doctor"}, // 0
+		{"doctr", "doctor"},  // 1
+		{"docr", "doctor"},   // 2
+		{"dor", "doctor"},    // 3 — the last distance that still suggests
+		{"do", ""},           // 4 — one too far
+	} {
+		t.Run(tc.typed, func(t *testing.T) {
+			if got := nearest(tc.typed, []string{"doctor"}); got != tc.want {
+				t.Fatalf("nearest(%q) = %q, want %q (distance %d)", tc.typed, got, tc.want, editDistance(tc.typed, "doctor"))
+			}
+		})
+	}
+}
+
+// The determinism nearestToolName's comment claims. Two names equally distant from
+// the input must resolve the same way regardless of the order the catalog lists
+// them in, or `bmcp describe` prints a different suggestion after every sync.
+func TestNearestToolNameDoesNotDependOnCatalogOrder(t *testing.T) {
+	forward := &toolCache{Tools: []tool{{Name: "tools___aaa"}, {Name: "tools___bbb"}}}
+	reversed := &toolCache{Tools: []tool{{Name: "tools___bbb"}, {Name: "tools___aaa"}}}
+	if editDistance("ccc", "aaa") != editDistance("ccc", "bbb") {
+		t.Fatalf("fixture must be a tie for the test to mean anything")
+	}
+	if got, want := nearestToolName(forward, "ccc"), nearestToolName(reversed, "ccc"); got != want {
+		t.Fatalf("catalog order changed the suggestion: %q vs %q", got, want)
+	}
+	if got := nearestToolName(forward, "ccc"); got != "aaa" {
+		t.Fatalf("a tie should resolve to the alphabetically first name, got %q", got)
+	}
+}
+
+// The claim in flags.go that a tool's own `version` argument is unaffected. The
+// global scope stops at the first non-flag token, so `--version` after a tool name
+// belongs to tool.ParseFlags; if it ever leaked back the call would turn into
+// `bmcp version` and the tool would silently never run.
+func TestToolVersionArgumentIsNotStolenByTheGlobalFlag(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{
+		Name:        "tools___deploy",
+		Description: "Has its own version argument.",
+		InputSchema: json.RawMessage(`{"type":"object","required":["version"],"properties":{"version":{"type":"string"}}}`),
+	}})
+	for _, args := range [][]string{
+		{"--non-interactive", "deploy", "--version", "1.2.3"},
+		{"--non-interactive", "deploy", "--version=1.2.3"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			m := &fakeMCP{
+				tools:      []tool{{Name: "tools___deploy"}},
+				callResult: []byte(`{"content":[{"type":"text","text":"{\"deployed\":true}"}]}`),
+			}
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+				now: time.Now, httpClient: m, credentials: staticCreds(),
+			}
+			if code := a.run(args); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), `{"deployed":true}`) {
+				t.Fatalf("the tool should have run, got stdout %q stderr %q", stdout.String(), stderr.String())
+			}
+			if strings.HasPrefix(stdout.String(), "bmcp ") {
+				t.Fatalf("the global --version stole the tool's argument: %q", stdout.String())
+			}
+		})
+	}
+}
+
+// `tools` was the most common wrong first token in the audit. An alias answers it
+// in one invocation; a suggestion would still have cost the failed one.
+func TestToolsIsAnAliasForList(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	if code := a.run([]string{"--non-interactive", "tools"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	var record toolRecord
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout.String())), &record); err != nil {
+		t.Fatalf("`bmcp tools` should emit the list records: %v (stdout %q)", err, stdout.String())
+	}
+	if record.DisplayName != "search_aws" {
+		t.Fatalf("unexpected record: %#v", record)
+	}
+}
+
+// resolveTool used to report only that a name was unknown, leaving the caller to
+// re-derive the catalog the lookup had just searched.
+func TestUnknownToolNamesTheNearestTool(t *testing.T) {
+	cache := &toolCache{Tools: []tool{
+		{Name: "tools___search_aws_memory"},
+		{Name: "tools___list_aws_resources"},
+	}}
+	_, err := resolveTool(cache, "search_aws_memry")
+	if err == nil || !strings.Contains(err.Error(), "Did you mean the tool: search_aws_memory?") {
+		t.Fatalf("expected a nearest-tool suggestion, got: %v", err)
+	}
+	// Nothing close enough is left unsuggested rather than answered with the least
+	// bad match in the catalog.
+	// The full namespaced spelling is matched too. It is what a copy out of the
+	// catalog gives, and the `tools___` prefix alone puts it past the threshold if
+	// only display names are compared — so a typo in it used to get no suggestion.
+	// The answer is still the short spelling, which also resolves.
+	if _, err := resolveTool(cache, "tools___search_aws_memry"); err == nil ||
+		!strings.Contains(err.Error(), "Did you mean the tool: search_aws_memory?") {
+		t.Fatalf("a typo in the full name should still be suggestable, got: %v", err)
+	}
+	_, err = resolveTool(cache, "totally_different_name")
+	if err == nil || !strings.Contains(err.Error(), "Unknown command or tool") {
+		t.Fatalf("expected an unknown-tool error, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "Did you mean") {
+		t.Fatalf("a distant name should get no suggestion, got: %v", err)
+	}
+	// A nil cache is the no-catalog case, and must not panic reaching for one.
+	if _, err := resolveTool(nil, "anything"); err == nil {
+		t.Fatalf("expected an error for a nil cache")
+	}
+}
+
 func TestSchemaDiff(t *testing.T) {
 	oldTool := tool{
 		Name:        "deploy_service",

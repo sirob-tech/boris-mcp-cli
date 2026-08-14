@@ -26,9 +26,18 @@ type globalFlags struct {
 	// before dispatch sees the name. The alias serves `bmcp -- --help`, which the
 	// flag cannot, since `--` stops flag interpretation. See the commands table.
 	help bool
+	// version is a flag as well as a command, for the same reason help is one: it
+	// is the spelling reached for first. Rejecting `--version` and `-V` cost a
+	// failed invocation before `bmcp version` was found, and the failure looked
+	// like a broken CLI rather than a wrong spelling.
+	//
+	// -V, not -v: -v is unbound here, but it conventionally means verbose, and
+	// this CLI already has --verbose for that.
+	version bool
 	// updateTo is `--to`, not `--version`: `version` is already a command, and a
-	// `--version` flag next to a `version` command is the same trap this file
-	// already sprang once with help.
+	// `--version` flag that meant "update target" next to a `--version` flag that
+	// means "print the version" is the same trap this file already sprang once
+	// with help.
 	updateTo string
 }
 
@@ -109,6 +118,18 @@ func parseFlags(flags globalFlags, args []string, scope flagScope) (globalFlags,
 		// answers it with that tool's schema instead of this usage text.
 		case arg == "--help" || arg == "-h":
 			flags.help = true
+		// Global scope only, unlike --help. After a command name it would have to
+		// either report the version and abandon the command — `bmcp update --to X
+		// --version` reporting success while updating nothing — or be ignored. Both
+		// are worse than the flag error it already was, and rejecting it is also
+		// what `git status --version` and `docker ps --version` do. `install` is
+		// rawArgs and rejects it too, so the answer stays consistent.
+		//
+		// A tool's own --version argument is unaffected: the global scope stops at
+		// the first non-flag token, so `bmcp <tool> --version x` is parsed by
+		// tool.ParseFlags and never reaches here.
+		case (arg == "--version" || arg == "-V") && scope == scopeGlobal:
+			flags.version = true
 		case arg == "--json":
 			flags.jsonOut = true
 		case arg == "--pretty":
