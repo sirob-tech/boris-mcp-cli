@@ -164,8 +164,10 @@ bmcp update --to v0.4.0  # move to an exact version, downgrading if needed
 bmcp update --rollback   # restore the binary the last update replaced
 ```
 
-`bmcp doctor` reports the version state on its own line, and never fails
-because of it — a GitHub outage is not a BORIS outage.
+`bmcp doctor` reports the version state on its own line, and a failed update
+check never changes its exit code — a GitHub outage is not a BORIS outage. The
+one exception is an update that left no working binary at the install path:
+doctor reports that as a failing check, because exiting 0 on it would be a lie.
 
 ### Turning auto-update off
 
@@ -387,15 +389,30 @@ always safe.
 
 ### `bmcp doctor --json` output
 
-`doctor --json` writes one JSON document to stdout and nothing else, so it can
-be piped straight into a parser:
+`doctor --json` writes its report as one JSON document to stdout, so it can be
+piped straight into a parser:
 
 ```bash
 bmcp doctor --json | jq '.checks[] | select(.ok == false)'
 ```
 
 Progress prose such as `Syncing tools...` goes to stderr, following the same
-split as `bmcp list`. The document carries `ok`, a `checks` array, and an
-`update` object when an update check ran. `ok` is false when any check failed,
-which is also when the command exits 1 — a failed *update* check is reported
-inside `update` and never changes the exit code.
+split as `bmcp list`.
+
+The document carries `ok` and a `checks` array, plus an `update` object whenever
+the pre-command update inspection ran — which is not the same as a network check
+having happened. Read `update.checked` for that, and `update.kind`, which is
+`source` for a build that cannot self-update at all.
+
+Two things worth knowing when consuming it:
+
+- **Check the exit code, not just stdout.** A failure *before* doctor produces a
+  report — an unparseable flag, a bad `--output`, an extra argument — writes
+  `{"ok":false,"error":…}` to stderr and leaves stdout empty, as every other
+  command does. The pipeline above then prints nothing and `jq` exits 0, which
+  reads as "no failing checks" from a command that never ran one. Use `set -o
+  pipefail`, or test bmcp's own exit code first.
+- **`ok` is false exactly when the command exits 1.** A failed update *check*
+  stays outside `checks` and never gets there: a GitHub outage is not a BORIS
+  outage. The single exception is an update that left no working binary at the
+  install path — that appears in `checks` as `update` and does fail doctor.

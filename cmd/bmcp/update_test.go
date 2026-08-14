@@ -942,7 +942,10 @@ func TestDoctorJSONCarriesTheUpdateObject(t *testing.T) {
 	if !strings.Contains(stderr.String(), "Syncing tools") {
 		t.Fatalf("expected progress prose on stderr, got: %s", stderr.String())
 	}
-	if strings.Contains(stderr.String(), `"ok"`) {
+	// Matched on "checks" rather than "ok": fail() legitimately writes an
+	// {"ok":false,...} envelope to stderr under --json, so "ok" would fire on the
+	// error path this very commit defines, with a misleading message.
+	if strings.Contains(stderr.String(), `"checks"`) {
 		t.Fatalf("the JSON document must not also reach stderr: %s", stderr.String())
 	}
 }
