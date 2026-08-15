@@ -152,10 +152,10 @@ func (a *app) promptInstallDetectedHarnesses(reader *bufio.Reader, flags globalF
 		}
 		result, err := a.installHarnessWithCatalog(flags, h.name, "user")
 		if err != nil {
-			fmt.Fprintf(a.stderr, "Could not install %s instructions: %s\n", h.displayName, err)
+			fmt.Fprintf(a.prose(), "Could not install %s instructions: %s\n", h.displayName, err)
 			continue
 		}
-		printInstallResult(a.stderr, result)
+		printInstallResult(a.prose(), result)
 	}
 }
 
@@ -785,19 +785,31 @@ Before the first BORIS call in a session, run:
 bmcp doctor
 ` + "```" + `
 
-This is a local check: while the cached tool catalog is fresh it authenticates nothing and contacts no server, so it is cheap enough to run every session. If it fails on config, tell the user to run ` + "`bmcp init`" + `.
+This is a local check: while the cached tool catalog is fresh it authenticates nothing and reaches no BORIS server, so it is cheap enough to run every session. (It may still contact GitHub for its own update check, at most once a day.) If it fails on config, tell the user to run ` + "`bmcp init`" + `.
 
 If a tool call later fails on authentication or connectivity, run ` + "`bmcp doctor --deep`" + `, which checks credentials, the server and the live catalog for real, and says which of them is at fault. The BORIS MCP server requires AWS credentials for any account in the AWS Organization; if auth is unavailable, use the normal environment credential workflow available in this harness or explain the credential requirement to the user.
 
 Useful commands:
 
-- ` + "`bmcp list`" + `: list remote tools as NDJSON, one object per line: ` + "`name`" + ` (full name, always callable), ` + "`display_name`" + `, ` + "`description`" + `, ` + "`last_sync`" + `. Call tools by ` + "`name`" + `. Truncating with ` + "`head`" + ` never breaks a line but does hide tools — the total count is on stderr. Add ` + "`--output human`" + ` for indented text.
+- ` + "`bmcp list`" + `: list remote tools as NDJSON, one object per line: ` + "`name`" + ` (full name, always callable), ` + "`display_name`" + `, ` + "`description`" + `, ` + "`last_sync`" + `. Call tools by ` + "`name`" + `. Truncating with ` + "`head`" + ` never breaks a line but does hide tools — use ` + "`bmcp list --format json`" + `, whose document carries ` + "`count`" + `, when completeness matters. Add ` + "`--format human`" + ` for indented text.
 - ` + "`bmcp list --schemas`" + `: the same records with each tool's ` + "`input_schema`" + ` included. Prefer this when you intend to call a tool: it answers "which tools exist" and "how do I call them" in one local invocation, with no per-tool ` + "`describe`" + ` round trip.
 - ` + "`bmcp describe <tool>`" + `: show one tool's schema and examples as indented text.
 - ` + "`bmcp <tool> --arg value`" + `: call a tool with CLI flags.
 - ` + "`bmcp call <tool> '{\"arg\":\"value\"}'`" + `: call a tool with JSON.
-- ` + "`bmcp --pretty <tool> ...`" + `: pretty-print JSON output when the tool returns JSON.
+- ` + "`bmcp --pretty <tool> ...`" + `: pretty-print JSON output when the tool returns JSON. Not needed under ` + "`--format json`" + `.
 - ` + "`bmcp --raw <tool> ...`" + `: show the original MCP tool envelope for debugging.
+
+Output format: pass ` + "`--format human|json|ndjson`" + ` to any command to get the machine-output contract. Prefer ` + "`--format json`" + ` (or ` + "`--format ndjson`" + ` for ` + "`bmcp list`" + `) for anything you intend to parse. Without it each command keeps its older output, which is not a contract — ` + "`--output`" + ` and ` + "`--json`" + ` are the legacy flags and are deprecated.
+
+**Put ` + "`--format`" + ` and ` + "`--max-bytes`" + ` before the tool name**, as in ` + "`bmcp --format json <tool> --arg value`" + `. Everything after the tool name is parsed as that tool's own arguments, so a trailing ` + "`--format json`" + ` is rejected as an unknown tool argument — and on a tool that declares no arguments it is not rejected but **sent to the server as an argument named ` + "`format`" + `**. The same applies to ` + "`bmcp install`" + ` and ` + "`bmcp version`" + `, which take their arguments verbatim.
+
+Under ` + "`--format json`" + ` or ` + "`--format ndjson`" + ` the rules are the same for every command, so no output plumbing is needed:
+
+- stdout carries one JSON document and nothing else. ` + "`bmcp list --format ndjson`" + ` is the exception by design: one object per line, and empty stdout for an empty catalog. Progress prose is not written at all, so ` + "`2>&1`" + ` is safe. Merging is also the only way to capture both outcomes in one variable, because the failure document is on stderr.
+- A failure writes ` + "`{\"ok\":false,\"command\":…,\"error\":…,\"message\":…,\"exit_code\":…}`" + ` to stderr as a single line, whichever format was selected, and leaves stdout empty. Read ` + "`ok`" + ` to tell the two apart, and ` + "`exit_code`" + ` if a pipeline swallowed the real exit status.
+- Two exceptions to that failure rule. ` + "`bmcp doctor`" + ` reports failing checks in its ordinary report on stdout with ` + "`\"ok\": false`" + ` and exits 1 — it is a diagnostic, so a failing check is its answer rather than an error. And ` + "`--help`" + ` prints human text in every format; do not parse it. Adding ` + "`--verbose`" + ` also puts progress prose back on stderr, so do not combine it with ` + "`2>&1`" + `.
+- A tool call answers with ` + "`{\"ok\":true,\"tool\":…,\"result\":…,\"result_bytes\":…,\"truncated\":…}`" + `. A non-JSON payload arrives in ` + "`result_text`" + ` instead of ` + "`result`" + `.
+- ` + "`bmcp --max-bytes <n> <tool> ...`" + ` caps a large result: the document stays parseable, sets ` + "`truncated`" + `, reports the full ` + "`result_bytes`" + `, and puts the kept prefix in ` + "`result_excerpt`" + `. Prefer it to piping through ` + "`head`" + `, which cuts the payload without saying so.
 
 Tools available when these instructions were generated (short display names; ` + "`bmcp list`" + ` prints the full ` + "`name`" + ` for each):
 

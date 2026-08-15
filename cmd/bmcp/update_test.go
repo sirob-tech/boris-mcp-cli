@@ -941,13 +941,11 @@ func TestDoctorJSONCarriesTheUpdateObject(t *testing.T) {
 	// The Unmarshal above is itself the guarantee that no prose shares the machine
 	// channel: json.Unmarshal rejects trailing non-whitespace, so a human row
 	// printed alongside the document would fail the parse. What remains to pin is
-	// the split — prose on stderr, and the document *only* on stdout.
+	// the split — prose on stderr, and the document *only* on stdout. --json
+	// selects no contract, so that split is the one it has always had.
 	if !strings.Contains(stderr.String(), "Syncing tools") {
 		t.Fatalf("expected progress prose on stderr, got: %s", stderr.String())
 	}
-	// Matched on "checks" rather than "ok": fail() legitimately writes an
-	// {"ok":false,...} envelope to stderr under --json, so "ok" would fire on the
-	// error path this very commit defines, with a misleading message.
 	if strings.Contains(stderr.String(), `"checks"`) {
 		t.Fatalf("the JSON document must not also reach stderr: %s", stderr.String())
 	}
@@ -1143,6 +1141,168 @@ func TestUpdateCommandAcceptsItsOwnFlagsThroughArgv(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(path); string(got) != "old binary" {
 		t.Fatalf("--check must change nothing, got %q", got)
+	}
+}
+
+// Every `bmcp update` path that exits 0 answers with a document in a machine
+// format. Only --check was converted when the contract landed; the other four
+// wrote prose into io.Discard and exited 0 with both streams empty, which left a
+// caller unable to tell "updated" from "already current" from "rolled back".
+func TestUpdateAnswersEveryOutcomeInAMachineFormat(t *testing.T) {
+	// `to` is the version fakeGitHub offers as latest. Naming it per case is what
+	// puts the machine ahead of, level with, or behind the published release.
+	for _, tc := range []struct {
+		name        string
+		latest      string
+		args        []string
+		wantOutcome string
+		wantApplied bool
+	}{
+		{name: "checked", latest: "v0.6.0", args: []string{"update", "--check"}, wantOutcome: updateOutcomeChecked},
+		{name: "current", latest: "v0.5.0", args: []string{"update"}, wantOutcome: updateOutcomeCurrent},
+		{name: "ahead", latest: "v0.4.0", args: []string{"update"}, wantOutcome: updateOutcomeAhead},
+		{name: "applied", latest: "v0.6.0", args: []string{"update"}, wantOutcome: updateOutcomeApplied, wantApplied: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			asReleaseBuild(t, "0.5.0")
+			t.Setenv("BMCP_HOME", configuredHome(t))
+			t.Setenv("HOME", t.TempDir())
+			path := stagedBinary(t, "old binary")
+			gh := &fakeGitHub{latestTag: tc.latest}
+			if tc.wantApplied {
+				// Only the applied case needs a downloadable release; the others
+				// terminate before any asset is fetched.
+				assets := map[string][]byte{"bmcp-" + hostAsset(): releaseArchive(t, []byte("new binary"))}
+				assets["checksums.txt"] = checksumsFor(assets)
+				gh.assets = assets
+			}
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+				now: time.Now, httpClient: &fakeMCP{github: gh}, credentials: staticCreds(),
+				lookPath:        func(string) (string, error) { return "", os.ErrNotExist },
+				executable:      func() (string, error) { return path, nil },
+				verifySignature: func(string) error { return nil },
+			}
+			if code := a.run(append([]string{"--format", "json"}, tc.args...)); code != 0 {
+				t.Fatalf("exit %d, stderr: %s", code, stderr.String())
+			}
+			var doc struct {
+				OK      bool           `json:"ok"`
+				Command string         `json:"command"`
+				Outcome string         `json:"outcome"`
+				From    string         `json:"from"`
+				To      string         `json:"to"`
+				Update  map[string]any `json:"update"`
+			}
+			if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+				t.Fatalf("stdout is not a single JSON document: %v\n%q", err, stdout.String())
+			}
+			if !doc.OK || doc.Command != "update" || doc.Outcome != tc.wantOutcome {
+				t.Fatalf("unexpected document: %s", stdout.String())
+			}
+			// The update state is nested, not merged. Merged, its always-present
+			// `error` key sat at top level beside the `error` the failure document
+			// uses for the error name, so `"error" in doc` answered wrongly.
+			if doc.Update == nil {
+				t.Fatalf("expected the update state under `update`: %s", stdout.String())
+			}
+			var top map[string]any
+			if err := json.Unmarshal(stdout.Bytes(), &top); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if _, collides := top["error"]; collides {
+				t.Fatalf("a success document must not carry the failure document's `error` key: %s", stdout.String())
+			}
+			if tc.wantApplied && (doc.From != "0.5.0" || doc.To != "0.6.0") {
+				t.Fatalf("an applied update should say what it moved between, got %q -> %q", doc.From, doc.To)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("a machine format must leave stderr empty, got: %s", stderr.String())
+			}
+		})
+	}
+}
+
+// `update --check --json` keeps the stream it has always used. Moving a report
+// from stderr to stdout is invisible to a caller that redirects one and not the
+// other, which is the worst kind of break on a binary that self-updates.
+func TestUpdateCheckJSONKeepsItsLegacyStreamAndShape(t *testing.T) {
+	asReleaseBuild(t, "0.5.0")
+	t.Setenv("BMCP_HOME", configuredHome(t))
+	t.Setenv("HOME", t.TempDir())
+	path := stagedBinary(t, "old binary")
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: &fakeMCP{github: &fakeGitHub{latestTag: "v0.6.0"}}, credentials: staticCreds(),
+		lookPath:   func(string) (string, error) { return "", os.ErrNotExist },
+		executable: func() (string, error) { return path, nil },
+	}
+	if code := a.run([]string{"update", "--check", "--json"}); code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("the legacy report belongs on stderr, got stdout: %q", stdout.String())
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(stderr.Bytes(), &doc); err != nil {
+		t.Fatalf("stderr is not the update state: %v\n%s", err, stderr.String())
+	}
+	// The bare state, not the contract's enveloped document.
+	if doc["current"] != "0.5.0" || doc["target"] != "0.6.0" {
+		t.Fatalf("unexpected update state: %v", doc)
+	}
+	for _, key := range []string{"ok", "command", "outcome", "update"} {
+		if _, present := doc[key]; present {
+			t.Fatalf("the legacy report must not gain %q: %v", key, doc)
+		}
+	}
+}
+
+func TestUpdateRollbackAnswersInAMachineFormat(t *testing.T) {
+	asReleaseBuild(t, "0.5.0")
+	t.Setenv("BMCP_HOME", configuredHome(t))
+	t.Setenv("HOME", t.TempDir())
+	path := stagedBinary(t, "current")
+	if err := os.WriteFile(priorBinaryPath(path), []byte("previous"), 0o755); err != nil {
+		t.Fatalf("write backup: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: &fakeMCP{}, credentials: staticCreds(),
+		lookPath:   func(string) (string, error) { return "", os.ErrNotExist },
+		executable: func() (string, error) { return path, nil },
+	}
+	if code := a.run([]string{"--format", "json", "update", "--rollback"}); code != 0 {
+		t.Fatalf("exit %d, stderr: %s", code, stderr.String())
+	}
+	var doc struct {
+		OK      bool   `json:"ok"`
+		Command string `json:"command"`
+		Outcome string `json:"outcome"`
+		From    string `json:"from"`
+		Path    string `json:"path"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("stdout is not a single JSON document: %v\n%q", err, stdout.String())
+	}
+	if !doc.OK || doc.Command != "update" || doc.Outcome != updateOutcomeRolledBack {
+		t.Fatalf("unexpected document: %s", stdout.String())
+	}
+	// Resolved, because resolveExecutable resolves symlinks and macOS temp dirs
+	// live under a /var -> /private/var link — the document reports the path the
+	// swap actually happened at, which is the useful one.
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	if doc.From != "0.5.0" || doc.Path != resolved {
+		t.Fatalf("a rollback should say what it replaced and where: %s", stdout.String())
+	}
+	if got, _ := os.ReadFile(path); string(got) != "previous" {
+		t.Fatalf("the rollback must still happen, got %q", got)
 	}
 }
 

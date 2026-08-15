@@ -84,7 +84,7 @@ func (a *app) resolveAutoUpdate(flags globalFlags, fileValue string) bool {
 			// warning three times reads as three distinct problems.
 			if !a.warnedAutoUpdate {
 				a.warnedAutoUpdate = true
-				fmt.Fprintf(a.stderr, "Ignoring %s: %q is not a boolean (use true or false)\n", source, raw)
+				fmt.Fprintf(a.prose(), "Ignoring %s: %q is not a boolean (use true or false)\n", source, raw)
 			}
 			return
 		}
@@ -143,7 +143,11 @@ func (a *app) requireConfig(flags globalFlags) (effectiveConfig, bool, error) {
 		return cfg, exists, err
 	}
 	if !exists {
-		if a.isInteractive() && !cfg.NonInteractive {
+		// A machine format is never interactive, for the reason cmdInit gives — but
+		// the consequence here is sharper. cmdInit reports its own failures, so on an
+		// unconfigured machine this path emitted cmdInit's error document and then
+		// the caller's, and a machine invocation answers with exactly one.
+		if a.isInteractive() && !cfg.NonInteractive && !flags.machine() {
 			if code := a.cmdInit(flags, nil); code != 0 {
 				return cfg, false, errors.New("first-run setup failed")
 			}

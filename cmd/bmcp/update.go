@@ -736,9 +736,7 @@ func (a *app) applyUpdate(ctx context.Context, flags globalFlags, st *updateStat
 			_ = os.Remove(staged)
 			return fmt.Errorf("refusing to install an unverified binary: %w", err)
 		}
-		if !flags.jsonOut {
-			fmt.Fprintf(a.stderr, "Warning: could not verify the signature of the new bmcp: %v\n", err)
-		}
+		a.warnUpdate(flags, "Warning: could not verify the signature of the new bmcp: %v", err)
 	}
 	if err := selfupdate.CommitBinary(opts); err != nil {
 		if rollbackErr := selfupdate.RollbackError(err); rollbackErr != nil {
@@ -747,8 +745,8 @@ func (a *app) applyUpdate(ctx context.Context, flags globalFlags, st *updateStat
 		}
 		return fmt.Errorf("could not install the new binary: %w", err)
 	}
-	if err := recordUpdate(st.Path, st.Current, target, a.now()); err != nil && !flags.jsonOut {
-		fmt.Fprintf(a.stderr, "Warning: updated, but could not record the update: %v\n", err)
+	if err := recordUpdate(st.Path, st.Current, target, a.now()); err != nil {
+		a.warnUpdate(flags, "Warning: updated, but could not record the update: %v", err)
 	}
 	return nil
 }
@@ -945,10 +943,8 @@ func (a *app) maybeAutoUpdate(flags globalFlags) {
 
 	if receipt, err := readInstallReceipt(st.Path); err == nil && receipt.Blocked != "" &&
 		normalizeVersion(receipt.Blocked) == st.Target {
-		if !flags.jsonOut {
-			fmt.Fprintf(a.stderr, "bmcp %s is available but was rolled back on this machine, so it will not be installed automatically.\nRun `bmcp update --to %s` to install it anyway.\n",
-				st.Target, taggedVersion(st.Target))
-		}
+		a.warnUpdate(flags, "bmcp %s is available but was rolled back on this machine, so it will not be installed automatically.\nRun `bmcp update --to %s` to install it anyway.",
+			st.Target, taggedVersion(st.Target))
 		return
 	}
 
@@ -957,24 +953,20 @@ func (a *app) maybeAutoUpdate(flags globalFlags) {
 	if err := a.applyUpdate(applyCtx, flags, st, st.Target); err != nil {
 		st.Err = err
 		st.Stage = updateStageApply
-		if !flags.jsonOut {
-			fmt.Fprintf(a.stderr, "Could not update bmcp automatically: %v\n", err)
-		}
+		a.warnUpdate(flags, "Could not update bmcp automatically: %v", err)
 		return
 	}
 	st.Applied = true
-	if !flags.jsonOut {
-		// No re-exec: this process finishes on the code it already loaded, so
-		// the new version takes effect on the next invocation.
-		fmt.Fprintf(a.stderr, "Updated bmcp %s -> %s (this run still uses %s)\n", st.Current, st.Target, st.Current)
-	}
+	// No re-exec: this process finishes on the code it already loaded, so the
+	// new version takes effect on the next invocation.
+	a.warnUpdate(flags, "Updated bmcp %s -> %s (this run still uses %s)", st.Current, st.Target, st.Current)
 }
 
 func (a *app) nudge(flags globalFlags, st *updateState) {
-	if flags.jsonOut || !st.Available || st.Action == "" {
+	if !st.Available || st.Action == "" || flags.legacyJSON() {
 		return
 	}
-	fmt.Fprintf(a.stderr, "bmcp %s is available (running %s). Run: %s\n", st.Target, st.Current, st.Action)
+	fmt.Fprintf(a.prose(), "bmcp %s is available (running %s). Run: %s\n", st.Target, st.Current, st.Action)
 }
 
 func (a *app) cmdUpdate(flags globalFlags, args []string) int {
@@ -1042,27 +1034,41 @@ func (a *app) cmdUpdate(flags globalFlags, args []string) int {
 
 	if flags.updateCheck {
 		switch {
-		case flags.jsonOut:
+		case a.machine:
+			return a.reportUpdate(flags, updateDoc{Outcome: updateOutcomeChecked, Update: st.updateJSON()})
+		case flags.legacyJSON():
+			// The legacy shape and the legacy stream: the bare update state, indented,
+			// on stderr. Moving it to stdout would be invisible to a caller redirecting
+			// one stream and not the other, which is the worst kind of break.
 			out, _ := json.MarshalIndent(st.updateJSON(), "", "  ")
 			fmt.Fprintln(a.stderr, string(out))
+			return 0
+		}
+		switch {
 		case behind:
-			fmt.Fprintf(a.stderr, "bmcp %s is newer than the latest release (%s); nothing to update to\n", st.Current, st.Target)
+			fmt.Fprintf(a.prose(), "bmcp %s is newer than the latest release (%s); nothing to update to\n", st.Current, st.Target)
 		case st.Available:
-			fmt.Fprintf(a.stderr, "bmcp %s is available (running %s)\n", st.Target, st.Current)
+			fmt.Fprintf(a.prose(), "bmcp %s is available (running %s)\n", st.Target, st.Current)
 		default:
-			fmt.Fprintf(a.stderr, "bmcp %s is up to date\n", st.Current)
+			fmt.Fprintf(a.prose(), "bmcp %s is up to date\n", st.Current)
 		}
 		return 0
 	}
 
 	if behind {
-		fmt.Fprintf(a.stderr, "bmcp %s is newer than the latest release (%s); nothing to update to.\nRun `bmcp update --to %s` to move to it anyway.\n",
+		if a.machine {
+			return a.reportUpdate(flags, updateDoc{Outcome: updateOutcomeAhead, Update: st.updateJSON()})
+		}
+		fmt.Fprintf(a.prose(), "bmcp %s is newer than the latest release (%s); nothing to update to.\nRun `bmcp update --to %s` to move to it anyway.\n",
 			st.Current, st.Target, taggedVersion(st.Target))
 		return 0
 	}
 
 	if !st.Available {
-		fmt.Fprintf(a.stderr, "bmcp %s is already installed\n", st.Current)
+		if a.machine {
+			return a.reportUpdate(flags, updateDoc{Outcome: updateOutcomeCurrent, Update: st.updateJSON()})
+		}
+		fmt.Fprintf(a.prose(), "bmcp %s is already installed\n", st.Current)
 		return 0
 	}
 
@@ -1070,7 +1076,26 @@ func (a *app) cmdUpdate(flags globalFlags, args []string) int {
 		return a.fail(flags, exitUpstream, "update_failed", err.Error())
 	}
 	st.Applied = true
-	fmt.Fprintf(a.stderr, "Updated bmcp %s -> %s (this run still uses %s)\n", st.Current, st.Target, st.Current)
+	if a.machine {
+		// From/To rather than only the nested state, so "what did this invocation
+		// do" is answerable without reading the update object — and st.Applied is
+		// set above, so the nested `applied` agrees with the outcome.
+		return a.reportUpdate(flags, updateDoc{
+			Outcome: updateOutcomeApplied, From: st.Current, To: st.Target, Path: st.Path, Update: st.updateJSON(),
+		})
+	}
+	fmt.Fprintf(a.prose(), "Updated bmcp %s -> %s (this run still uses %s)\n", st.Current, st.Target, st.Current)
+	return 0
+}
+
+// reportUpdate writes one update document. Every terminal path of cmdUpdate that
+// exits 0 goes through it, which is what makes "one invocation, one document"
+// true of a command with five of them.
+func (a *app) reportUpdate(flags globalFlags, doc updateDoc) int {
+	doc.OK, doc.Command, doc.Warnings = true, "update", a.warnings
+	if err := encodeMachineDoc(a.stdout, flags.contract(), doc); err != nil {
+		return a.fail(flags, exitGeneric, "output_failed", err.Error())
+	}
 	return 0
 }
 
@@ -1100,15 +1125,23 @@ func (a *app) rollbackUpdate(flags globalFlags, path string) int {
 		return a.fail(flags, exitGeneric, "update_rollback_failed", err.Error())
 	}
 	if err := recordRollback(path, normalizeVersion(version), restored, a.now()); err != nil {
-		fmt.Fprintf(a.stderr, "Warning: rolled back, but could not record it: %v\n", err)
+		fmt.Fprintf(a.prose(), "Warning: rolled back, but could not record it: %v\n", err)
 	}
 
-	if restored != "" {
-		fmt.Fprintf(a.stderr, "Rolled back bmcp %s -> %s at %s\n", normalizeVersion(version), restored, path)
-	} else {
-		fmt.Fprintf(a.stderr, "Rolled back to the previously installed bmcp at %s\n", path)
+	if a.machine {
+		// `to` is empty when the receipt could not say which version was restored,
+		// which is a real state rather than a failure — the binary is back either
+		// way, and omitting the field says so more honestly than guessing.
+		return a.reportUpdate(flags, updateDoc{
+			Outcome: updateOutcomeRolledBack, From: normalizeVersion(version), To: restored, Path: path,
+		})
 	}
-	fmt.Fprintf(a.stderr, "bmcp %s will not be installed automatically again on this machine.\nRun `bmcp update --to %s` to install it anyway.\n",
+	if restored != "" {
+		fmt.Fprintf(a.prose(), "Rolled back bmcp %s -> %s at %s\n", normalizeVersion(version), restored, path)
+	} else {
+		fmt.Fprintf(a.prose(), "Rolled back to the previously installed bmcp at %s\n", path)
+	}
+	fmt.Fprintf(a.prose(), "bmcp %s will not be installed automatically again on this machine.\nRun `bmcp update --to %s` to install it anyway.\n",
 		normalizeVersion(version), taggedVersion(version))
 	return 0
 }
