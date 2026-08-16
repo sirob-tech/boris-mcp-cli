@@ -109,11 +109,11 @@ func (a *app) cacheForCatalog(flags globalFlags, cfg effectiveConfig, allowStale
 			// cmdList would dereference it.
 			if errors.Is(err, errEmptyCatalog) && cacheErr == nil {
 				a.refusedEmptyCatalog = true
-				fmt.Fprintf(a.stderr, "Warning: %s\n", err)
+				a.warn("Warning: %s", err)
 				return cache, nil
 			}
 			if allowStale && cacheErr == nil {
-				fmt.Fprintf(a.stderr, "Warning: sync failed, using stale cache: %s\n", err)
+				a.warn("Warning: sync failed, using stale cache: %s", err)
 				return cache, nil
 			}
 			return nil, err
@@ -512,6 +512,33 @@ type toolRecord struct {
 	InputSchema json.RawMessage `json:"input_schema,omitempty"`
 }
 
+// newToolRecord builds the record shape from a cached tool. Shared by the NDJSON
+// stream, the `list --format json` document and `describe --format json`, so a
+// consumer that can read a catalog record can read any of the three.
+//
+// lastSync is pre-formatted rather than a time.Time: every caller within one
+// invocation reports the same stamp, and formatting it once is what guarantees
+// that.
+func newToolRecord(t tool, lastSync string, withSchema bool) toolRecord {
+	record := toolRecord{
+		Name:        t.Name,
+		DisplayName: displayToolName(t.Name),
+		Description: t.Description,
+		LastSync:    lastSync,
+	}
+	if withSchema {
+		// Assigned raw. The schema on disk is indented — writeCache stores the
+		// catalog with MarshalIndent, which re-indents this very field — so a
+		// record carrying it would seem bound to span as many lines as the schema
+		// has fields, breaking the one guarantee NDJSON makes here. It does not,
+		// because encoding/json compacts a RawMessage as it encodes it. That is
+		// the property TestListWithSchemasStaysOneRecordPerLine pins: not code in
+		// this function, but the reason none is needed.
+		record.InputSchema = t.InputSchema
+	}
+	return record
+}
+
 // writeToolRecords emits NDJSON: one record per line, descriptions verbatim.
 // Authored newlines survive as JSON escapes, so a record never spans two lines
 // and `head` can never split one.
@@ -531,23 +558,7 @@ func writeToolRecords(w io.Writer, tools []tool, lastSync time.Time, withSchemas
 	// from a caller grepping the raw lines.
 	enc.SetEscapeHTML(false)
 	for _, t := range tools {
-		record := toolRecord{
-			Name:        t.Name,
-			DisplayName: displayToolName(t.Name),
-			Description: t.Description,
-			LastSync:    stamp,
-		}
-		if withSchemas {
-			// Assigned raw. The schema on disk is indented — writeCache stores the
-			// catalog with MarshalIndent, which re-indents this very field — so a
-			// record carrying it would seem bound to span as many lines as the schema
-			// has fields, breaking the one guarantee NDJSON makes here. It does not,
-			// because encoding/json compacts a RawMessage as it encodes it. That is
-			// the property TestListWithSchemasStaysOneRecordPerLine pins: not code in
-			// this function, but the reason none is needed.
-			record.InputSchema = t.InputSchema
-		}
-		if err := enc.Encode(record); err != nil {
+		if err := enc.Encode(newToolRecord(t, stamp, withSchemas)); err != nil {
 			return fmt.Errorf("write record for %s: %w", t.Name, err)
 		}
 	}

@@ -360,12 +360,101 @@ Successful tool calls unwrap MCP text envelopes internally and print the useful
 payload directly. Use `--pretty` to format JSON payloads and `--raw` to inspect
 the original MCP envelope.
 
+### Machine output
+
+`--format` opts a command into the machine-output contract:
+
+| Format | stdout |
+|---|---|
+| `human` | prose |
+| `json` | exactly one indented JSON document per invocation |
+| `ndjson` | the same document compacted onto one line — except `list`, which is one bare tool record per line |
+
+**Without `--format`, nothing changes.** Every command keeps the output it had
+before this flag existed, which is what makes a release safe to apply
+unattended on a binary that self-updates. `--output` (read by `list` alone,
+where `json` still means `ndjson`) and `--json` (structured errors, plus
+doctor's report) are the legacy flags. Both still work, both are deprecated,
+and `--format` supersedes them wherever they appear together.
+
+`--pretty` is a legacy convenience: `--format json` is already indented, and
+`ndjson` must stay on one line, so it is not consulted under either.
+
+Under `--format json` or `--format ndjson`, three rules hold for every command:
+
+- **stdout carries the document and nothing else.** Progress prose is not
+  redirected but suppressed, so `bmcp … --format json 2>&1 | jq` is safe —
+  exactly one JSON document reaches the merged stream. `--verbose` puts the
+  prose back on stderr when you are debugging, so do not combine it with `2>&1`.
+- **Failures are one document on stderr**, with stdout left empty:
+
+  ```json
+  {"ok":false,"command":"call","error":"tool_validation_failed","message":"…","exit_code":5}
+  ```
+
+  Read `ok` to tell success from failure on a merged stream. `exit_code`
+  repeats bmcp's own exit status, which is worth reading when a pipeline has
+  replaced it with its own. The document is always a **single line**, in both
+  machine formats — the one place the output does not follow `--format` — so
+  `tail -1` and `read -r line` keep working on it.
+
+  Because failures are on stderr, `out=$(bmcp … --format json)` captures
+  nothing when the command fails. Merge the streams if you want one capture
+  that holds either outcome.
+
+  Two commands are exceptions. `doctor` reports failing checks in its ordinary
+  report on stdout with `"ok": false` and exits 1 — a failing check is its
+  answer, not an error about it — so its report carries `exit_code` too.
+  `--help` prints human text in every format.
+- **Success documents carry `ok` and `command`**, then whatever that command
+  answers with.
+- **Nothing prompts.** No first-run wizard, no URL or profile question, no
+  `aws sso login` shell-out — each returns an actionable error instead.
+
+A tool call answers like this:
+
+```json
+{
+  "ok": true,
+  "command": "call",
+  "tool": "tools___search_infrastructure_graph",
+  "display_name": "search_infrastructure_graph",
+  "result": { "nodes": [] },
+  "result_bytes": 17,
+  "truncated": false
+}
+```
+
+`result` holds the payload as JSON when it parses as JSON; a text payload
+arrives in `result_text` instead, so the type of `result` never depends on what
+the server chose to return.
+
+`--max-bytes <n>` caps a large result. The document stays parseable, sets
+`truncated`, reports the full `result_bytes`, and puts the kept prefix in
+`result_excerpt` — as text, because a prefix of a JSON document is not a JSON
+document. Prefer it to `head -c`, which cuts the payload without leaving
+anything in the output that says so. Without `--format` it truncates stdout and
+says so on stderr.
+
+The excerpt cuts on a rune boundary, and it is text rather than a byte-exact
+prefix: JSON encoding replaces invalid UTF-8 with U+FFFD, so a payload carrying
+raw bytes reads back with those substituted. That applies to `result_text` too,
+so no machine field preserves them — read the payload without `--format`, where
+it is written to stdout verbatim, if you need the exact bytes.
+
+Like `--pretty` and `--raw`, `--max-bytes` and `--format` must precede the tool
+name in the `bmcp <tool> --arg value` form — everything after the tool name is
+parsed as that tool's arguments, so a trailing `--format json` is rejected as an
+unknown tool argument, and on a tool that declares no arguments it is sent to
+the server as an argument named `format`.
+
 ### `bmcp list` output
 
-`list` writes NDJSON to stdout — one JSON object per line, nothing else. The
-`%d tools synced <timestamp>` header goes to stderr, so stdout stays parseable
-even when piped through `head`, and an empty catalog is empty stdout with
-exit 0.
+`list` writes NDJSON to stdout — one JSON object per line, nothing else, and an
+empty catalog is empty stdout with exit 0. The `%d tools synced <timestamp>`
+header goes to stderr, so stdout stays parseable even when piped through `head`.
+Under `--format json` or `--format ndjson` that header is suppressed rather than
+redirected, so merging the streams is safe.
 
 ```json
 {"name":"tools___search_infrastructure_graph","display_name":"search_infrastructure_graph","description":"Multi-hop, aggregation…","last_sync":"2026-08-13T16:44:41Z"}
@@ -385,8 +474,9 @@ Two things worth knowing when consuming this:
 
 - **`head` truncates safely but silently.** Every line is a complete record, so
   `head -5` never yields invalid JSON — but it does hide tools, without any
-  marker in stdout. The total count is on stderr; compare it if completeness
-  matters.
+  marker in stdout. Use `--format json` when completeness matters: that document
+  carries `count`, which a stream cut short cannot report about itself. The
+  total is also on stderr without `--format`.
 - **Pipe records, do not `echo` them.** `echo "$line" | jq` expands the `\n`
   escapes inside a description and corrupts the JSON. Use `printf '%s'` or feed
   `jq` the stream directly.
@@ -401,25 +491,27 @@ bmcp list --output human
 `--output` accepts `ndjson` (default), `json` as an alias for it, and `human`.
 Any other value, including an empty `--output=`, exits 5; omitting the value
 (`bmcp list --output`) is a flag-parse error and exits 1, like every other
-value-taking flag.
+value-taking flag. `--format` accepts `human`, `json` and `ndjson` — three
+distinct formats — and is the one to reach for; `--output` is kept for callers
+that already use it and is read by `list` alone.
 
-Only `list` reads it — other commands accept and ignore it. As a global flag it
-always works before the command name. After the command name, `help`, `version`
-and `install` take their arguments verbatim (`install` rejects it outright), as
-does the tool in the `bmcp <tool> --arg value` form. Putting `--output` first is
-always safe.
+As a global flag `--output` always works before the command name. After the
+command name, `help`, `version` and `install` take their arguments verbatim
+(`install` rejects it outright), as does the tool in the `bmcp <tool> --arg
+value` form. Putting `--output` first is always safe.
 
-### `bmcp doctor --json` output
+### `bmcp doctor` JSON output
 
-`doctor --json` writes its report as one JSON document to stdout, so it can be
+`doctor --json` — or `doctor --format json`, which adds `command` and
+`exit_code` — writes its report as one JSON document to stdout, so it can be
 piped straight into a parser:
 
 ```bash
 bmcp doctor --json | jq '.checks[] | select(.ok == false)'
 ```
 
-Progress prose such as `Syncing tools...` goes to stderr, following the same
-split as `bmcp list`.
+Progress prose such as `Syncing tools...` goes to stderr under `--json`, and is
+suppressed entirely under `--format`; `--verbose` restores it there.
 
 The document carries `ok` and a `checks` array, plus an `update` object whenever
 the pre-command update inspection ran — which is not the same as a network check
@@ -430,10 +522,12 @@ Two things worth knowing when consuming it:
 
 - **Check the exit code, not just stdout.** A failure *before* doctor produces a
   report — an unparseable flag, a bad `--output`, an extra argument — writes
-  `{"ok":false,"error":…}` to stderr and leaves stdout empty, as every other
-  command does. The pipeline above then prints nothing and `jq` exits 0, which
-  reads as "no failing checks" from a command that never ran one. Use `set -o
-  pipefail`, or test bmcp's own exit code first.
+  `{"ok":false,"error":…,"exit_code":…}` to stderr and leaves stdout empty, as
+  every other command does. The pipeline above then prints nothing and `jq`
+  exits 0, which reads as "no failing checks" from a command that never ran one.
+  Use `set -o pipefail`, test bmcp's own exit code, or merge the streams — in a
+  machine format `2>&1` yields exactly one document either way, and `ok` says
+  which.
 - **`ok` is false exactly when the command exits 1.** A failed update *check*
   stays outside `checks` and never gets there: a GitHub outage is not a BORIS
   outage. The single exception is an update that left no working binary at the

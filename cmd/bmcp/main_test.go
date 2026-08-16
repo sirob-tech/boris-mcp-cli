@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -354,10 +356,16 @@ func TestListEmitsOneNDJSONRecordPerTool(t *testing.T) {
 			t.Fatalf("record %d mismatch:\n got: %s\nwant: %s", i, line, want[i])
 		}
 	}
+	// Plain `bmcp list` selects no contract, so it behaves exactly as it did before
+	// --format existed: records on stdout, the count header on stderr. Suppressing
+	// that header is the contract's business, and only a caller that spelled
+	// --format has asked for it — see TestContractSuppressesProseOnlyWhenSelected.
 	if !strings.Contains(stderr.String(), "2 tools synced") {
 		t.Fatalf("count header belongs on stderr, got: %s", stderr.String())
 	}
-	// --json means structured errors; it must not restructure the catalog.
+	// --json means structured errors; it must not restructure the catalog. That was
+	// true before --format and stays true, which is the whole point of giving the
+	// contract a flag of its own.
 	var jsonStdout bytes.Buffer
 	a.stdout = &jsonStdout
 	if code := a.run([]string{"--non-interactive", "--json", "list"}); code != 0 {
@@ -368,8 +376,89 @@ func TestListEmitsOneNDJSONRecordPerTool(t *testing.T) {
 	}
 }
 
+// `list --output json` is the enveloped form, and the one to reach for when
+// completeness matters: `head` on the NDJSON stream is silently short, and
+// nothing in that stream says how many records there should have been.
+func TestListJSONDocumentCarriesCountAndTools(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{
+		{Name: "tools___search_aws", Description: "Semantic search — scope it with <region> & tags."},
+		{Name: "tools___search_infrastructure_graph", Description: "Multi-hop queries."},
+	})
+	cache, err := readCache(filepath.Join(borisHome, "tools.json"))
+	if err != nil {
+		t.Fatalf("readCache: %v", err)
+	}
+	for _, args := range [][]string{{"list", "--format", "json"}, {"--format", "json", "list"}} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+			if code := a.run(append([]string{"--non-interactive"}, args...)); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			var doc struct {
+				OK       bool   `json:"ok"`
+				Command  string `json:"command"`
+				Count    int    `json:"count"`
+				LastSync string `json:"last_sync"`
+				Tools    []struct {
+					Name        string          `json:"name"`
+					Description string          `json:"description"`
+					InputSchema json.RawMessage `json:"input_schema"`
+				} `json:"tools"`
+			}
+			// Unmarshalling the whole of stdout is itself the assertion that no prose
+			// shares the channel: json.Unmarshal rejects trailing non-whitespace.
+			if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+				t.Fatalf("stdout is not a single JSON document: %v\n%s", err, stdout.String())
+			}
+			if !doc.OK || doc.Command != "list" {
+				t.Fatalf("unexpected envelope: %s", stdout.String())
+			}
+			if doc.Count != 2 || len(doc.Tools) != 2 {
+				t.Fatalf("expected 2 tools and count 2, got count %d and %d tools", doc.Count, len(doc.Tools))
+			}
+			if doc.LastSync != cache.LastSync.UTC().Format(time.RFC3339) {
+				t.Fatalf("unexpected last_sync %q", doc.LastSync)
+			}
+			// Same raw-byte guarantee the NDJSON stream makes: HTML escaping stays off,
+			// so what the tool said is what a caller reads.
+			if !strings.Contains(doc.Tools[0].Description, "<region> & tags") {
+				t.Fatalf("description should not be HTML-escaped: %q", doc.Tools[0].Description)
+			}
+			// Schemas are opt-in in this format too, for the reason they are in NDJSON.
+			if doc.Tools[0].InputSchema != nil {
+				t.Fatalf("schemas should need --schemas, got %s", doc.Tools[0].InputSchema)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("a machine format must leave stderr empty, got: %s", stderr.String())
+			}
+		})
+	}
+}
+
+// An empty catalog is `"tools":[]`, never `"tools":null`: this command exits 0
+// on an empty catalog, so a consumer ranging over the field should not have to
+// special-case the case it is most likely to meet.
+func TestListJSONDocumentHasEmptyArrayForEmptyCatalog(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, nil)
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	if code := a.run([]string{"--non-interactive", "list", "--format", "json"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `"tools": []`) {
+		t.Fatalf("expected an empty array, got: %s", stdout.String())
+	}
+}
+
 // Every accepted --output spelling, in both flag positions and both syntaxes,
-// through both `list` and its `ls` alias.
+// through both `list` and its `ls` alias. `json` is not here: it used to be an
+// alias for `ndjson` and is now its own format, pinned by
+// TestListJSONDocumentCarriesCountAndTools.
 func TestListOutputFormatSpellings(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -387,10 +476,8 @@ func TestListOutputFormatSpellings(t *testing.T) {
 	}{
 		{args: []string{"list"}, want: ndjson},
 		{args: []string{"ls"}, want: ndjson},
-		{args: []string{"list", "--output", "ndjson"}, want: ndjson},
+		{args: []string{"list", "--format", "ndjson"}, want: ndjson},
 		{args: []string{"list", "--output=ndjson"}, want: ndjson},
-		{args: []string{"list", "--output", "json"}, want: ndjson},
-		{args: []string{"--output", "json", "list"}, want: ndjson},
 		{args: []string{"list", "--output", "human"}, want: human},
 		{args: []string{"list", "--output=human"}, want: human},
 		{args: []string{"--output=human", "ls"}, want: human},
@@ -483,8 +570,15 @@ func TestListEmptyCatalogExitsZeroWithEmptyStdout(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Fatalf("stdout should be empty, got %q", stdout.String())
 	}
+	// The count is prose, so the human format is where it is reported now — see
+	// TestListEmitsOneNDJSONRecordPerTool.
+	stdout.Reset()
+	stderr.Reset()
+	if code := a.run([]string{"--non-interactive", "list", "--output", "human"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
 	if !strings.Contains(stderr.String(), "0 tools") {
-		t.Fatalf("stderr should report an empty catalog, got: %s", stderr.String())
+		t.Fatalf("the human format should report an empty catalog, got: %s", stderr.String())
 	}
 }
 
@@ -703,6 +797,9 @@ func TestDoctorJSONIsParseableOnStdoutWithProseOnStderr(t *testing.T) {
 	if !payload.OK || len(payload.Checks) == 0 {
 		t.Fatalf("expected passing checks, got: %s", stdout.String())
 	}
+	// --json selects no contract, so the split is the one it always was: document
+	// on stdout, prose on stderr. Suppressing the prose is the contract's business
+	// — see TestContractSuppressesProseOnlyWhenSelected.
 	if !strings.Contains(stderr.String(), "Syncing tools") {
 		t.Fatalf("progress prose belongs on stderr, got: %s", stderr.String())
 	}
@@ -748,13 +845,22 @@ func TestListReportsCountWithoutTimestampWhenCacheHasNoSync(t *testing.T) {
 	if got := stdout.String(); got != `{"name":"tools___search_aws","display_name":"search_aws","description":"Search."}`+"\n" {
 		t.Fatalf("record should carry no last_sync: %q", got)
 	}
+	// The header is prose, suppressed in a machine format; --verbose is where it
+	// can still be observed.
+	stdout.Reset()
+	stderr.Reset()
+	if code := a.run([]string{"--non-interactive", "--verbose", "list"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
 	if !strings.Contains(stderr.String(), "1 tools\n") {
 		t.Fatalf("header should omit an absent timestamp, got: %s", stderr.String())
 	}
 }
 
-// The stale-cache fallback keeps exit 0, so its warning has to stay on stderr —
-// one line of prose on stdout would break every consumer.
+// The stale-cache fallback keeps exit 0, so its warning must never reach stdout
+// — one line of prose there would break every consumer. In a machine format it
+// is not written at all, because a caller merging the streams would be back in
+// the same position; --verbose is where a human can still see it.
 func TestListKeepsStaleCacheWarningOffStdout(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -783,6 +889,19 @@ func TestListKeepsStaleCacheWarningOffStdout(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "using stale cache") {
 		t.Fatalf("stale-cache warning belongs on stderr, got: %s", stderr.String())
+	}
+	// Under the contract it is suppressed rather than redirected, so a caller
+	// merging the streams still gets one parseable document.
+	stdout.Reset()
+	stderr.Reset()
+	if code := a.run([]string{"--non-interactive", "--format", "ndjson", "list"}); code != 0 {
+		t.Fatalf("stale cache should still exit 0, got %d, stderr: %s", code, stderr.String())
+	}
+	if stdout.String() != want {
+		t.Fatalf("--format must not disturb stdout:\n got: %q\nwant: %q", stdout.String(), want)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("the contract must leave stderr empty, got: %s", stderr.String())
 	}
 }
 
@@ -3102,6 +3221,1275 @@ func TestToolCallPrettyFormatsUnwrappedJSONThroughCLI(t *testing.T) {
 	}
 	if stdout.String() != "{\n  \"ok\": true\n}\n" {
 		t.Fatalf("unexpected pretty stdout: %q", stdout.String())
+	}
+}
+
+// callApp wires an app around one canned tool result, which is all most of the
+// machine-output cases need.
+//
+// The tool carries a schema with one optional argument. Optional so that a bare
+// call is valid, declared so that an undeclared flag is not — which is how these
+// cases reach a local validation failure without a second fixture.
+func callApp(t *testing.T, result string, stdout, stderr *bytes.Buffer) *app {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tools := []tool{{
+		Name:        "tools___search_aws",
+		Description: "Search.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+	}}
+	setupInstallCatalog(t, home, tools)
+	return &app{
+		stdin:  strings.NewReader(""),
+		stdout: stdout,
+		stderr: stderr,
+		now:    time.Now,
+		// The same catalog the cache holds, so a command that does sync — `sync`
+		// itself — is not answered with an empty-catalog refusal.
+		httpClient:  &fakeMCP{tools: tools, callResult: []byte(result)},
+		credentials: staticCreds(),
+	}
+}
+
+// A tool call in a machine format is an envelope, not a bare payload: the caller
+// gets the tool it reached, the result, and — the part no payload can carry —
+// whether that result is all of it.
+func TestToolCallJSONEnvelopeCarriesResultAndCompleteness(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	a := callApp(t, `{"content":[{"type":"text","text":"{\"ok\":true,\"hits\":2}"}]}`, &stdout, &stderr)
+	if code := a.run([]string{"--format", "json", "search_aws"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	var doc struct {
+		OK          bool            `json:"ok"`
+		Command     string          `json:"command"`
+		Tool        string          `json:"tool"`
+		DisplayName string          `json:"display_name"`
+		Result      json.RawMessage `json:"result"`
+		ResultText  *string         `json:"result_text"`
+		ResultBytes int             `json:"result_bytes"`
+		Truncated   bool            `json:"truncated"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("stdout is not a single JSON document: %v\n%s", err, stdout.String())
+	}
+	if !doc.OK || doc.Command != "call" {
+		t.Fatalf("unexpected envelope: %s", stdout.String())
+	}
+	// The full name is what is callable; the display name is the convenience. Both
+	// are present for the same reason both are in a catalog record.
+	if doc.Tool != "tools___search_aws" || doc.DisplayName != "search_aws" {
+		t.Fatalf("unexpected tool identity: %q / %q", doc.Tool, doc.DisplayName)
+	}
+	// A JSON payload lands in `result` as JSON, not as a string holding JSON: a
+	// consumer indexes into it rather than parsing twice.
+	var inner struct {
+		Hits int `json:"hits"`
+	}
+	if err := json.Unmarshal(doc.Result, &inner); err != nil || inner.Hits != 2 {
+		t.Fatalf("result should be the unwrapped payload as JSON, got %s", doc.Result)
+	}
+	if doc.ResultText != nil {
+		t.Fatalf("a JSON payload must not also appear as text: %q", *doc.ResultText)
+	}
+	if doc.ResultBytes != len(`{"ok":true,"hits":2}`) || doc.Truncated {
+		t.Fatalf("unexpected completeness fields: %d bytes, truncated=%v", doc.ResultBytes, doc.Truncated)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("a machine format must leave stderr empty, got: %s", stderr.String())
+	}
+}
+
+// Not every tool returns JSON. A text payload keeps its own field rather than
+// being wrapped into `result`, so the type of `result` never depends on what the
+// server happened to send.
+func TestToolCallJSONEnvelopeSeparatesTextResults(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	a := callApp(t, `{"content":[{"type":"text","text":"no matching resources"}]}`, &stdout, &stderr)
+	if code := a.run([]string{"--format", "json", "search_aws"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	var doc struct {
+		Result     json.RawMessage `json:"result"`
+		ResultText *string         `json:"result_text"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("stdout is not a single JSON document: %v\n%s", err, stdout.String())
+	}
+	if doc.Result != nil {
+		t.Fatalf("a text payload must not appear as result: %s", doc.Result)
+	}
+	if doc.ResultText == nil || *doc.ResultText != "no matching resources" {
+		t.Fatalf("expected the text in result_text, got %v", doc.ResultText)
+	}
+}
+
+// json is indented and ndjson is one line, for every command. Asserted on the
+// bytes, not on the parsed value: the earlier version of this test unmarshalled
+// both and compared the maps, so it passed while `--format json` was quietly
+// emitting the compact form for seven of nine commands — flags.output was being
+// threaded into encodeMachineDoc, and that field can never hold "json".
+func TestJSONIsIndentedAndNDJSONIsOneLineForEveryCommand(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		// sameDoc compares the two documents for equality. False for `list`, whose
+		// ndjson is a record stream rather than the enveloped document — the one
+		// carve-out in the contract — and for `install`, which honestly reports
+		// changed:false the second time because the files already match.
+		sameDoc bool
+	}{
+		{name: "version", args: []string{"version"}, sameDoc: true},
+		{name: "sync", args: []string{"sync"}, sameDoc: true},
+		{name: "doctor", args: []string{"doctor"}, sameDoc: true},
+		{name: "list", args: []string{"list"}},
+		{name: "describe", args: []string{"describe", "search_aws"}, sameDoc: true},
+		{name: "call", args: []string{"search_aws"}, sameDoc: true},
+		{name: "install", args: []string{"install", "claude-code"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			// One app, so both runs see the same home and the documents differ only
+			// in the way this test is about.
+			var stdout, stderr bytes.Buffer
+			a := callApp(t, `{"content":[{"type":"text","text":"{\"ok\":true}"}]}`, &stdout, &stderr)
+			run := func(format string) string {
+				stdout.Reset()
+				args := append([]string{"--non-interactive", "--format", format}, tc.args...)
+				if code := a.run(args); code != 0 {
+					t.Fatalf("--format %s exit %d, stderr: %s", format, code, stderr.String())
+				}
+				return stdout.String()
+			}
+			indented, compact := run("json"), run("ndjson")
+			if lines := strings.Count(strings.TrimSuffix(compact, "\n"), "\n"); lines != 0 {
+				t.Fatalf("ndjson must be one line, got %d newlines:\n%s", lines, compact)
+			}
+			// The property the earlier version of this test missed: it unmarshalled
+			// both and compared the maps, so it passed while --format json was
+			// quietly emitting the compact form for seven of nine commands.
+			if !strings.Contains(indented, "\n  \"") {
+				t.Fatalf("json must be indented, got: %q", indented)
+			}
+			if !tc.sameDoc {
+				return
+			}
+			var a1, a2 map[string]any
+			if err := json.Unmarshal([]byte(indented), &a1); err != nil {
+				t.Fatalf("json is not one document: %v\n%s", err, indented)
+			}
+			if err := json.Unmarshal([]byte(compact), &a2); err != nil {
+				t.Fatalf("ndjson is not one document: %v\n%s", err, compact)
+			}
+			if !reflect.DeepEqual(a1, a2) {
+				t.Fatalf("the two formats should differ only in whitespace:\n%v\n%v", a1, a2)
+			}
+		})
+	}
+}
+
+// A legacy invocation writes no document to stdout. `sync` and `install` are the
+// two whose contract guard nothing else pins, and both are side-effecting, so a
+// stray document there would be the easiest kind of regression to miss.
+func TestLegacyCommandsWriteNoDocumentToStdout(t *testing.T) {
+	for _, args := range [][]string{
+		{"sync"},
+		{"install", "claude-code"},
+		{"--json", "sync"},
+		{"--output", "json", "sync"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			var stdout, stderr bytes.Buffer
+			a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+			if code := a.run(append([]string{"--non-interactive"}, args...)); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("no --format means no document, got stdout: %q", stdout.String())
+			}
+			if stderr.Len() == 0 {
+				t.Fatalf("the prose these commands have always printed should still be there")
+			}
+		})
+	}
+}
+
+// --help is prose in every format, which is a documented exception rather than a
+// hole: it is a request for the human text, and stdout carrying it is the answer.
+func TestHelpStaysProseUnderTheContract(t *testing.T) {
+	for _, args := range [][]string{
+		{"--format", "json", "--help"},
+		{"--format", "ndjson", "--help"},
+		{"--format", "json", "help"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+			if code := a.run(args); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if !strings.Contains(stdout.String(), "Usage:") {
+				t.Fatalf("--help should answer with usage, got: %s", stdout.String())
+			}
+		})
+	}
+}
+
+// --max-bytes is what replaces piping the result through `head -c`, which cuts
+// the payload without leaving anything in the output that says so.
+func TestMaxBytesMarksATruncatedResultInsteadOfSilentlyClippingIt(t *testing.T) {
+	payload := `{"items":["aaaaaaaaaa","bbbbbbbbbb","cccccccccc"]}`
+	var stdout, stderr bytes.Buffer
+	a := callApp(t, `{"content":[{"type":"text","text":`+strconv.Quote(payload)+`}]}`, &stdout, &stderr)
+	if code := a.run([]string{"--format", "json", "--max-bytes", "12", "search_aws"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	var doc struct {
+		Result      json.RawMessage `json:"result"`
+		ResultText  *string         `json:"result_text"`
+		ResultBytes int             `json:"result_bytes"`
+		Truncated   bool            `json:"truncated"`
+		Excerpt     string          `json:"result_excerpt"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("a truncated result must still be a parseable document: %v\n%s", err, stdout.String())
+	}
+	if !doc.Truncated || doc.ResultBytes != len(payload) {
+		t.Fatalf("expected truncated=true and the full size, got %v / %d", doc.Truncated, doc.ResultBytes)
+	}
+	// The clipped bytes are text, never `result`: a prefix of a JSON document is
+	// not a JSON document, and offering one as `result` would hand the consumer a
+	// parse error where it asked for a truncation flag.
+	if doc.Result != nil || doc.ResultText != nil {
+		t.Fatalf("a clipped payload must appear only as an excerpt: %s / %v", doc.Result, doc.ResultText)
+	}
+	if doc.Excerpt != payload[:12] {
+		t.Fatalf("excerpt should be the kept prefix, got %q", doc.Excerpt)
+	}
+	// Under the cap nothing changes, so `truncated` is a fact about this result
+	// rather than about the flag being present.
+	stdout.Reset()
+	if code := a.run([]string{"--format", "json", "--max-bytes", "8192", "search_aws"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if doc.Truncated || doc.Result == nil {
+		t.Fatalf("a result under the cap should be complete: %s", stdout.String())
+	}
+}
+
+// The human format has no field to carry the flag, so it says so in prose. A
+// clipped JSON payload does not parse, and this line is the difference between
+// that and a server that returned something malformed.
+func TestMaxBytesReportsTruncationInTheHumanFormat(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	a := callApp(t, `{"content":[{"type":"text","text":"{\"ok\":true,\"hits\":2}"}]}`, &stdout, &stderr)
+	if code := a.run([]string{"--max-bytes", "5", "search_aws"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if stdout.String() != "{\"ok\"\n" {
+		t.Fatalf("stdout should carry the kept prefix, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "Truncated to 5 of 20 bytes") {
+		t.Fatalf("stderr should say the payload is incomplete, got: %s", stderr.String())
+	}
+}
+
+// Cutting mid-rune would put a replacement character in the excerpt and make it
+// disagree with the prefix of the payload it claims to be.
+func TestMaxBytesCutsOnARuneBoundary(t *testing.T) {
+	// Written as escapes rather than literals: the point of the test is which
+	// byte the cut lands on, and a source file that normalised a two-byte rune
+	// into a letter plus a combining mark would silently change that.
+	const s = "\u00fcber" // 5 bytes: the u-umlaut is two of them.
+	for _, tc := range []struct {
+		max  int
+		want string
+	}{
+		// A cap that would split the leading rune keeps nothing rather than half
+		// of it, which is the case a plain slice gets wrong.
+		{1, ""},
+		{2, "\u00fc"},
+		{3, "\u00fcb"},
+		{99, s},
+		// Zero is "no limit", not "keep nothing" — see parseMaxBytes.
+		{0, s},
+	} {
+		if got := string(truncateBytes([]byte(s), tc.max)); got != tc.want {
+			t.Fatalf("truncateBytes(%q, %d) = %q, want %q", s, tc.max, got, tc.want)
+		}
+	}
+}
+
+func TestMaxBytesRejectsNonPositiveValues(t *testing.T) {
+	for _, v := range []string{"0", "-1", "lots", "8k", ""} {
+		t.Run(v, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+			if code := a.run([]string{"--max-bytes", v, "search_aws"}); code != exitValidation {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("a rejected flag must not call the tool: %q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), "--max-bytes") {
+				t.Fatalf("stderr should name the offending flag, got: %s", stderr.String())
+			}
+		})
+	}
+}
+
+// The headline property of the contract, stated as the thing agents actually do.
+// 322 of 907 audited shell calls post-processed BMCP output, and merging stderr
+// into stdout to keep hold of errors is what made valid payloads unparseable.
+// Both outcomes have to survive the merge, or the merge remains unsafe and the
+// plumbing comes back.
+func TestMachineFormatSurvivesMergedStreams(t *testing.T) {
+	for _, format := range []string{"json", "ndjson"} {
+		t.Run(format, func(t *testing.T) {
+			// One buffer standing in for `2>&1`: both streams write to it, in order.
+			var merged bytes.Buffer
+			a := callApp(t, `{"content":[{"type":"text","text":"{\"ok\":true}"}]}`, &merged, &merged)
+			if code := a.run([]string{"--format", format, "search_aws"}); code != 0 {
+				t.Fatalf("exit code %d, merged: %s", code, merged.String())
+			}
+			var doc map[string]any
+			if err := json.Unmarshal(merged.Bytes(), &doc); err != nil {
+				t.Fatalf("merged success stream is not one document: %v\n%s", err, merged.String())
+			}
+			if doc["ok"] != true {
+				t.Fatalf("expected ok=true, got: %s", merged.String())
+			}
+			// The failure half. The tool is real and the flag is not, so this fails
+			// after the same progress prose a success would have printed.
+			merged.Reset()
+			if code := a.run([]string{"--format", format, "search_aws", "--nonsense", "x"}); code == 0 {
+				t.Fatalf("expected a failure, merged: %s", merged.String())
+			}
+			if err := json.Unmarshal(merged.Bytes(), &doc); err != nil {
+				t.Fatalf("merged failure stream is not one document: %v\n%s", err, merged.String())
+			}
+			if doc["ok"] != false {
+				t.Fatalf("expected ok=false, got: %s", merged.String())
+			}
+		})
+	}
+}
+
+// One invocation, one document — including on the paths that report through
+// more than one layer. An unconfigured machine used to run first-run setup from
+// inside requireConfig, and cmdInit reports its own failures: in a machine format
+// that put cmdInit's error document and the caller's on stderr back to back,
+// which is not a parseable stream however good either document is.
+func TestUnconfiguredMachineInvocationEmitsExactlyOneDocument(t *testing.T) {
+	for _, format := range []string{"json", "ndjson"} {
+		t.Run(format, func(t *testing.T) {
+			t.Setenv("BMCP_HOME", filepath.Join(t.TempDir(), "absent"))
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now,
+				// Interactive, which is what used to trigger the first-run setup. A
+				// machine format declines it: there is no channel left to ask on.
+				interactive: func() bool { return true },
+			}
+			if code := a.run([]string{"--format", format, "list"}); code != exitConfig {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			var doc struct {
+				OK      bool   `json:"ok"`
+				Error   string `json:"error"`
+				Message string `json:"message"`
+			}
+			// Two documents back to back fail this parse; one does not.
+			if err := json.Unmarshal(stderr.Bytes(), &doc); err != nil {
+				t.Fatalf("stderr should be exactly one document: %v\n%s", err, stderr.String())
+			}
+			if doc.OK || doc.Error != "not_configured" {
+				t.Fatalf("unexpected error document: %+v", doc)
+			}
+			// The full guidance survives into the message rather than being replaced
+			// by the "first-run setup failed" the inner call used to produce.
+			if !strings.Contains(doc.Message, "bmcp init --url") {
+				t.Fatalf("the message should still say how to configure it, got %q", doc.Message)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("a failure must not write to stdout, got %q", stdout.String())
+			}
+		})
+	}
+}
+
+// The JSON-argument call form, which issue #34 names in scope alongside the
+// `bmcp <tool> --arg value` one. Every other machine-format call assertion goes
+// through the dynamic form, so without this a `cmdCall` that ignored the format
+// entirely would pass the suite.
+func TestJSONFormToolCallAnswersInTheSelectedFormat(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	a := callApp(t, `{"content":[{"type":"text","text":"{\"hits\":1}"}]}`, &stdout, &stderr)
+	if code := a.run([]string{"--format", "json", "call", "search_aws", `{"query":"x"}`}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	var doc struct {
+		OK      bool            `json:"ok"`
+		Command string          `json:"command"`
+		Tool    string          `json:"tool"`
+		Result  json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("stdout is not a single JSON document: %v\n%s", err, stdout.String())
+	}
+	if !doc.OK || doc.Command != "call" || doc.Tool != "tools___search_aws" {
+		t.Fatalf("unexpected envelope: %s", stdout.String())
+	}
+	// Decoded rather than byte-compared: --output json indents the whole document,
+	// and json.RawMessage is indented along with everything around it.
+	var inner struct {
+		Hits int `json:"hits"`
+	}
+	if err := json.Unmarshal(doc.Result, &inner); err != nil || inner.Hits != 1 {
+		t.Fatalf("unexpected result: %s", doc.Result)
+	}
+	// The same call reads its payload from stdin when none is given, and that path
+	// must reach the same document rather than bypassing the format.
+	stdout.Reset()
+	a.stdin = strings.NewReader(`{"query":"x"}`)
+	if code := a.run([]string{"--format", "json", "call", "search_aws"}); code != 0 {
+		t.Fatalf("stdin form exit code %d, stderr: %s", code, stderr.String())
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("the stdin form should answer with the same document: %v\n%s", err, stdout.String())
+	}
+	if !doc.OK || doc.Command != "call" {
+		t.Fatalf("unexpected envelope from the stdin form: %s", stdout.String())
+	}
+}
+
+// --max-bytes caps what is actually written, so it composes with the two flags
+// that change what that is. Under --raw it caps the envelope rather than the
+// unwrapped payload; under --pretty it caps the indented bytes, not the compact
+// ones they were reformatted from.
+func TestMaxBytesComposesWithRawAndPretty(t *testing.T) {
+	const envelope = `{"content":[{"type":"text","text":"{\"ok\":true}"}]}`
+	t.Run("raw", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		a := callApp(t, envelope, &stdout, &stderr)
+		if code := a.run([]string{"--format", "json", "--raw", "--max-bytes", "12", "search_aws"}); code != 0 {
+			t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+		}
+		var doc struct {
+			ResultBytes int     `json:"result_bytes"`
+			Truncated   bool    `json:"truncated"`
+			Excerpt     *string `json:"result_excerpt"`
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+			t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
+		}
+		// The envelope, not the 11-byte payload inside it — which would not have
+		// been truncated at all.
+		if !doc.Truncated || doc.ResultBytes != len(envelope) {
+			t.Fatalf("--raw should cap the envelope, got %d bytes truncated=%v", doc.ResultBytes, doc.Truncated)
+		}
+		if doc.Excerpt == nil || *doc.Excerpt != envelope[:12] {
+			t.Fatalf("unexpected excerpt: %v", doc.Excerpt)
+		}
+	})
+	t.Run("pretty", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		a := callApp(t, envelope, &stdout, &stderr)
+		if code := a.run([]string{"--pretty", "--max-bytes", "8", "search_aws"}); code != 0 {
+			t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+		}
+		// `{"ok":true}` is 11 bytes compact and 16 indented. Reporting 16 is what
+		// says the cap was applied to what was actually written.
+		if !strings.Contains(stderr.String(), "Truncated to 8 of 16 bytes") {
+			t.Fatalf("--max-bytes should cap the indented payload, got: %s", stderr.String())
+		}
+		if stdout.String() != "{\n  \"ok\"\n" {
+			t.Fatalf("unexpected truncated stdout: %q", stdout.String())
+		}
+	})
+}
+
+// A cap smaller than the payload's first rune keeps no bytes. `truncated` still
+// says so, and the excerpt is present-and-empty rather than absent — a missing
+// key reads as a different kind of answer.
+func TestMaxBytesKeepsAnEmptyExcerptPresent(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	// The payload opens with a two-byte rune, so a one-byte cap can keep nothing.
+	a := callApp(t, `{"content":[{"type":"text","text":"über"}]}`, &stdout, &stderr)
+	if code := a.run([]string{"--format", "json", "--max-bytes", "1", "search_aws"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	var doc struct {
+		Truncated bool    `json:"truncated"`
+		Excerpt   *string `json:"result_excerpt"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
+	}
+	if !doc.Truncated {
+		t.Fatalf("expected truncated=true, got: %s", stdout.String())
+	}
+	if doc.Excerpt == nil || *doc.Excerpt != "" {
+		t.Fatalf("expected a present, empty excerpt, got %v", doc.Excerpt)
+	}
+}
+
+// One invalid byte anywhere before the cut used to walk the excerpt back to
+// empty — truncateBytes shortened while the whole prefix failed utf8.Valid, so
+// a --raw payload or an unrecognised envelope, neither of which is laundered to
+// U+FFFD, lost its excerpt entirely and took quadratic time doing it.
+func TestTruncateKeepsThePrefixAroundInvalidUTF8(t *testing.T) {
+	payload := append([]byte{0xff}, bytes.Repeat([]byte("a"), 1000)...)
+	got := truncateBytes(payload, 100)
+	if len(got) != 100 {
+		t.Fatalf("an invalid byte before the cut must not shorten the excerpt, got %d bytes", len(got))
+	}
+	if !bytes.Equal(got, payload[:100]) {
+		t.Fatalf("the excerpt should be the payload's own prefix, got %q", got)
+	}
+}
+
+// exit_code is in the failure document because the audit found 11 rejected calls
+// that read as successes: a following pipeline command replaced BMCP's exit
+// status with its own, and nothing in the output disagreed.
+func TestErrorDocumentNamesTheCommandAndCarriesTheExitCode(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+	if code := a.run([]string{"--format", "json", "search_aws", "--nonsense", "x"}); code != exitValidation {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	var doc struct {
+		OK       bool   `json:"ok"`
+		Command  string `json:"command"`
+		Error    string `json:"error"`
+		Message  string `json:"message"`
+		ExitCode int    `json:"exit_code"`
+	}
+	if err := json.Unmarshal(stderr.Bytes(), &doc); err != nil {
+		t.Fatalf("stderr is not a single JSON document: %v\n%s", err, stderr.String())
+	}
+	if doc.OK || doc.Error != "tool_validation_failed" || doc.ExitCode != exitValidation {
+		t.Fatalf("unexpected error document: %+v", doc)
+	}
+	if doc.Command != "call" {
+		t.Fatalf("a failed tool call should report the call command, got %q", doc.Command)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("a failure must not write to stdout, got %q", stdout.String())
+	}
+}
+
+// describe had no machine form at all, so an agent that wanted a schema had to
+// parse indented prose or call `list --schemas` and filter it. The schema is
+// unconditional here: describe is the command asked when a payload is about to
+// be written.
+func TestDescribeJSONCarriesTheSchemaInTheCatalogRecordShape(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{
+		Name:        "tools___search_aws",
+		Description: "Search.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}`),
+	}})
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	if code := a.run([]string{"--non-interactive", "describe", "search_aws", "--format", "json"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	var doc struct {
+		OK      bool   `json:"ok"`
+		Command string `json:"command"`
+		Tool    struct {
+			Name        string `json:"name"`
+			DisplayName string `json:"display_name"`
+			InputSchema struct {
+				Required []string `json:"required"`
+			} `json:"input_schema"`
+		} `json:"tool"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("stdout is not a single JSON document: %v\n%s", err, stdout.String())
+	}
+	if !doc.OK || doc.Command != "describe" {
+		t.Fatalf("unexpected envelope: %s", stdout.String())
+	}
+	if doc.Tool.Name != "tools___search_aws" || doc.Tool.DisplayName != "search_aws" {
+		t.Fatalf("unexpected tool identity: %+v", doc.Tool)
+	}
+	if len(doc.Tool.InputSchema.Required) != 1 || doc.Tool.InputSchema.Required[0] != "query" {
+		t.Fatalf("the schema should arrive verbatim, got %+v", doc.Tool.InputSchema)
+	}
+	// Without --output it is still the indented text a person reads.
+	stdout.Reset()
+	if code := a.run([]string{"--non-interactive", "describe", "search_aws"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Arguments:") {
+		t.Fatalf("the default describe should stay human, got: %s", stdout.String())
+	}
+}
+
+// Every command answers in the selected format. A command that stayed silent in
+// a machine format would leave the caller unable to tell success from a command
+// that does not exist.
+//
+// `want` checks a field only that command's document carries, so a command whose
+// body was gutted down to ok/command still fails here.
+func TestEveryCommandAnswersInTheSelectedMachineFormat(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want func(*testing.T, map[string]any)
+	}{
+		{name: "version", args: []string{"version"}, want: func(t *testing.T, doc map[string]any) {
+			if doc["version"] == "" || doc["version"] == nil {
+				t.Fatalf("version document should carry the version: %v", doc)
+			}
+		}},
+		{name: "sync", args: []string{"sync"}, want: func(t *testing.T, doc map[string]any) {
+			if doc["count"] != float64(1) || doc["tools_path"] == nil {
+				t.Fatalf("sync document should carry the catalog size and path: %v", doc)
+			}
+		}},
+		{name: "doctor", args: []string{"doctor"}, want: func(t *testing.T, doc map[string]any) {
+			if doc["checks"] == nil || doc["mode"] == nil {
+				t.Fatalf("doctor document should carry checks and mode: %v", doc)
+			}
+			// exit_code, for the reason the failure document carries it — doctor is
+			// the command most often piped into jq.
+			if doc["exit_code"] != float64(0) {
+				t.Fatalf("a passing doctor should report exit_code 0: %v", doc)
+			}
+		}},
+		{name: "list", args: []string{"list"}, want: func(t *testing.T, doc map[string]any) {
+			if doc["count"] != float64(1) {
+				t.Fatalf("list document should carry a count: %v", doc)
+			}
+		}},
+		{name: "describe", args: []string{"describe", "search_aws"}, want: func(t *testing.T, doc map[string]any) {
+			tool, _ := doc["tool"].(map[string]any)
+			if tool == nil || tool["input_schema"] == nil {
+				t.Fatalf("describe document should carry the schema: %v", doc)
+			}
+		}},
+		{name: "call", args: []string{"search_aws"}, want: func(t *testing.T, doc map[string]any) {
+			if doc["tool"] != "tools___search_aws" || doc["result_bytes"] == nil {
+				t.Fatalf("call document should identify the tool and its size: %v", doc)
+			}
+		}},
+		{name: "install", args: []string{"install", "claude-code"}, want: func(t *testing.T, doc map[string]any) {
+			if doc["scope"] != "user" {
+				t.Fatalf("install document should carry the scope: %v", doc)
+			}
+			files, _ := doc["files"].([]any)
+			if len(files) == 0 {
+				t.Fatalf("install document should list the files it wrote: %v", doc)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A directory of its own: `sync` refreshes project-scope instruction
+			// files in the working directory, and the package directory is where the
+			// test binary runs. Adding a CLAUDE.md there would otherwise make this
+			// test rewrite a tracked file.
+			t.Chdir(t.TempDir())
+			var stdout, stderr bytes.Buffer
+			a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+			args := append([]string{"--non-interactive", "--format", "json"}, tc.args...)
+			if code := a.run(args); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			var doc map[string]any
+			if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+				t.Fatalf("stdout is not a single JSON document: %v\n%s", err, stdout.String())
+			}
+			if doc["ok"] != true || doc["command"] != tc.name {
+				t.Fatalf("expected an ok %q document, got: %s", tc.name, stdout.String())
+			}
+			tc.want(t, doc)
+			if stderr.Len() != 0 {
+				t.Fatalf("a machine format must leave stderr empty, got: %s", stderr.String())
+			}
+		})
+	}
+}
+
+// init reports its own document and exactly one: it calls the sync path, which
+// has a document of its own to emit and must not.
+func TestInitAnswersWithOneDocumentAndASanitizedURL(t *testing.T) {
+	t.Chdir(t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("BMCP_HOME", filepath.Join(home, ".bmcp"))
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now,
+		httpClient:  &fakeMCP{tools: []tool{{Name: "tools___search_aws", Description: "Search."}}},
+		credentials: staticCreds(),
+		// Interactive, to pin that a machine format declines to prompt rather than
+		// blocking on a question the caller cannot see.
+		interactive: func() bool { return true },
+	}
+	if code := a.run([]string{"--format", "json", "init", "--url", "https://user:secret@example.invalid/mcp"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	var doc struct {
+		OK         bool   `json:"ok"`
+		Command    string `json:"command"`
+		ConfigPath string `json:"config_path"`
+		URL        string `json:"url"`
+	}
+	// Two documents — init's and the sync it triggers — fail this parse.
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("stdout should be exactly one document: %v\n%s", err, stdout.String())
+	}
+	if !doc.OK || doc.Command != "init" || doc.ConfigPath == "" {
+		t.Fatalf("unexpected document: %s", stdout.String())
+	}
+	if strings.Contains(doc.URL, "secret") {
+		t.Fatalf("the URL must be sanitized before it reaches the document: %q", doc.URL)
+	}
+}
+
+// The schema-change refusal is the one failure carrying structured detail, and
+// the shape #40 will extend with retryability.
+func TestSchemaChangeRefusalIsAStructuredFailureDocument(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	// A stale cache holding the old schema, against a server serving a new one:
+	// the call syncs, sees the hash move, and refuses rather than calling with
+	// arguments the agent chose from the schema it read.
+	old := []tool{{
+		Name: "tools___search_aws", Description: "Search.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+	}}
+	old[0].SchemaHash = schemaHash(old[0].InputSchema)
+	if err := writeCache(filepath.Join(borisHome, "tools.json"), &toolCache{
+		Version: 1, URL: "http://localhost:8787/mcp", Tools: old,
+		LastSync: time.Now().Add(-defaultTTL - time.Hour),
+	}); err != nil {
+		t.Fatalf("writeCache: %v", err)
+	}
+	fresh := []tool{{
+		Name: "tools___search_aws", Description: "Search.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"cypher":{"type":"string"}}}`),
+	}}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now,
+		httpClient:  &fakeMCP{tools: fresh, callResult: []byte(`{"content":[{"type":"text","text":"{}"}]}`)},
+		credentials: staticCreds(),
+	}
+	// The `call` form, not `bmcp <tool>`: cmdDynamic resolves the name against the
+	// catalog first and syncs while doing it, so by the time runCall compares
+	// LastSync the advance has already been consumed and the guard cannot fire.
+	// That is #17, which this test deliberately does not try to fix — it pins the
+	// shape of the refusal on the path that still reaches it.
+	if code := a.run([]string{"--non-interactive", "--format", "json", "call", "search_aws", "{}"}); code != exitSync {
+		t.Fatalf("exit code %d, stdout: %s stderr: %s", code, stdout.String(), stderr.String())
+	}
+	var doc struct {
+		OK       bool                `json:"ok"`
+		Command  string              `json:"command"`
+		Error    string              `json:"error"`
+		ExitCode int                 `json:"exit_code"`
+		Tool     string              `json:"tool"`
+		Changes  []map[string]string `json:"changes"`
+	}
+	if err := json.Unmarshal(stderr.Bytes(), &doc); err != nil {
+		t.Fatalf("stderr is not a single JSON document: %v\n%s", err, stderr.String())
+	}
+	if doc.OK || doc.Error != "tool_schema_changed" || doc.ExitCode != exitSync {
+		t.Fatalf("unexpected error document: %+v", doc)
+	}
+	if doc.Tool != "tools___search_aws" || len(doc.Changes) == 0 {
+		t.Fatalf("the refusal should name the tool and what changed: %s", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("the tool was not called, so stdout must be empty: %q", stdout.String())
+	}
+}
+
+// A failure document is one line in both machine formats — the one place the
+// output does not follow --output. --json used to mean errors and nothing else,
+// so every pre-existing --json caller is an error-document caller, and indenting
+// under --output json would break `tail -1` and `read -r line` for all of them.
+func TestFailureDocumentsAreAlwaysOneLine(t *testing.T) {
+	for _, format := range []string{"json", "ndjson"} {
+		t.Run(format, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+			if code := a.run([]string{"--format", format, "search_aws", "--nonsense", "x"}); code != exitValidation {
+				t.Fatalf("exit code %d", code)
+			}
+			// The message itself is multi-line; it has to survive as one JSON string.
+			if lines := strings.Count(strings.TrimSuffix(stderr.String(), "\n"), "\n"); lines != 0 {
+				t.Fatalf("a failure document must be one line, got %d newlines:\n%s", lines, stderr.String())
+			}
+			var doc struct {
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(stderr.Bytes(), &doc); err != nil {
+				t.Fatalf("unmarshal: %v\n%s", err, stderr.String())
+			}
+			if !strings.Contains(doc.Message, "\n") {
+				t.Fatalf("the multi-line message should survive into the JSON string: %q", doc.Message)
+			}
+		})
+	}
+}
+
+// The failure document names the command even when the failure happens before
+// dispatch, and reports whichever exit code bmcp is about to exit with.
+func TestFailureDocumentsNameTheCommandAndCodeBeforeDispatch(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		wantCmd  string
+		wantErr  string
+		wantCode int
+	}{
+		{name: "unknown flag", args: []string{"--format", "json", "list", "--bogus"},
+			wantCmd: "list", wantErr: "invalid_flags", wantCode: exitGeneric},
+		{name: "bad max-bytes", args: []string{"--format", "json", "list", "--max-bytes", "0"},
+			wantCmd: "list", wantErr: "invalid_max_bytes", wantCode: exitValidation},
+		{name: "usage", args: []string{"--format", "json", "describe"},
+			wantCmd: "describe", wantErr: "usage", wantCode: exitValidation},
+		// Globally positioned, which is the ordering the docs give for --max-bytes —
+		// so the command has to be named before the global flags are validated, or
+		// the document that reports the bad value cannot say where it happened.
+		{name: "global max-bytes on a tool call", args: []string{"--format", "json", "--max-bytes", "0", "search_aws"},
+			wantCmd: "call", wantErr: "invalid_max_bytes", wantCode: exitValidation},
+		{name: "global max-bytes on a command", args: []string{"--format", "json", "--max-bytes", "0", "list"},
+			wantCmd: "list", wantErr: "invalid_max_bytes", wantCode: exitValidation},
+		// No command at all. A bare machine-format invocation is an unfinished
+		// command line, not a request for help, so it fails rather than writing
+		// usage prose into a parser.
+		{name: "no command", args: []string{"--format", "json"},
+			wantCmd: "", wantErr: "usage", wantCode: exitValidation},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+			if code := a.run(tc.args); code != tc.wantCode {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			var doc struct {
+				OK       bool   `json:"ok"`
+				Command  string `json:"command"`
+				Error    string `json:"error"`
+				ExitCode int    `json:"exit_code"`
+			}
+			if err := json.Unmarshal(stderr.Bytes(), &doc); err != nil {
+				t.Fatalf("stderr is not a single JSON document: %v\n%s", err, stderr.String())
+			}
+			if doc.OK || doc.Error != tc.wantErr || doc.ExitCode != tc.wantCode {
+				t.Fatalf("unexpected error document: %+v", doc)
+			}
+			if doc.Command != tc.wantCmd {
+				t.Fatalf("expected command %q, got %q", tc.wantCmd, doc.Command)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("a failure must not write to stdout, got %q", stdout.String())
+			}
+		})
+	}
+}
+
+// A format named anywhere on the line is the format the failure is reported in.
+// parseFlags used to return on the first unknown flag, so `bmcp list --bogus
+// --output json` failed as prose while `bmcp list --output json --bogus` failed
+// as a document — the same invocation answering differently on flag order alone.
+func TestFailureFormatDoesNotDependOnFlagOrder(t *testing.T) {
+	for _, args := range [][]string{
+		{"list", "--bogus", "--format", "json"},
+		{"list", "--format", "json", "--bogus"},
+		{"--bogus", "--format", "json", "list"},
+		{"--format", "json", "--bogus", "list"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+			if code := a.run(append([]string{"--non-interactive"}, args...)); code != exitGeneric {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			var doc struct {
+				OK      bool   `json:"ok"`
+				Error   string `json:"error"`
+				Message string `json:"message"`
+			}
+			if err := json.Unmarshal(stderr.Bytes(), &doc); err != nil {
+				t.Fatalf("stderr should be a document whatever the flag order: %v\n%s", err, stderr.String())
+			}
+			// The first error is the one reported, not whichever the scan ended on.
+			if doc.OK || doc.Error != "invalid_flags" || !strings.Contains(doc.Message, "--bogus") {
+				t.Fatalf("unexpected error document: %+v", doc)
+			}
+		})
+	}
+}
+
+// A caller who has not successfully named a machine format is not owed one. The
+// fallback used to be ndjson, so a typo in --output was answered with a JSON
+// document instead of the sentence explaining the typo.
+func TestRejectedOutputValueIsReportedInProse(t *testing.T) {
+	for _, args := range [][]string{
+		{"list", "--output", "huamn"},
+		{"--output=", "list"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+			if code := a.run(append([]string{"--non-interactive"}, args...)); code != exitValidation {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if strings.HasPrefix(strings.TrimSpace(stderr.String()), "{") {
+				t.Fatalf("a bad --output must not be reported as a document: %s", stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "Supported values") {
+				t.Fatalf("stderr should list the accepted values, got: %s", stderr.String())
+			}
+		})
+	}
+}
+
+// The compatibility boundary, stated as the outputs a caller on an older release
+// already parses. Installed binaries self-update, so every one of these reaches
+// every machine automatically on its next `bmcp doctor` — none of them may move.
+func TestLegacyFlagsKeepTheirExactOutput(t *testing.T) {
+	t.Run("json leaves a tool call payload bare", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		a := callApp(t, `{"content":[{"type":"text","text":"{\"hits\":1}"}]}`, &stdout, &stderr)
+		if code := a.run([]string{"--json", "search_aws"}); code != 0 {
+			t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+		}
+		// The payload itself, not an envelope around it. `jq .hits` still works.
+		if stdout.String() != "{\"hits\":1}\n" {
+			t.Fatalf("--json must not envelope a successful call, got %q", stdout.String())
+		}
+	})
+	t.Run("json error shape gains no fields", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+		if code := a.run([]string{"--json", "search_aws", "--nonsense", "x"}); code != exitValidation {
+			t.Fatalf("exit code %d", code)
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(stderr.Bytes(), &doc); err != nil {
+			t.Fatalf("unmarshal: %v\n%s", err, stderr.String())
+		}
+		// Exactly the three keys --json has always emitted. `command` and
+		// `exit_code` belong to the contract document and must not leak here: a
+		// consumer asserting on the key set would break on its next auto-update.
+		if len(doc) != 3 || doc["ok"] != false || doc["error"] == nil || doc["message"] == nil {
+			t.Fatalf("the legacy error shape must not gain fields: %v", doc)
+		}
+	})
+	t.Run("output json on list is still ndjson", func(t *testing.T) {
+		var plain, aliased, stderr bytes.Buffer
+		a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &plain, &stderr)
+		if code := a.run([]string{"--non-interactive", "list"}); code != 0 {
+			t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+		}
+		a.stdout = &aliased
+		if code := a.run([]string{"--non-interactive", "list", "--output", "json"}); code != 0 {
+			t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+		}
+		if aliased.String() != plain.String() {
+			t.Fatalf("--output json is still an alias for ndjson:\n got: %q\nwant: %q", aliased.String(), plain.String())
+		}
+	})
+	t.Run("doctor json report gains no fields", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+		if code := a.run([]string{"--non-interactive", "doctor", "--json"}); code != 0 {
+			t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+		}
+		var doc map[string]any
+		if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+			t.Fatalf("unmarshal: %v\n%s", err, stdout.String())
+		}
+		for _, key := range []string{"command", "exit_code"} {
+			if _, present := doc[key]; present {
+				t.Fatalf("the legacy doctor report must not gain %q: %v", key, doc)
+			}
+		}
+		if doc["ok"] == nil || doc["checks"] == nil || doc["mode"] == nil {
+			t.Fatalf("the legacy doctor report lost a field: %v", doc)
+		}
+	})
+	t.Run("schema change refusal keeps its own json shape", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+		old := []tool{{
+			Name: "tools___search_aws", Description: "Search.",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+		}}
+		old[0].SchemaHash = schemaHash(old[0].InputSchema)
+		if err := writeCache(filepath.Join(borisHome, "tools.json"), &toolCache{
+			Version: 1, URL: "http://localhost:8787/mcp", Tools: old,
+			LastSync: time.Now().Add(-defaultTTL - time.Hour),
+		}); err != nil {
+			t.Fatalf("writeCache: %v", err)
+		}
+		var stdout, stderr bytes.Buffer
+		a := &app{
+			stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now,
+			httpClient: &fakeMCP{tools: []tool{{
+				Name: "tools___search_aws", Description: "Search.",
+				InputSchema: json.RawMessage(`{"type":"object","properties":{"cypher":{"type":"string"}}}`),
+			}}, callResult: []byte(`{"content":[{"type":"text","text":"{}"}]}`)},
+			credentials: staticCreds(),
+		}
+		if code := a.run([]string{"--non-interactive", "--json", "call", "search_aws", "{}"}); code != exitSync {
+			t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+		}
+		// The last line, because in legacy mode "Syncing tools..." shares stderr with
+		// the document — which is the plumbing the contract exists to remove, and
+		// which stays exactly as it was for a caller that has not opted in.
+		lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(lines[len(lines)-1]), &doc); err != nil {
+			t.Fatalf("unmarshal: %v\n%s", err, stderr.String())
+		}
+		// tool and changes, and no message — the shape this one failure has always
+		// had under --json, which is not the shape fail() produces.
+		if doc["error"] != "tool_schema_changed" || doc["tool"] == nil || doc["changes"] == nil {
+			t.Fatalf("the legacy refusal shape changed: %v", doc)
+		}
+	})
+}
+
+// --format human is a selection too. It asks for prose, so the legacy --json
+// must not answer with its JSON report — "machine format" alone does not cover
+// this, since human is not one.
+func TestFormatHumanSupersedesLegacyJSON(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+	if code := a.run([]string{"--non-interactive", "--json", "--format", "human", "doctor"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if strings.Contains(stdout.String(), `"checks"`) {
+		t.Fatalf("--format human must suppress the legacy JSON report, got: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "config") {
+		t.Fatalf("expected human check rows, got: %s", stdout.String())
+	}
+	// And a failure under --format human is prose, not the legacy error document.
+	stdout.Reset()
+	stderr.Reset()
+	if code := a.run([]string{"--non-interactive", "--json", "--format", "human", "describe"}); code != exitValidation {
+		t.Fatalf("exit code %d", code)
+	}
+	if strings.HasPrefix(strings.TrimSpace(stderr.String()), "{") {
+		t.Fatalf("--format human must render failures as prose, got: %s", stderr.String())
+	}
+}
+
+// The legacy doctor report is frozen down to its bytes, not just its key set.
+// It has always been HTML-escaped, because it was marshalled with
+// json.MarshalIndent; encodeMachineDoc turns escaping off, so routing the legacy
+// path through it would have changed the output of any machine whose config path
+// or URL contains &, < or >.
+func TestLegacyDoctorReportKeepsItsHTMLEscaping(t *testing.T) {
+	home := t.TempDir()
+	// A directory the escaping is observable in. The config path goes into the
+	// report verbatim.
+	borisHome := filepath.Join(home, "a&b")
+	t.Setenv("HOME", home)
+	t.Setenv("BMCP_HOME", borisHome)
+	if err := os.MkdirAll(borisHome, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(borisHome, "config.toml"), []byte("url = \"http://localhost:8787/mcp\"\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("BMCP_AUTO_UPDATE", "0")
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	a.run([]string{"--non-interactive", "doctor", "--json"})
+	if !strings.Contains(stdout.String(), `a\u0026b`) {
+		t.Fatalf("the legacy report must stay HTML-escaped, got: %s", stdout.String())
+	}
+	// The contract report is the one that turns escaping off, so grepping raw
+	// output for what a tool actually said works there.
+	stdout.Reset()
+	a.run([]string{"--non-interactive", "doctor", "--format", "json"})
+	if !strings.Contains(stdout.String(), "a&b") {
+		t.Fatalf("the contract report should not escape, got: %s", stdout.String())
+	}
+}
+
+// The self-update path has always been silent under the legacy --json: every one
+// of those sites sat behind `if !flags.jsonOut`. Routing them through prose()
+// alone would have started showing update notices to every `doctor --json`
+// caller on their next automatic update.
+func TestLegacyJSONStillSilencesUpdateProse(t *testing.T) {
+	var stderr bytes.Buffer
+	a := &app{stdout: &bytes.Buffer{}, stderr: &stderr, now: time.Now}
+	st := &updateState{Current: "1.0.0", Target: "2.0.0", Available: true, Action: "bmcp update"}
+	a.nudge(globalFlags{jsonOut: true}, st)
+	a.warnUpdate(globalFlags{jsonOut: true}, "Could not update bmcp automatically: %v", errors.New("boom"))
+	if stderr.Len() != 0 {
+		t.Fatalf("--json must silence the update path, got: %s", stderr.String())
+	}
+	// Recorded even so, because a --format document has a field to carry it.
+	if len(a.warnings) != 1 {
+		t.Fatalf("the warning should still be recorded for a machine document, got %v", a.warnings)
+	}
+	// Without --json it is prose, as it always was.
+	stderr.Reset()
+	a.nudge(globalFlags{}, st)
+	if !strings.Contains(stderr.String(), "bmcp 2.0.0 is available") {
+		t.Fatalf("a plain invocation should still be nudged, got: %s", stderr.String())
+	}
+}
+
+// A --format anywhere the parser would legitimately have looked decides how a
+// failure is reported, even one raised before the parser got there — parsing
+// stops at the first unknown flag, which is what every legacy caller sees and
+// must keep seeing.
+func TestFormatIsFoundWhereverItSitsOnTheLine(t *testing.T) {
+	for _, tc := range []struct {
+		args     []string
+		document bool
+	}{
+		{args: []string{"list", "--format", "json", "--bogus"}, document: true},
+		{args: []string{"list", "--bogus", "--format", "json"}, document: true},
+		{args: []string{"--bogus", "list", "--format", "json"}, document: true},
+		{args: []string{"--format", "json", "--bogus", "list"}, document: true},
+		{args: []string{"--format=json", "--bogus", "list"}, document: true},
+		{args: []string{"--max-bytes", "0", "list", "--format", "json"}, document: true},
+		// Legacy, and it must stay prose: continuing the scan past the unknown flag
+		// is what would have turned this into a document.
+		{args: []string{"list", "--bogus", "--json"}, document: false},
+		{args: []string{"list", "--bogus"}, document: false},
+		// An invalid --format selects nothing, so the complaint about it is prose.
+		{args: []string{"list", "--bogus", "--format", "bogus"}, document: false},
+		// After a tool name everything belongs to the tool, so the scan stops there.
+		{args: []string{"--bogus", "search_aws", "--format", "json"}, document: false},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+			if code := a.run(append([]string{"--non-interactive"}, tc.args...)); code == 0 {
+				t.Fatalf("expected a failure, stderr: %s", stderr.String())
+			}
+			isDoc := strings.HasPrefix(strings.TrimSpace(stderr.String()), "{")
+			if isDoc != tc.document {
+				t.Fatalf("expected document=%v, got stderr: %s", tc.document, stderr.String())
+			}
+		})
+	}
+}
+
+// --format supersedes the legacy flags wherever both are given, and neither
+// legacy flag selects a format on its own. That is the compatibility boundary:
+// a caller keeps its old output until it spells --format.
+func TestFormatSupersedesTheLegacyFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		contract bool
+	}{
+		// --json alone: legacy. describe had no machine form before --format, so
+		// prose is the correct answer here.
+		{name: "json alone stays legacy", args: []string{"--json", "describe", "search_aws"}, contract: false},
+		// --output alone: legacy, and describe never read it at all.
+		{name: "output alone stays legacy", args: []string{"--output", "json", "describe", "search_aws"}, contract: false},
+		// --format wins whichever side it is written on.
+		{name: "format after json", args: []string{"--json", "--format", "json", "describe", "search_aws"}, contract: true},
+		{name: "format before json", args: []string{"--format", "json", "--json", "describe", "search_aws"}, contract: true},
+		{name: "format beats output", args: []string{"--output", "human", "--format", "json", "describe", "search_aws"}, contract: true},
+		{name: "format beats output reversed", args: []string{"--format", "json", "--output", "human", "describe", "search_aws"}, contract: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+			if code := a.run(append([]string{"--non-interactive"}, tc.args...)); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			var doc struct {
+				Command string `json:"command"`
+			}
+			gotContract := json.Unmarshal(stdout.Bytes(), &doc) == nil && doc.Command == "describe"
+			if gotContract != tc.contract {
+				t.Fatalf("expected contract=%v, got stdout: %s", tc.contract, stdout.String())
+			}
+		})
+	}
+}
+
+// Prose is suppressed only when the contract was selected. Every legacy caller
+// keeps the stderr it has always had, which is what makes this release safe to
+// apply unattended on a self-updating binary.
+func TestContractSuppressesProseOnlyWhenSelected(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		args  []string
+		quiet bool
+	}{
+		{name: "legacy list", args: []string{"list"}, quiet: false},
+		{name: "legacy json list", args: []string{"--json", "list"}, quiet: false},
+		{name: "legacy output json list", args: []string{"--output", "json", "list"}, quiet: false},
+		{name: "contract ndjson", args: []string{"--format", "ndjson", "list"}, quiet: true},
+		{name: "contract json", args: []string{"--format", "json", "list"}, quiet: true},
+		// --verbose puts the prose back for a human debugging a contract run, so it
+		// is the one combination that must not be merged with 2>&1.
+		{name: "contract verbose", args: []string{"--format", "ndjson", "--verbose", "list"}, quiet: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+			if code := a.run(append([]string{"--non-interactive"}, tc.args...)); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+			}
+			if quiet := stderr.Len() == 0; quiet != tc.quiet {
+				t.Fatalf("expected quiet=%v, got stderr: %q", tc.quiet, stderr.String())
+			}
+		})
+	}
+}
+
+// `bmcp <tool> --help` is the documented alias for that tool's schema, so it
+// answers with describe's document rather than prose on stdout.
+func TestToolHelpAnswersWithTheDescribeDocument(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	a := callApp(t, `{"content":[{"type":"text","text":"{}"}]}`, &stdout, &stderr)
+	if code := a.run([]string{"--format", "json", "search_aws", "--help"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	var doc struct {
+		OK      bool   `json:"ok"`
+		Command string `json:"command"`
+		Tool    struct {
+			Name        string          `json:"name"`
+			InputSchema json.RawMessage `json:"input_schema"`
+		} `json:"tool"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &doc); err != nil {
+		t.Fatalf("stdout is not a single JSON document: %v\n%s", err, stdout.String())
+	}
+	if !doc.OK || doc.Command != "describe" || doc.Tool.Name != "tools___search_aws" {
+		t.Fatalf("unexpected document: %s", stdout.String())
+	}
+	if len(doc.Tool.InputSchema) == 0 {
+		t.Fatalf("the schema is the thing being asked for: %s", stdout.String())
+	}
+	// Without a machine format it is still the indented text a person reads.
+	stdout.Reset()
+	if code := a.run([]string{"search_aws", "--help"}); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Arguments:") {
+		t.Fatalf("the default should stay human, got: %s", stdout.String())
 	}
 }
 

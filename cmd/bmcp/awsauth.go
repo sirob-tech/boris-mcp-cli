@@ -34,8 +34,14 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 	if err == nil {
 		return creds, awsCfg.Region, nil
 	}
-	if cfg.Profile != "" && !cfg.NonInteractive && looksLikeSSO(err) && isInteractive() {
-		fmt.Fprintf(a.stderr, "AWS SSO credentials for profile %s are expired or missing. Running aws sso login --profile %s\n", cfg.Profile, cfg.Profile)
+	// a.machine is the same gate cmdInit and requireConfig apply: a machine format
+	// is never interactive. Without it, `bmcp --format json <tool>` on a terminal
+	// would block on a browser login it has promised not to ask for, and the login
+	// subprocess would write its own prose straight to the inherited stderr —
+	// which is the one thing a machine format guarantees will not happen. Refusing
+	// here falls through to the actionable "run aws sso login" error below.
+	if cfg.Profile != "" && !cfg.NonInteractive && !a.machine && looksLikeSSO(err) && isInteractive() {
+		fmt.Fprintf(a.prose(), "AWS SSO credentials for profile %s are expired or missing. Running aws sso login --profile %s\n", cfg.Profile, cfg.Profile)
 		cmd := exec.CommandContext(ctx, "aws", "sso", "login", "--profile", cfg.Profile)
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stderr, os.Stderr
 		if runErr := cmd.Run(); runErr != nil {

@@ -144,6 +144,26 @@ func commandsWithPrefix(name string) []string {
 
 func (a *app) run(args []string) int {
 	flags, rest, err := parseGlobalFlags(args)
+	// Before the error check and before validation: parsing stops at the first
+	// unknown flag, so a --format later on the line was never seen, and the
+	// failure would otherwise be rendered in whichever format the mistake's
+	// position happened to leave selected. See formatForReport.
+	if !flags.formatSet {
+		if f := formatForReport(args); f != "" {
+			flags.format, flags.formatSet = f, true
+		}
+	}
+	// Named before the global flags are validated, so that a failure raised there —
+	// a bad --output, a bad --max-bytes, both of which the documented ordering puts
+	// ahead of the command — still says which command it happened in. An
+	// unrecognised name is a tool call, which is what dispatch will decide below.
+	if len(rest) > 0 {
+		if c, known := lookupCommand(rest[0]); known {
+			flags.command = c.names[0]
+		} else {
+			flags.command = "call"
+		}
+	}
 	if err != nil {
 		return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 	}
@@ -151,8 +171,8 @@ func (a *app) run(args []string) int {
 	// error to exitGeneric, and an unsupported --output is a usage error. Checked
 	// before the bare-usage path too, so a bad value never exits 0. rawArgs
 	// commands still receive their own arguments unparsed, by design.
-	if flags.output, err = normalizeOutputFormat(flags.output); err != nil {
-		return a.fail(flags, exitValidation, "invalid_output", err.Error())
+	if code, ok := a.validateOutputFlags(&flags); !ok {
+		return code
 	}
 	// Checked after --output on purpose, so `bmcp --output bogus --help` still
 	// reports the bad value rather than exiting 0 on the usage path.
@@ -172,6 +192,14 @@ func (a *app) run(args []string) int {
 		return a.cmdVersion(flags, nil)
 	}
 	if len(rest) == 0 {
+		// A machine format gets a failure document rather than usage prose. `--help`
+		// is an explicit request for the human text and keeps it in every format, but
+		// an empty command line is not a request — it is an invocation that did not
+		// finish being built, and `bmcp --format json $ARGS | jq` with an empty $ARGS
+		// otherwise exits 0 having written 2.8KB of English to the parser.
+		if flags.machine() {
+			return a.fail(flags, exitValidation, "usage", "bmcp needs a command.\nRun `bmcp --help` for the list, or `bmcp list` for the tool catalog.")
+		}
 		usage(a.stdout)
 		return 0
 	}
@@ -182,8 +210,8 @@ func (a *app) run(args []string) int {
 		if err != nil {
 			return a.fail(flags, exitGeneric, "invalid_flags", err.Error())
 		}
-		if flags.output, err = normalizeOutputFormat(flags.output); err != nil {
-			return a.fail(flags, exitValidation, "invalid_output", err.Error())
+		if code, ok := a.validateOutputFlags(&flags); !ok {
+			return code
 		}
 		// Before maybeAutoUpdate below: asking a command for help must not cost a
 		// network round trip, let alone a binary swap. There is no version check
@@ -194,12 +222,66 @@ func (a *app) run(args []string) int {
 		}
 	}
 	if known {
+		a.selectFormat(&flags)
 		if c.autoUpdate {
 			a.maybeAutoUpdate(flags)
 		}
 		return c.run(a, flags, cmdArgs)
 	}
+	// An unrecognised name is a tool call, so it answers in the format a tool call
+	// answers in — and it is the one dispatch path with no table entry to read a
+	// default from.
+	flags.command = "call"
+	a.selectFormat(&flags)
 	return a.cmdDynamic(flags, name, cmdArgs)
+}
+
+// validateOutputFlags checks the two value-taking flags that describe the output
+// rather than the work. Both are validated in run() rather than in parseFlags,
+// which maps every error it raises to exitGeneric — a bad value for either is a
+// usage error and exits 5.
+func (a *app) validateOutputFlags(flags *globalFlags) (int, bool) {
+	var err error
+	// --format first: it is the one that decides how this very report is rendered,
+	// so a bad --output alongside a good --format still answers in the contract.
+	if flags.formatSet {
+		if flags.format, err = normalizeContractFormat(flags.format); err != nil {
+			return a.fail(*flags, exitValidation, "invalid_format", err.Error()), false
+		}
+	}
+	if flags.outputSet {
+		if flags.output, err = normalizeOutputFormat(flags.output); err != nil {
+			return a.fail(*flags, exitValidation, "invalid_output", err.Error()), false
+		}
+	}
+	if flags.maxBytesSet {
+		if flags.maxBytes, err = parseMaxBytes(flags.maxBytesRaw); err != nil {
+			return a.fail(*flags, exitValidation, "invalid_max_bytes", err.Error()), false
+		}
+	}
+	return 0, true
+}
+
+// selectOutput resolves the format for the dispatched command and silences
+// progress prose whenever that format is a machine one.
+//
+// Suppressing rather than redirecting is the point: stderr was already the prose
+// channel, and agents merged it into stdout anyway to keep hold of errors. One
+// line of prose in a merged NDJSON stream is an unparseable record, which is
+// what the audit measured. --verbose puts the prose back for a human debugging a
+// machine-mode invocation.
+// There is no per-command default to resolve: --format always names a value, and
+// validateOutputFlags has already rejected any spelling that does not.
+func (a *app) selectFormat(flags *globalFlags) {
+	// No --format means no contract: every command keeps its legacy output, and
+	// nothing here is silenced. That is the whole compatibility story — a fleet of
+	// self-updating binaries sees no change until a caller opts in by spelling
+	// --format.
+	if !flags.formatSet {
+		return
+	}
+	a.machine = machineFormat(flags.format)
+	a.quiet = a.machine && !flags.verbose
 }
 
 func (a *app) cmdInit(flags globalFlags, args []string) int {
@@ -214,7 +296,10 @@ func (a *app) cmdInit(flags globalFlags, args []string) int {
 		cfg = defaultEffective(flags)
 	}
 
-	interactive := a.isInteractive() && !cfg.NonInteractive
+	// A machine format is never interactive. Asking a question through a channel
+	// this invocation has promised to keep free of prose would block on an answer
+	// to a prompt the caller cannot see.
+	interactive := a.isInteractive() && !cfg.NonInteractive && !flags.machine()
 	var reader *bufio.Reader
 	fileCfg, _ := readConfig(cfg.ConfigPath)
 	if interactive {
@@ -274,16 +359,23 @@ func (a *app) cmdInit(flags globalFlags, args []string) int {
 	if err := writeConfig(cfg.ConfigPath, fileCfg); err != nil {
 		return a.fail(flags, exitConfig, "config_write_failed", err.Error())
 	}
-	fmt.Fprintf(a.stderr, "Saved config: %s\nRun `bmcp init` again to change it.\n", cfg.ConfigPath)
+	fmt.Fprintf(a.prose(), "Saved config: %s\nRun `bmcp init` again to change it.\n", cfg.ConfigPath)
 	if oldURL != "" && oldURL != fileCfg.URL {
 		_ = os.Remove(cfg.ToolsPath)
 	}
 	refreshInstructions := !interactive
-	if code := a.cmdSyncWithRefresh(flags, refreshInstructions); code != 0 {
+	if code := a.cmdSyncWithRefresh(flags, refreshInstructions, false); code != 0 {
 		return code
 	}
 	if interactive && reader != nil {
 		a.promptInstallDetectedHarnesses(reader, flags)
+	}
+	if flags.machine() {
+		if err := encodeMachineDoc(a.stdout, flags.contract(), initDoc{
+			OK: true, Command: "init", ConfigPath: cfg.ConfigPath, URL: sanitizeURL(fileCfg.URL), Warnings: a.warnings,
+		}); err != nil {
+			return a.fail(flags, exitGeneric, "output_failed", err.Error())
+		}
 	}
 	return 0
 }
@@ -319,14 +411,26 @@ func (a *app) cmdVersion(flags globalFlags, args []string) int {
 		return a.fail(flags, exitValidation, "usage", fmt.Sprintf(
 			"bmcp version takes no arguments; got %q.\nTo update to a specific version: bmcp update --to <version>", args[0]))
 	}
-	fmt.Fprintf(a.stdout, "bmcp %s\ncommit: %s\nbuilt: %s\n", version, buildCommit, buildDate)
-	// Without this line, "bmcp broke" reports after a self-update arrive with no
-	// way to tell which version replaced which, or when.
+	// Without the update trail, "bmcp broke" reports after a self-update arrive
+	// with no way to tell which version replaced which, or when.
+	var updated *updatedFrom
 	if path, err := a.resolveExecutable(); err == nil {
 		if receipt, err := readInstallReceipt(path); err == nil && len(receipt.Updates) > 0 {
 			last := receipt.Updates[len(receipt.Updates)-1]
-			fmt.Fprintf(a.stdout, "updated: %s -> %s at %s\n", last.From, last.To, last.At)
+			updated = &updatedFrom{From: last.From, To: last.To, At: last.At}
 		}
+	}
+	if flags.machine() {
+		if err := encodeMachineDoc(a.stdout, flags.contract(), versionDoc{
+			OK: true, Command: "version", Version: version, Commit: buildCommit, Built: buildDate, Updated: updated,
+		}); err != nil {
+			return a.fail(flags, exitGeneric, "output_failed", err.Error())
+		}
+		return 0
+	}
+	fmt.Fprintf(a.stdout, "bmcp %s\ncommit: %s\nbuilt: %s\n", version, buildCommit, buildDate)
+	if updated != nil {
+		fmt.Fprintf(a.stdout, "updated: %s -> %s at %s\n", updated.From, updated.To, updated.At)
 	}
 	return 0
 }
@@ -335,10 +439,14 @@ func (a *app) cmdSync(flags globalFlags, args []string) int {
 	if len(args) != 0 {
 		return a.fail(flags, exitValidation, "usage", "usage: bmcp sync")
 	}
-	return a.cmdSyncWithRefresh(flags, true)
+	return a.cmdSyncWithRefresh(flags, true, true)
 }
 
-func (a *app) cmdSyncWithRefresh(flags globalFlags, refreshInstructions bool) int {
+// report is false when init calls this, because the contract allows a machine
+// invocation exactly one document on stdout and init emits its own. It is not a
+// synonym for refreshInstructions: init refreshes in its non-interactive form
+// and still reports as init.
+func (a *app) cmdSyncWithRefresh(flags globalFlags, refreshInstructions, report bool) int {
 	cfg, _, err := a.requireConfig(flags)
 	if err != nil {
 		return a.fail(flags, exitConfig, "not_configured", err.Error())
@@ -351,10 +459,19 @@ func (a *app) cmdSyncWithRefresh(flags globalFlags, refreshInstructions bool) in
 		}
 		return a.fail(flags, code, errorName(err), err.Error())
 	}
-	fmt.Fprintf(a.stderr, "Synced %d tools to %s\n", len(cache.Tools), cfg.ToolsPath)
+	fmt.Fprintf(a.prose(), "Synced %d tools to %s\n", len(cache.Tools), cfg.ToolsPath)
+	var instructions *refreshSummary
 	if refreshInstructions {
 		// True: a human typed `bmcp sync` in a directory they chose.
-		a.refreshInstructions(cache, true)
+		summary := a.refreshInstructions(cache, true)
+		instructions = &summary
+	}
+	if report && flags.machine() {
+		if err := encodeMachineDoc(a.stdout, flags.contract(), syncDoc{
+			OK: true, Command: "sync", Count: len(cache.Tools), ToolsPath: cfg.ToolsPath, Instructions: instructions, Warnings: a.warnings,
+		}); err != nil {
+			return a.fail(flags, exitGeneric, "output_failed", err.Error())
+		}
 	}
 	return 0
 }
@@ -372,7 +489,7 @@ type refreshSummary struct {
 // they embed matches the one this run just fetched. Every caller has already
 // synced, so the cache is the newest catalog available.
 //
-// Output goes to stderr and nothing here reaches an exit code. This runs inside
+// Output goes through a.prose() and nothing here reaches an exit code. This runs inside
 // doctor, and BORIS.md tells agents to read a failing doctor as "BORIS is
 // broken" and stop using it — an unwritable ~/.claude is not that.
 func (a *app) refreshInstructions(cache *toolCache, includeProject bool) refreshSummary {
@@ -386,7 +503,7 @@ func (a *app) refreshInstructions(cache *toolCache, includeProject bool) refresh
 				summary.Refreshed++
 			}
 		}
-		printRefreshResult(a.stderr, result)
+		printRefreshResult(a.prose(), result)
 	}
 	return summary
 }
@@ -394,9 +511,15 @@ func (a *app) refreshInstructions(cache *toolCache, includeProject bool) refresh
 // cmdList writes machine-readable records to stdout and everything else to
 // stderr: callers pipe it through head/grep, so one truncated line must still
 // be a complete, parseable record.
+//
+// ndjson stays a stream of bare records rather than becoming an enveloped
+// document, because that is the property `head` depends on and the reason the
+// format was chosen. --format json is the enveloped form, and it is the one to
+// reach for when completeness matters: it carries `count`, which a stream cut
+// short by `head` cannot report about itself.
 func (a *app) cmdList(flags globalFlags, args []string) int {
 	if len(args) != 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: bmcp list [--schemas] [--output ndjson|json|human]")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp list [--schemas] [--format human|json|ndjson]")
 	}
 	cfg, _, err := a.requireConfig(flags)
 	if err != nil {
@@ -406,12 +529,27 @@ func (a *app) cmdList(flags globalFlags, args []string) int {
 	if err != nil {
 		return a.fail(flags, exitSync, "sync_failed", err.Error())
 	}
-	if cache.LastSync.IsZero() {
-		fmt.Fprintf(a.stderr, "%d tools\n", len(cache.Tools))
-	} else {
-		fmt.Fprintf(a.stderr, "%d tools synced %s\n", len(cache.Tools), cache.LastSync.UTC().Format(time.RFC3339))
+	stamp := ""
+	if !cache.LastSync.IsZero() {
+		stamp = cache.LastSync.UTC().Format(time.RFC3339)
 	}
-	if flags.output == outputHuman {
+	if stamp == "" {
+		fmt.Fprintf(a.prose(), "%d tools\n", len(cache.Tools))
+	} else {
+		fmt.Fprintf(a.prose(), "%d tools synced %s\n", len(cache.Tools), stamp)
+	}
+	// The legacy --output when no --format was given, and the contract when one
+	// was. `list` is the only command that ever read --output, so it is the only
+	// one carrying both — and `json` still means `ndjson` on that side, because
+	// changing it there is exactly the silent break --format exists to avoid.
+	format := flags.contract()
+	if format == "" {
+		// normalizeOutputFormat already collapsed `json` to `ndjson`, so this is
+		// only ever ndjson or human.
+		format = flags.output
+	}
+	switch format {
+	case outputHuman:
 		// --schemas in the human view is `describe` for every tool, which is what
 		// the flag means in the machine view too. Rejecting the combination would
 		// be a usage papercut for the one caller — a person — least able to guess
@@ -421,7 +559,18 @@ func (a *app) cmdList(flags globalFlags, args []string) int {
 		} else {
 			err = renderToolList(a.stdout, cache.Tools)
 		}
-	} else {
+	case outputJSON:
+		// Tools is never nil, so an empty catalog is `"tools":[]` rather than
+		// `"tools":null` — a consumer ranging over it should not have to special-case
+		// the empty case that this command exits 0 on.
+		records := make([]toolRecord, 0, len(cache.Tools))
+		for _, t := range cache.Tools {
+			records = append(records, newToolRecord(t, stamp, flags.listSchemas))
+		}
+		err = encodeMachineDoc(a.stdout, format, listDoc{
+			OK: true, Command: "list", Count: len(records), LastSync: stamp, Tools: records, Warnings: a.warnings,
+		})
+	default:
 		err = writeToolRecords(a.stdout, cache.Tools, cache.LastSync, flags.listSchemas)
 	}
 	if err != nil {
@@ -446,7 +595,32 @@ func (a *app) cmdDescribe(flags globalFlags, args []string) int {
 	if err != nil {
 		return a.fail(flags, exitValidation, "tool_not_found", err.Error())
 	}
-	t.Describe(a.stdout)
+	return a.describeTool(flags, t, cache)
+}
+
+// describeTool answers "what are this tool's inputs" in the selected format.
+//
+// Shared with cmdDynamic, which answers `bmcp <tool> --help` with the same
+// document. That path used to print the human rendering whatever the format,
+// so a machine caller asking a documented question got prose on stdout and no
+// document at all.
+func (a *app) describeTool(flags globalFlags, t tool, cache *toolCache) int {
+	if !flags.machine() {
+		t.Describe(a.stdout)
+		return 0
+	}
+	stamp := ""
+	if cache != nil && !cache.LastSync.IsZero() {
+		stamp = cache.LastSync.UTC().Format(time.RFC3339)
+	}
+	// Schema always included. `describe` is the command asked when the caller is
+	// about to write a payload, so the machine form withholding the schema would
+	// leave it answering a question nobody asks it.
+	if err := encodeMachineDoc(a.stdout, flags.contract(), describeDoc{
+		OK: true, Command: "describe", Tool: newToolRecord(t, stamp, true), Warnings: a.warnings,
+	}); err != nil {
+		return a.fail(flags, exitGeneric, "output_failed", err.Error())
+	}
 	return 0
 }
 
@@ -503,7 +677,7 @@ func (a *app) runCall(flags globalFlags, name string, payload string, readStdin 
 	if err := t.Validate(input); err != nil {
 		return a.fail(flags, exitValidation, "tool_validation_failed", err.Error())
 	}
-	fmt.Fprintf(a.stderr, "Calling %s...\n", displayToolName(t.Name))
+	fmt.Fprintf(a.prose(), "Calling %s...\n", displayToolName(t.Name))
 	result, err := a.callTool(context.Background(), cfg, t.Name, input)
 	if err != nil {
 		code := exitSync
@@ -518,15 +692,39 @@ func (a *app) runCall(flags globalFlags, name string, payload string, readStdin 
 	if !flags.raw {
 		result = unwrapMCPTextEnvelope(result)
 	}
+	if flags.machine() {
+		// --pretty is not consulted here. The json document is already indented and
+		// the ndjson one must stay on one line, so honouring it could only corrupt
+		// the format the caller explicitly selected.
+		if err := encodeMachineDoc(a.stdout, flags.contract(), newCallDoc(t.Name, result, flags.maxBytes, a.warnings)); err != nil {
+			return a.fail(flags, exitGeneric, "output_failed", err.Error())
+		}
+		return 0
+	}
 	if flags.pretty {
 		var pretty bytes.Buffer
 		if json.Indent(&pretty, result, "", "  ") == nil {
 			result = pretty.Bytes()
 		}
 	}
-	a.stdout.Write(result)
+	// Truncation after --pretty, so --max-bytes caps what is actually written
+	// rather than what would have been written before reformatting.
+	full := len(result)
+	result = truncateBytes(result, flags.maxBytes)
+	// Checked, like every machine path checks encodeMachineDoc: a payload cut
+	// short by a full disk must not exit 0, which is the rule cmdList already
+	// follows for the catalog.
+	if _, err := a.stdout.Write(result); err != nil {
+		return a.fail(flags, exitGeneric, "output_failed", err.Error())
+	}
 	if len(result) == 0 || result[len(result)-1] != '\n' {
 		fmt.Fprintln(a.stdout)
+	}
+	if len(result) != full {
+		// The only signal a human format has for it. A clipped JSON payload does not
+		// parse, and this line is the difference between that and a server that
+		// returned something malformed.
+		fmt.Fprintf(a.prose(), "Truncated to %d of %d bytes by --max-bytes; the payload above is incomplete.\n", len(result), full)
 	}
 	return 0
 }
@@ -578,8 +776,7 @@ func (a *app) cmdDynamic(flags globalFlags, name string, args []string) int {
 		return a.fail(flags, exitValidation, "unknown_command", err.Error())
 	}
 	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h") {
-		t.Describe(a.stdout)
-		return 0
+		return a.describeTool(flags, t, cache)
 	}
 	input, err := t.ParseFlags(args)
 	if err != nil {
@@ -623,7 +820,9 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 	deep := false
 	add := func(name string, ok bool, msg string) {
 		checks = append(checks, map[string]any{"name": name, "ok": ok, "message": msg})
-		if flags.jsonOut {
+		// Both the contract and the legacy --json answer with a document, so neither
+		// prints the human rows.
+		if flags.machine() || flags.legacyJSON() {
 			return
 		}
 		state := "ok"
@@ -702,23 +901,49 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 	if st != nil && errors.Is(st.Err, errUpdateCorrupted) {
 		add("update", false, st.Err.Error())
 	}
-	if flags.jsonOut {
+	if flags.machine() || flags.legacyJSON() {
 		// mode says which question was answered, because the two produce different
 		// check sets and a consumer that finds no `auth` row should be able to tell
 		// "not checked" from "checked and gone".
 		payload := map[string]any{"ok": allChecksOK(checks), "checks": checks, "mode": doctorMode(deep)}
+		if flags.machine() {
+			// command and exit_code only under the contract. The legacy --json report
+			// keeps the exact key set it has always had, because every consumer of it
+			// takes the next release automatically.
+			//
+			// exit_code is here for the reason the failure document carries it: a
+			// pipeline that replaced bmcp's status with its own leaves this the only
+			// place the real one survives. Doctor is the command most often piped into
+			// jq, and the one whose report is a success document even when ok is false.
+			code := 0
+			if !allChecksOK(checks) {
+				code = exitGeneric
+			}
+			payload["command"], payload["exit_code"] = "doctor", code
+		}
 		if st != nil {
 			payload["update"] = st.updateJSON()
 		}
 		if instructions != nil {
 			payload["instructions"] = instructions
 		}
-		out, _ := json.MarshalIndent(payload, "", "  ")
-		// stdout, matching the convention cmdList follows: machine-readable output
-		// on stdout, prose on stderr. This document used to share stderr with
-		// syncTools' "Syncing tools...", so the stream was not a parseable JSON
-		// document and every consumer had to scan for the first `{`.
-		fmt.Fprintln(a.stdout, string(out))
+		// stdout, like every other success document. This one used to share stderr
+		// with syncTools' "Syncing tools...", so the stream was not a parseable JSON
+		// document and every consumer had to scan for the first `{`; under the
+		// contract prose is suppressed outright, so neither stream needs scanning.
+		//
+		if format := flags.contract(); format != "" {
+			if err := encodeMachineDoc(a.stdout, format, payload); err != nil {
+				return a.fail(flags, exitGeneric, "output_failed", err.Error())
+			}
+		} else {
+			// json.MarshalIndent, not encodeMachineDoc: the legacy report has always
+			// been HTML-escaped, and encodeMachineDoc turns that off. A config path
+			// containing & would otherwise come back with different bytes than the
+			// release before it, which is exactly what freezing this path forbids.
+			out, _ := json.MarshalIndent(payload, "", "  ")
+			fmt.Fprintln(a.stdout, string(out))
+		}
 	} else if st != nil {
 		fmt.Fprintf(a.stdout, "%-18s %s  %s\n", "version", "ok", a.updateSummary(st))
 	}
@@ -809,12 +1034,29 @@ func (a *app) cmdInstall(flags globalFlags, args []string) int {
 	if len(harnesses) == 1 && harnesses[0] == "all" {
 		harnesses = []string{"claude-code", "codex", "opencode", "cursor", "kiro"}
 	}
+	doc := installDoc{OK: true, Command: "install", Scope: scope, Harnesses: []harnessDoc{}, Files: []installedDoc{}}
 	for _, harness := range harnesses {
 		result, err := a.installHarnessWithCatalog(flags, harness, scope)
 		if err != nil {
 			return a.fail(flags, exitValidation, "install_failed", err.Error())
 		}
-		printInstallResult(a.stderr, result)
+		printInstallResult(a.prose(), result)
+		doc.Harnesses = append(doc.Harnesses, harnessDoc{Harness: result.Harness, Scope: result.Scope})
+		for _, file := range result.Files {
+			// An empty path is how installHarness reports a file it could not write.
+			// printInstallResult says so in prose and the exit code ignores it, so the
+			// machine form has to carry it or a partial install reads as a whole one.
+			doc.Files = append(doc.Files, installedDoc{
+				Harness: result.Harness, Path: file.Path, Backup: file.Backup,
+				Changed: file.Changed, Failed: file.Path == "",
+			})
+		}
+	}
+	if flags.machine() {
+		doc.Warnings = a.warnings
+		if err := encodeMachineDoc(a.stdout, flags.contract(), doc); err != nil {
+			return a.fail(flags, exitGeneric, "output_failed", err.Error())
+		}
 	}
 	return 0
 }
@@ -825,10 +1067,10 @@ func usage(w io.Writer) {
   bmcp install <claude-code|codex|opencode|cursor|kiro|all> [--scope user|project]
   bmcp sync
   bmcp doctor [--deep]
-  bmcp list|ls|tools [--schemas] [--output ndjson|json|human]
+  bmcp list|ls|tools [--schemas] [--format human|json|ndjson]
   bmcp describe|d <tool>
   bmcp call <tool> ['{"arg":"value"}']
-  bmcp <exact_tool_name> --arg value
+  bmcp [--format json] [--max-bytes <n>] <exact_tool_name> --arg value
   bmcp update [--check] [--to <version>] [--rollback]
   bmcp version
 
@@ -856,38 +1098,96 @@ Global flags:
   --profile, -p <profile>      Override AWS profile
   --region <region>            Override SigV4 region
   --service <service>          Override SigV4 service
-  --output <ndjson|json|human> Format for bmcp list (default ndjson)
-  --json                       Emit structured errors
-  --pretty                     Pretty-print successful tool JSON
+  --format <human|json|ndjson> Answer under the machine-output contract. json is
+                               one document per invocation; ndjson is one object
+                               per line (one tool record per line for list);
+                               human is prose. stdout then carries that and
+                               nothing else, progress prose is suppressed so
+                               merging the streams stays safe, and no prompt is
+                               ever shown. Without it every command keeps the
+                               output it had before this flag existed
+  --max-bytes <n>              Cap a tool result at n bytes. Under --format the
+                               document reports the full size and marks itself
+                               truncated
+  --pretty                     Pretty-print successful tool JSON. Not consulted
+                               under --format, whose json is already indented
   --raw                        Emit raw MCP tool envelopes
   --non-interactive            Disable prompts and SSO login
   --verbose                    Emit diagnostics to stderr
+
+Deprecated, superseded by --format wherever both are given:
+  --output <ndjson|json|human> Format for bmcp list only (json means ndjson)
+  --json                       Structured errors, and doctor's JSON report
 `)
 }
 
+// fail is the one failure path. Every command routes through it, so the machine
+// error shape is the same whatever went wrong and wherever it went wrong.
+//
+// stderr in every format, unlike the success documents. A shell expects errors
+// there, and nothing is gained by moving them: prose is suppressed in a machine
+// format, so a caller that merges the streams sees exactly one JSON document
+// either way and reads `ok` to tell which it got.
 func (a *app) fail(flags globalFlags, code int, name, msg string) int {
-	if flags.jsonOut {
-		out, _ := json.Marshal(map[string]any{"ok": false, "error": name, "message": msg})
+	return a.failDoc(flags, code, errorDoc{Command: flags.command, Error: name, Message: msg, ExitCode: code}, msg, nil)
+}
+
+// failDoc reports a failure carrying more than a message. prose is what the
+// human format prints; doc is what the machine formats emit.
+//
+// Three renderings, because there are three callers to keep faith with. Under
+// the contract it is the full document; under the legacy --json it is the shape
+// that flag has always produced, unchanged to the byte; otherwise it is prose.
+func (a *app) failDoc(flags globalFlags, code int, doc errorDoc, prose string, legacy map[string]any) int {
+	switch {
+	case flags.machine():
+		// One line, whichever machine format was selected — the only place the
+		// contract does not follow --format. A failure document is a thing to log
+		// and grep, so `tail -1`, `read -r line` and `grep '^{'` all have to keep
+		// working on it.
+		if err := encodeMachineDoc(a.stderr, outputNDJSON, doc); err != nil {
+			// Nothing left to report it with — the error channel is the thing that
+			// failed. The exit code still carries the original failure.
+			fmt.Fprintln(a.stderr, prose)
+		}
+	case flags.legacyJSON():
+		// The legacy shape, deliberately not the new one: no command, no exit_code.
+		// Anything added here would reach every existing --json caller on their next
+		// automatic update, which is the whole reason the contract got a flag of its
+		// own. legacy carries the one failure that always had a shape of its own.
+		if legacy == nil {
+			legacy = map[string]any{"ok": false, "error": doc.Error, "message": doc.Message}
+		}
+		out, _ := json.Marshal(legacy)
 		fmt.Fprintln(a.stderr, string(out))
-	} else {
-		fmt.Fprintln(a.stderr, msg)
+	default:
+		fmt.Fprintln(a.stderr, prose)
 	}
 	return code
 }
 
 func (a *app) failSchemaChanged(flags globalFlags, oldTool, newTool tool) int {
 	changes := oldTool.Diff(newTool)
-	if flags.jsonOut {
-		out, _ := json.Marshal(map[string]any{"ok": false, "error": "tool_schema_changed", "tool": newTool.Name, "changes": changes})
-		fmt.Fprintln(a.stderr, string(out))
-	} else {
-		fmt.Fprintf(a.stderr, "Tool schema changed: %s\n", newTool.Name)
-		for _, c := range changes {
-			fmt.Fprintf(a.stderr, "- %s\n", c["message"])
-		}
-		fmt.Fprintln(a.stderr, "\nThe tool was not called. Retry with the updated arguments.")
+	var prose strings.Builder
+	fmt.Fprintf(&prose, "Tool schema changed: %s\n", newTool.Name)
+	for _, c := range changes {
+		fmt.Fprintf(&prose, "- %s\n", c["message"])
 	}
-	return exitSync
+	prose.WriteString("\nThe tool was not called. Retry with the updated arguments.")
+	return a.failDoc(flags, exitSync, errorDoc{
+		Command: flags.command,
+		Error:   "tool_schema_changed",
+		Message: prose.String(),
+		// exitSync rather than the code the caller would infer: the refusal is a
+		// catalog-state failure, and a caller that lost the exit status through a
+		// pipeline reads it from here.
+		ExitCode: exitSync,
+		Tool:     newTool.Name,
+		Changes:  changes,
+	}, prose.String(), map[string]any{
+		// Byte-for-byte what --json produced before the contract existed.
+		"ok": false, "error": "tool_schema_changed", "tool": newTool.Name, "changes": changes,
+	})
 }
 
 func shouldReadPayloadFromStdin(r io.Reader) bool {
