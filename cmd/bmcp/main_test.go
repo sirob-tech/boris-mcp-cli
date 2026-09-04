@@ -320,8 +320,9 @@ func TestMCPProtocolVersionHeaderAlwaysSet(t *testing.T) {
 	}
 }
 
-// Agents pipe `bmcp list` through head/grep, so stdout must carry nothing but
-// one self-contained record per tool.
+// stdout is a line-oriented stream, so it must carry nothing but one
+// self-contained record per tool: `grep` and `while read -r line` see whole
+// records, and a consumer can parse them as they arrive.
 func TestListEmitsOneNDJSONRecordPerTool(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -3437,8 +3438,9 @@ func TestHelpStaysProseUnderTheContract(t *testing.T) {
 	}
 }
 
-// --max-bytes is what replaces piping the result through `head -c`, which cuts
-// the payload without leaving anything in the output that says so.
+// --max-bytes is the only sanctioned way to shorten a result, and what earns it
+// that is the marker: `truncated` set, and the full `result_bytes` reported, so
+// a clipped answer never reads as a complete one.
 func TestMaxBytesMarksATruncatedResultInsteadOfSilentlyClippingIt(t *testing.T) {
 	payload := `{"items":["aaaaaaaaaa","bbbbbbbbbb","cccccccccc"]}`
 	var stdout, stderr bytes.Buffer
@@ -4782,6 +4784,8 @@ func TestUnwrapMCPTextEnvelopeFallsBackToRaw(t *testing.T) {
 	}
 }
 
+// jq is not a bmcp dependency and may not be installed on the machine reading
+// these instructions, so the template must never route an agent through it.
 func TestGeneratedInstructionsDoNotDependOnJQ(t *testing.T) {
 	cache := &toolCache{LastSync: time.Now(), Tools: []tool{{Name: "tools___search_aws", Description: "Find infrastructure context."}}}
 	got := borisInstructionsMarkdown(cache)
@@ -4799,6 +4803,30 @@ func TestGeneratedInstructionsDoNotDependOnJQ(t *testing.T) {
 	}
 	if !strings.Contains(got, "`bmcp --raw <tool> ...`") {
 		t.Fatalf("instructions should mention raw debugging mode: %s", got)
+	}
+}
+
+// The change everything else here rests on: 71% of observed bmcp invocations
+// were piped into head/tail, and the cut leaves no marker, so a partial answer
+// reads exactly like a complete one. The instructions must state the
+// prohibition outright and keep pointing at the two in-band completeness
+// checks, `count` and `has_more`. Asserted positively on the shortest
+// distinctive phrases: a !Contains check on the phrasings this replaced would
+// be self-nullifying, since the same commit deleted them.
+func TestGeneratedInstructionsForbidShorteningOutput(t *testing.T) {
+	cache := &toolCache{LastSync: time.Now(), Tools: []tool{{Name: "tools___search_aws", Description: "Find infrastructure context."}}}
+	got := borisInstructionsMarkdown(cache)
+	for _, want := range []string{
+		"**Never shorten `bmcp` output to a fixed number of lines, bytes, or records.**",
+		"leaves no marker",
+		"`bmcp --max-bytes <n>`",
+		"`truncated`",
+		"`has_more`",
+		"`count`",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("instructions should carry %q: %s", want, got)
+		}
 	}
 }
 

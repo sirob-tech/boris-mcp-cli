@@ -787,11 +787,13 @@ bmcp doctor
 
 This is a local check: while the cached tool catalog is fresh it authenticates nothing and reaches no BORIS server, so it is cheap enough to run every session. (It may still contact GitHub for its own update check, at most once a day.) If it fails on config, tell the user to run ` + "`bmcp init`" + `.
 
+**Never shorten ` + "`bmcp`" + ` output to a fixed number of lines, bytes, or records.** The cut leaves no marker, so a partial answer looks exactly like a complete one. If a result is too large: filter by scope (account, region, namespace, selector) first, then ` + "`bmcp --max-bytes <n>`" + `, the one cut that marks what it dropped — and a count cap like ` + "`max_results`" + ` only last, because that one may leave no marker at all. A result is not complete if ` + "`truncated`" + ` or ` + "`has_more`" + ` is set, or a count cap applied — yours, or the tool's own default.
+
 If a tool call later fails on authentication or connectivity, run ` + "`bmcp doctor --deep`" + `, which checks credentials, the server and the live catalog for real, and says which of them is at fault. The BORIS MCP server requires AWS credentials for any account in the AWS Organization; if auth is unavailable, use the normal environment credential workflow available in this harness or explain the credential requirement to the user.
 
 Useful commands:
 
-- ` + "`bmcp list`" + `: list remote tools as NDJSON, one object per line: ` + "`name`" + ` (full name, always callable), ` + "`display_name`" + `, ` + "`description`" + `, ` + "`last_sync`" + `. Call tools by ` + "`name`" + `. Truncating with ` + "`head`" + ` never breaks a line but does hide tools — use ` + "`bmcp list --format json`" + `, whose document carries ` + "`count`" + `, when completeness matters. Add ` + "`--format human`" + ` for indented text.
+- ` + "`bmcp list`" + `: list remote tools as NDJSON, one object per line: ` + "`name`" + ` (full name, always callable), ` + "`display_name`" + `, ` + "`description`" + `, ` + "`last_sync`" + `. Call tools by ` + "`name`" + `. Add ` + "`--format human`" + ` for indented text, or ` + "`--format json`" + ` for one document whose ` + "`count`" + ` says how many records it should hold.
 - ` + "`bmcp list --schemas`" + `: the same records with each tool's ` + "`input_schema`" + ` included. Prefer this when you intend to call a tool: it answers "which tools exist" and "how do I call them" in one local invocation, with no per-tool ` + "`describe`" + ` round trip.
 - ` + "`bmcp describe <tool>`" + `: show one tool's schema and examples as indented text.
 - ` + "`bmcp <tool> --arg value`" + `: call a tool with CLI flags.
@@ -809,7 +811,7 @@ Under ` + "`--format json`" + ` or ` + "`--format ndjson`" + ` the rules are the
 - A failure writes ` + "`{\"ok\":false,\"command\":…,\"error\":…,\"message\":…,\"exit_code\":…}`" + ` to stderr as a single line, whichever format was selected, and leaves stdout empty. Read ` + "`ok`" + ` to tell the two apart, and ` + "`exit_code`" + ` if a pipeline swallowed the real exit status.
 - Two exceptions to that failure rule. ` + "`bmcp doctor`" + ` reports failing checks in its ordinary report on stdout with ` + "`\"ok\": false`" + ` and exits 1 — it is a diagnostic, so a failing check is its answer rather than an error. And ` + "`--help`" + ` prints human text in every format; do not parse it. Adding ` + "`--verbose`" + ` also puts progress prose back on stderr, so do not combine it with ` + "`2>&1`" + `.
 - A tool call answers with ` + "`{\"ok\":true,\"tool\":…,\"result\":…,\"result_bytes\":…,\"truncated\":…}`" + `. A non-JSON payload arrives in ` + "`result_text`" + ` instead of ` + "`result`" + `.
-- ` + "`bmcp --max-bytes <n> <tool> ...`" + ` caps a large result: the document stays parseable, sets ` + "`truncated`" + `, reports the full ` + "`result_bytes`" + `, and puts the kept prefix in ` + "`result_excerpt`" + `. Prefer it to piping through ` + "`head`" + `, which cuts the payload without saying so.
+- ` + "`bmcp --max-bytes <n> <tool> ...`" + ` caps a large result: the document stays parseable, sets ` + "`truncated`" + `, reports the full ` + "`result_bytes`" + `, and puts the kept prefix in ` + "`result_excerpt`" + `. It goes before the tool name, as above.
 
 Tools available when these instructions were generated (short display names; ` + "`bmcp list`" + ` prints the full ` + "`name`" + ` for each):
 

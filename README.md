@@ -452,9 +452,9 @@ the server as an argument named `format`.
 
 `list` writes NDJSON to stdout — one JSON object per line, nothing else, and an
 empty catalog is empty stdout with exit 0. The `%d tools synced <timestamp>`
-header goes to stderr, so stdout stays parseable even when piped through `head`.
-Under `--format json` or `--format ndjson` that header is suppressed rather than
-redirected, so merging the streams is safe.
+header goes to stderr, so stdout stays parseable. Under `--format json` or
+`--format ndjson` that header is suppressed rather than redirected, so merging
+the streams is safe.
 
 ```json
 {"name":"tools___search_infrastructure_graph","display_name":"search_infrastructure_graph","description":"Multi-hop, aggregation…","last_sync":"2026-08-13T16:44:41Z"}
@@ -472,11 +472,11 @@ Parse the lines as JSON rather than matching on field or column positions.
 
 Two things worth knowing when consuming this:
 
-- **`head` truncates safely but silently.** Every line is a complete record, so
-  `head -5` never yields invalid JSON — but it does hide tools, without any
-  marker in stdout. Use `--format json` when completeness matters: that document
-  carries `count`, which a stream cut short cannot report about itself. The
-  total is also on stderr without `--format`.
+- **`head` hides tools and leaves no marker.** Every line is a complete record,
+  so `head -5` never yields invalid JSON — which is the problem: a shortened
+  catalog reads exactly like a small one. Use `--format json` when completeness
+  matters: that document carries `count`, which a stream cut short cannot report
+  about itself. The total is also on stderr without `--format`.
 - **Pipe records, do not `echo` them.** `echo "$line" | jq` expands the `\n`
   escapes inside a description and corrupts the JSON. Use `printf '%s'` or feed
   `jq` the stream directly.

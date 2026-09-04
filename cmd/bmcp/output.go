@@ -105,9 +105,10 @@ type errorDoc struct {
 	Changes  []map[string]string `json:"changes,omitempty"`
 }
 
-// listDoc is `list --format json`. count is what ndjson cannot report: a stream
-// piped through `head` is silently short, and comparing a line count against
-// this field is how a caller tells a truncated catalog from a small one.
+// listDoc is `list --format json`. count is what a bare ndjson stream cannot
+// report about itself, and it is the in-band completeness check the generated
+// instructions send agents to: comparing the records in hand against this field
+// is how a caller tells a shortened catalog from a small one.
 type listDoc struct {
 	OK       bool         `json:"ok"`
 	Command  string       `json:"command"`

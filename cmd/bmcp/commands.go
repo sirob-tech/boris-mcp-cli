@@ -509,14 +509,15 @@ func (a *app) refreshInstructions(cache *toolCache, includeProject bool) refresh
 }
 
 // cmdList writes machine-readable records to stdout and everything else to
-// stderr: callers pipe it through head/grep, so one truncated line must still
-// be a complete, parseable record.
+// stderr, which makes stdout a line-oriented stream: every line is one
+// complete, parseable record on its own.
 //
 // ndjson stays a stream of bare records rather than becoming an enveloped
-// document, because that is the property `head` depends on and the reason the
-// format was chosen. --format json is the enveloped form, and it is the one to
-// reach for when completeness matters: it carries `count`, which a stream cut
-// short by `head` cannot report about itself.
+// document because that is what keeps it line-oriented: `grep` matches whole
+// records, `while read -r line` handles them one at a time, and a consumer can
+// parse incrementally instead of buffering the catalog. --format json is the
+// enveloped form, and it is the one to reach for when completeness matters: it
+// carries `count`, which a bare stream cannot report about itself.
 func (a *app) cmdList(flags globalFlags, args []string) int {
 	if len(args) != 0 {
 		return a.fail(flags, exitValidation, "usage", "usage: bmcp list [--schemas] [--format human|json|ndjson]")
@@ -1108,7 +1109,8 @@ Global flags:
                                output it had before this flag existed
   --max-bytes <n>              Cap a tool result at n bytes. Under --format the
                                document reports the full size and marks itself
-                               truncated
+                               truncated, so reach for this rather than cutting
+                               bmcp output to a fixed number of lines
   --pretty                     Pretty-print successful tool JSON. Not consulted
                                under --format, whose json is already indented
   --raw                        Emit raw MCP tool envelopes
