@@ -1706,6 +1706,72 @@ func TestFailedWriteDoesNotConsumeABackupGeneration(t *testing.T) {
 	}
 }
 
+// The other half of the same ordering: a write that fails must not leave a
+// backup behind either. Taking the .bak- before the write meant the failure
+// path returned with the copy already on disk and pruneOldBackups never called,
+// and because the target was left unchanged the next run's bytes.Equal
+// short-circuit missed again and took another — one orphan per agent session,
+// unbounded, on a machine where the write keeps failing. backupGenerations
+// cannot bound that, since pruning is the step that never runs.
+//
+// Staging the new content first is what closes it: every failure this names
+// (a read-only mount, a full disk, a target directory that denies writes) hits
+// the temp file, before there is any backup to leak.
+func TestFailedWriteLeavesNoBackupBehind(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root, directory permissions do not deny the write")
+	}
+	dir := t.TempDir()
+	targetDir := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(targetDir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	target := filepath.Join(targetDir, "target.md")
+	if err := os.WriteFile(target, []byte("good\n"), 0o644); err != nil {
+		t.Fatalf("seed target: %v", err)
+	}
+	// As above: the link sits in a writable directory, so a backup beside it
+	// would succeed. Only the resolved target refuses the write.
+	path := filepath.Join(dir, "BORIS.md")
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	if err := os.Chmod(targetDir, 0o500); err != nil {
+		t.Fatalf("chmod target dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(targetDir, 0o700) })
+
+	// Twice, because one orphan is a leak and two is the unbounded growth: the
+	// failed write leaves the target unchanged, so nothing stops the next
+	// session repeating it.
+	for i := 0; i < 2; i++ {
+		result := writeFileWithBackup(path, []byte("new\n"))
+		if result.Changed {
+			t.Fatalf("write %d into a read-only directory should have failed", i+1)
+		}
+		if result.Backup != "" {
+			t.Fatalf("write %d reported a backup for a write that failed: %s", i+1, result.Backup)
+		}
+	}
+	if found := backupsFor(t, path); len(found) != 0 {
+		t.Fatalf("a failed write left %d orphan backup(s): %v", len(found), found)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "good\n" {
+		t.Fatalf("the target should be untouched, got %q, err %v", got, err)
+	}
+	// The staged temp file is the thing that failed; it must not be left next to
+	// the good file either.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp") {
+			t.Fatalf("a failed write left a staged temp file: %s", entry.Name())
+		}
+	}
+}
+
 func TestInstallCodexProjectWritesInlineAgentsInstructions(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)

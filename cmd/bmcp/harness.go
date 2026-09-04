@@ -418,23 +418,54 @@ func containsLegacyInstructionRef(line string, refs []string) bool {
 // syncTools is preconditioned on being able to read the old catalog, so it does
 // not engage — and an empty tools/list is then written as the truth.
 func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
+	staged, err := stageFileAtomic(path, content, perm)
+	if err != nil {
+		return err
+	}
+	defer staged.abandon()
+	return staged.commit()
+}
+
+// stagedWrite is a temp file that already holds the new content, sitting in the
+// destination's own directory and needing only a rename.
+//
+// The split exists for writeFileWithBackup: staging separately lets it get the
+// entire new file onto disk before it rotates a .bak-, so the failure that
+// actually happens — no room for the new content — happens while there is still
+// nothing to leak. Writing the small backup first also spent the space the
+// larger new file needed, which is the write it then failed.
+type stagedWrite struct {
+	path string
+	tmp  string
+}
+
+// stageFileAtomic writes content to a temp file beside path and leaves it for
+// commit to rename into place. The caller must call abandon or the temp file is
+// left next to the good file; deferring it immediately is always correct, since
+// abandon is a no-op once commit has succeeded.
+func stageFileAtomic(path string, content []byte, perm os.FileMode) (staged *stagedWrite, err error) {
 	path = resolveSymlink(path)
 	// A file that already exists keeps the mode it has. os.WriteFile applied
 	// perm only at creation, so a BORIS.md someone had tightened to 0600 stayed
 	// tightened; recreating the inode on every write would otherwise reset it to
 	// the constant this is called with.
 	mode, preserve := perm, false
-	if info, err := os.Stat(path); err == nil {
+	if info, statErr := os.Stat(path); statErr == nil {
 		mode, preserve = info.Mode().Perm(), true
 	}
-	f, tmp, err := createTempFile(filepath.Dir(path), "."+filepath.Base(path), mode)
-	if err != nil {
-		return err
+	f, tmp, createErr := createTempFile(filepath.Dir(path), "."+filepath.Base(path), mode)
+	if createErr != nil {
+		return nil, createErr
 	}
 	defer func() {
+		if err == nil {
+			// Staging succeeded, so the temp file is the point of the call and
+			// disposing of it is the caller's to decide.
+			return
+		}
 		f.Close()
-		// A no-op once the rename succeeded; on any earlier failure this is what
-		// keeps a partial write from being left behind next to the good file.
+		// What keeps a partial write from being left behind next to the good
+		// file.
 		os.Remove(tmp)
 	}()
 	if preserve {
@@ -442,23 +473,28 @@ func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
 		// a umask has no business editing a mode the user already chose. It
 		// still applies to a file being created for the first time, which is
 		// what os.WriteFile did.
-		if err := f.Chmod(mode); err != nil {
-			return err
+		if err = f.Chmod(mode); err != nil {
+			return nil, err
 		}
 	}
-	if _, err := f.Write(content); err != nil {
-		return err
+	if _, err = f.Write(content); err != nil {
+		return nil, err
 	}
 	// Sync before the rename. Without it the rename can reach disk before the
 	// data does, which after a crash leaves a file that exists, has the right
 	// name, and is empty — the one state the empty-catalog guard cannot see.
-	if err := f.Sync(); err != nil {
-		return err
+	if err = f.Sync(); err != nil {
+		return nil, err
 	}
-	if err := f.Close(); err != nil {
-		return err
+	if err = f.Close(); err != nil {
+		return nil, err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	return &stagedWrite{path: path, tmp: tmp}, nil
+}
+
+// commit renames the staged file over its destination.
+func (s *stagedWrite) commit() error {
+	if err := os.Rename(s.tmp, s.path); err != nil {
 		return err
 	}
 	// Best effort, and only about durability: the rename is already atomic for
@@ -466,11 +502,17 @@ func writeFileAtomic(path string, content []byte, perm os.FileMode) error {
 	// it back to the previous file. Losing the newer of two intact files is an
 	// acceptable outcome, and not every filesystem allows this, so a failure
 	// here is not worth failing the write over.
-	if dir, err := os.Open(filepath.Dir(path)); err == nil {
+	if dir, err := os.Open(filepath.Dir(s.path)); err == nil {
 		_ = dir.Sync()
 		dir.Close()
 	}
 	return nil
+}
+
+// abandon discards the staged file. A no-op once commit has succeeded, because
+// the rename is what removed the temp name.
+func (s *stagedWrite) abandon() {
+	os.Remove(s.tmp)
 }
 
 // resolveSymlink returns what path ultimately names, so a write lands on the
@@ -526,7 +568,8 @@ func createTempFile(dir, prefix string, perm os.FileMode) (*os.File, string, err
 func writeFileWithBackup(path string, content []byte) installFileResult {
 	result := installFileResult{Path: path}
 	old, err := os.ReadFile(path)
-	if err == nil {
+	exists := err == nil
+	if exists {
 		// The load-bearing short-circuit now that renderInstructionToolList emits
 		// no timestamp: a refresh against an unchanged catalog produces identical
 		// bytes and returns here, so the per-session doctor refresh writes
@@ -534,6 +577,24 @@ func writeFileWithBackup(path string, content []byte) installFileResult {
 		if bytes.Equal(old, content) {
 			return result
 		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return installFileResult{}
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return installFileResult{}
+	}
+	// Staged before the backup is taken, so no .bak- exists yet for any failure
+	// up to this point — a read-only mount, a full disk, a target that is not
+	// writable. Taking it first left one behind on every such write, and the
+	// target was unchanged, so the next run took another: one orphan per agent
+	// session on a machine where the write kept failing, unbounded, because
+	// pruning is what never ran. backupGenerations does not bound that.
+	staged, err := stageFileAtomic(path, content, 0o644)
+	if err != nil {
+		return installFileResult{}
+	}
+	defer staged.abandon()
+	if exists {
 		backup := backupPath(path)
 		if err := os.MkdirAll(filepath.Dir(backup), 0o700); err != nil {
 			return installFileResult{}
@@ -542,13 +603,18 @@ func writeFileWithBackup(path string, content []byte) installFileResult {
 			return installFileResult{}
 		}
 		result.Backup = backup
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return installFileResult{}
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return installFileResult{}
-	}
-	if err := writeFileAtomic(path, content, 0o644); err != nil {
+	if err := staged.commit(); err != nil {
+		// The rename is a short window but not an empty one: an immutable
+		// target, or a path that became a directory, fails here with the backup
+		// already taken. Removing the copy this call made restores the state
+		// before it exactly — the target was never replaced, so the copy
+		// duplicates a file that is still there — and leaves the generation
+		// count untouched rather than spending one on a write that never
+		// happened.
+		if result.Backup != "" {
+			os.Remove(result.Backup)
+		}
 		return installFileResult{}
 	}
 	// Pruning only after the target is actually replaced. Doing it beside the

@@ -315,7 +315,10 @@ Project-scope targets:
 Existing files are modified in place. When a file changes, a timestamped
 `.bak-<timestamp>` backup is created and printed. The five most recent backups
 of a file are kept, so a bad write is still recoverable after a later one has
-happened. The generated content is a pure function of the tool catalog, so a
+happened. A write that fails leaves neither: the new content is staged in full
+before any backup is rotated, so a read-only mount or a full disk leaves the
+file it could not replace exactly as it was, with nothing beside it. The
+generated content is a pure function of the tool catalog, so a
 refresh against an unchanged catalog writes nothing at all — no backup, no
 mtime change — and the routine refresh below cannot age genuine restore points
 out of the set.
