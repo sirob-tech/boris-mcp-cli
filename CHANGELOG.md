@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.8.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.7.1...v0.8.0) (2026-09-04)
+
+
+### Features
+
+* add --format, one machine-output contract across every command ([#51](https://github.com/sirob-tech/boris-mcp-cli/issues/51)) ([0f9acad](https://github.com/sirob-tech/boris-mcp-cli/commit/0f9acade36bb2a0a97c0bf43d445114d095802a0))
+* add bmcp list --schemas so one call answers what and how ([#50](https://github.com/sirob-tech/boris-mcp-cli/issues/50)) ([a08d5ee](https://github.com/sirob-tech/boris-mcp-cli/commit/a08d5eeec11da6b937dd06f5bd1d619b5749f1a0))
+* answer bmcp doctor from local state and rate limit update checks ([#49](https://github.com/sirob-tech/boris-mcp-cli/issues/49)) ([beb8fca](https://github.com/sirob-tech/boris-mcp-cli/commit/beb8fca850597e0c8ef972c0162e50fbfc654a4e))
+* render nested tool schemas and accept conventional CLI discovery forms ([#45](https://github.com/sirob-tech/boris-mcp-cli/issues/45)) ([3817d63](https://github.com/sirob-tech/boris-mcp-cli/commit/3817d63e91c78b2bf664e88193c210a4fd26b218))
+* tell agents not to cut bmcp output to a fixed size ([#55](https://github.com/sirob-tech/boris-mcp-cli/issues/55)) ([21affbb](https://github.com/sirob-tech/boris-mcp-cli/commit/21affbbca34f8294a424769b158641f463f26175))
+
 ## [0.7.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.7.0...v0.7.1) (2026-08-14)
 
 
