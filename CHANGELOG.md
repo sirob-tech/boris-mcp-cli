@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.8.0...v0.8.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* cursor project-scope path, and the backup a failed write left behind ([#56](https://github.com/sirob-tech/boris-mcp-cli/issues/56)) ([9be5a9b](https://github.com/sirob-tech/boris-mcp-cli/commit/9be5a9bc3fd6d7b1e146c8b0471da82a61c699ce)), closes [#52](https://github.com/sirob-tech/boris-mcp-cli/issues/52) [#53](https://github.com/sirob-tech/boris-mcp-cli/issues/53)
+
 ## [0.8.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.7.1...v0.8.0) (2026-09-04)
 
 
