@@ -546,8 +546,8 @@ func newToolRecord(t tool, lastSync string, withSchema bool) toolRecord {
 // withSchemas is a flag rather than the default because the two answer different
 // questions. "Which tools exist" is asked once and skimmed; "how do I call these"
 // is asked before writing a payload. On the live catalog the schemas take the
-// output from 8.7KB to 18.9KB, and a caller piping the catalog through `head` to
-// see what is available should not pay for schemas it will not read.
+// output from 8.7KB to 18.9KB, and a caller who only wants to know which tools
+// exist should not pay for schemas it will not read.
 func writeToolRecords(w io.Writer, tools []tool, lastSync time.Time, withSchemas bool) error {
 	stamp := ""
 	if !lastSync.IsZero() {
