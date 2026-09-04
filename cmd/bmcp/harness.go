@@ -88,7 +88,14 @@ var harnesses = []harness{
 	},
 	{
 		name: "cursor", displayName: "Cursor",
-		bins: []string{"cursor"}, userDir: ".cursor",
+		// projectDir is not redundant with userDir. Without it, installBase's
+		// project branch falls through to bare cwd, so `--scope project` wrote
+		// ./rules/boris.mdc — a path Cursor never reads, and a directory at the
+		// repo root this tool has no business claiming. The install reported
+		// success and the agent got no BORIS context, with nothing anywhere
+		// saying why. Cursor reads project rules from .cursor/rules, so the
+		// project base has to name .cursor the same way the user base does.
+		bins: []string{"cursor"}, userDir: ".cursor", projectDir: ".cursor",
 		files: func(base string, cache *toolCache) []harnessFile {
 			return []harnessFile{
 				{path: filepath.Join(base, "rules", "boris.mdc"), content: borisCursorRule(cache)},

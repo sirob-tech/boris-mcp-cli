@@ -1806,6 +1806,35 @@ func TestInstallCursorGlobalWritesRule(t *testing.T) {
 	}
 }
 
+// Project scope has to land under .cursor/rules, the only place Cursor reads
+// project rules from. It used to write ./rules/boris.mdc and report success, so
+// the failure was invisible: a file appeared, Cursor loaded nothing, and the
+// agent ran with no BORIS context. The absence assertion is the half that
+// catches a regression to bare cwd.
+func TestInstallCursorProjectWritesRuleUnderDotCursor(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	setupInstallCatalog(t, home, []tool{{Name: "tools___dependency_search", Description: "Search dependency metadata."}})
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	code := a.run([]string{"install", "cursor", "--scope", "project"})
+	if code != 0 {
+		t.Fatalf("install exit code %d, stderr: %s", code, stderr.String())
+	}
+	rule, err := os.ReadFile(filepath.Join(dir, ".cursor", "rules", "boris.mdc"))
+	if err != nil {
+		t.Fatalf("read cursor rule: %v", err)
+	}
+	if !strings.Contains(string(rule), "alwaysApply: true") || !strings.Contains(string(rule), "`dependency_search`: Search dependency metadata.") {
+		t.Fatalf("unexpected cursor rule: %s", rule)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "rules")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("project install must not claim ./rules at the repo root, stat gave: %v", err)
+	}
+}
+
 func TestInstallKiroGlobalWritesSteering(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
