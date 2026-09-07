@@ -340,12 +340,18 @@ func TestSharedProfileForHierarchy(t *testing.T) {
 			},
 			outranksProfile: true,
 		},
-		// A token file with no role ARN is not usable credentials: the SDK's own
-		// arm takes it and then fails with "role ARN is not set", so treating it
-		// as outranking would trade a working profile for a certain error.
-		{name: "web identity with no role", set: func(t *testing.T) {
-			t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", filepath.Join(t.TempDir(), "token"))
-		}},
+		// A token file with no role ARN still outranks, matching the SDK's arm,
+		// which tests the token file alone and then fails closed with "role ARN is
+		// not set". Keeping the profile here would fail *open*: a half-injected
+		// IRSA deployment would silently authenticate as the ambient profile,
+		// which may be an unrelated and more privileged identity.
+		{
+			name: "web identity with no role",
+			set: func(t *testing.T) {
+				t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", filepath.Join(t.TempDir(), "token"))
+			},
+			outranksProfile: true,
+		},
 		// Partial static keys are not credentials either — HasKeys wants both —
 		// which is what a hand-rolled env check would most likely get wrong.
 		{name: "access key id alone", set: func(t *testing.T) {
@@ -728,5 +734,84 @@ func TestDoctorDeepReportsAFailingAuthRowWithItsSource(t *testing.T) {
 		if !strings.Contains(stdout, want) {
 			t.Fatalf("doctor should report %q, got:\n%s", want, stdout)
 		}
+	}
+}
+
+// Half-injected IRSA has to fail closed. A token file with no AWS_ROLE_ARN is
+// how a broken webhook or Helm template presents, and the tempting fix — keep
+// the ambient profile, since the SDK is going to error anyway — silently
+// authenticates as a different, possibly more privileged identity and hides the
+// fact that IRSA is broken at all.
+func TestHalfInjectedWebIdentityDoesNotFallBackToTheProfile(t *testing.T) {
+	isolateAWSEnv(t)
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", filepath.Join(t.TempDir(), "token"))
+	cfg := effectiveConfig{
+		Profile:        "has-static",
+		ProfileSource:  profileSourceFile,
+		Region:         "us-east-1",
+		NonInteractive: true,
+	}
+	creds, _, err := authTestApp().awsCredentials(authTestContext(t), cfg)
+	if err == nil {
+		t.Fatalf("expected a closed failure, got credentials %q", creds.AccessKeyID)
+	}
+	if creds.AccessKeyID == profileKey {
+		t.Fatal("resolved the ambient profile, masking the broken IRSA configuration")
+	}
+	if !strings.Contains(err.Error(), "role ARN is not set") {
+		t.Fatalf("want the SDK's own diagnosis, got: %v", err)
+	}
+}
+
+// ambientProfileRegion reads the region from the shared config files and must
+// not do anything else. A second LoadDefaultConfig would have been shorter but
+// is not free: `defaults_mode = auto` in the profile makes the SDK probe IMDS,
+// and a container full URI with a hostname makes it resolve that host — either
+// can block on the caller's context and spend the budget the real credential
+// load then needs.
+//
+// AWS_EC2_METADATA_DISABLED is deliberately NOT set here, unlike everywhere
+// else, so that a regression actually reaches for IMDS rather than being waved
+// off. The deadline is what converts the block into a failure.
+func TestAmbientProfileRegionDoesNotProbeTheNetwork(t *testing.T) {
+	isolateAWSEnv(t)
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "")
+	t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://a-host-that-does-not-resolve.invalid/creds")
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config")
+	if err := os.WriteFile(configPath, []byte(`[profile auto-mode]
+region = eu-north-1
+defaults_mode = auto
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	t.Setenv("AWS_CONFIG_FILE", configPath)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	region := ambientProfileRegion(ctx, effectiveConfig{Profile: "auto-mode", ProfileSource: profileSourceFile})
+	if region != "eu-north-1" {
+		t.Fatalf("region %q, want eu-north-1 read straight from the shared config", region)
+	}
+	// Generous, because it only has to separate "parsed a file" from "waited on
+	// a network round trip that cannot succeed".
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("took %s, so something went to the network", elapsed)
+	}
+}
+
+// A profile typed at the init prompt outranks the environment, like the flag,
+// but must not claim to have come from the flag.
+func TestInitPromptProfileNamesItselfHonestly(t *testing.T) {
+	isolateAWSEnv(t)
+	setEnvCredentials(t)
+	cfg := effectiveConfig{Profile: "has-static", ProfileSource: profileSourcePrompt}
+	if !cfg.ProfileSource.namedForThisInvocation() {
+		t.Fatal("a profile typed at the prompt was named for this invocation")
+	}
+	want := "AWS profile has-static from the bmcp init prompt"
+	if got := describeCredentialSource(cfg); got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }

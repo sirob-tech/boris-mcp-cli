@@ -89,11 +89,16 @@ func envCredentialSource() string {
 		// HasKeys wants both halves, so a stray AWS_ACCESS_KEY_ID on its own does
 		// not cost the operator their profile.
 		return "environment credentials (AWS_ACCESS_KEY_ID)"
-	case env.WebIdentityTokenFilePath != "" && env.RoleARN != "":
-		// Both, deliberately, where the SDK's own arm tests only the token file and
-		// then fails with "role ARN is not set". A sidecar that injects the token
-		// alone would otherwise cost a working profile to buy a guaranteed error;
-		// requiring the pair can only turn that failure into a success.
+	case env.WebIdentityTokenFilePath != "":
+		// The token file alone, exactly as the SDK's arm tests it, and deliberately
+		// not "the token file and AWS_ROLE_ARN". Requiring the pair looks safer —
+		// it keeps a working profile where a half-injected IRSA setup would
+		// otherwise fail — but it fails open: an IRSA deployment whose role ARN
+		// went missing would silently authenticate as the ambient profile, which
+		// may be an unrelated and more privileged identity, and the operator would
+		// never learn that IRSA was broken. The SDK fails closed here with "role
+		// ARN is not set", every other AWS tool on that machine does the same, and
+		// a credential path is the wrong place to be more forgiving than that.
 		return "web identity credentials (AWS_WEB_IDENTITY_TOKEN_FILE)"
 	}
 	return ""
@@ -120,21 +125,35 @@ func ambientProfileRegion(ctx context.Context, cfg effectiveConfig) string {
 	if cfg.Region != "" {
 		return ""
 	}
-	if env, err := awsconfig.NewEnvConfig(); err != nil || env.Region != "" {
+	env, err := awsconfig.NewEnvConfig()
+	if err != nil || env.Region != "" {
 		return ""
 	}
-	// Loaded with the profile applied, taking only the region from the result.
-	// That is the SDK's own shared-config resolution, so it honours
-	// AWS_CONFIG_FILE, AWS_SHARED_CREDENTIALS_FILE and the default paths without
-	// this function restating any of them — LoadSharedConfigProfile would have
-	// needed all three passed in by hand, and silently read ~/.aws/config
-	// instead when they were not. The credential provider it also builds is
-	// discarded without being retrieved, so nothing here reaches the network.
-	withProfile, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithSharedConfigProfile(cfg.Profile))
+	// Parses the shared config files and nothing more. A second
+	// LoadDefaultConfig would have been shorter, and would have read the file
+	// locations itself, but it is not free: a profile carrying
+	// `defaults_mode = auto` makes the SDK probe IMDS for the runtime region
+	// (resolveDefaultsModeOptions in resolve.go), and a container full URI with
+	// a hostname makes it resolve that host synchronously
+	// (resolveLocalHTTPCredProvider in resolve_credentials.go). Either can block
+	// on the caller's context and spend the budget the real credential load is
+	// about to need — which is the same class of defect as the link-local stall
+	// this change removed. So the file locations are passed in instead, from the
+	// same EnvConfig the SDK would have consulted.
+	files, credFiles := awsconfig.DefaultSharedConfigFiles, awsconfig.DefaultSharedCredentialsFiles
+	if env.SharedConfigFile != "" {
+		files = []string{env.SharedConfigFile}
+	}
+	if env.SharedCredentialsFile != "" {
+		credFiles = []string{env.SharedCredentialsFile}
+	}
+	shared, err := awsconfig.LoadSharedConfigProfile(ctx, cfg.Profile, func(o *awsconfig.LoadSharedConfigOptions) {
+		o.ConfigFiles, o.CredentialsFiles = files, credFiles
+	})
 	if err != nil {
 		return ""
 	}
-	return withProfile.Region
+	return shared.Region
 }
 
 // describeCredentialSource says which credentials an invocation with this

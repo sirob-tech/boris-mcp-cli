@@ -36,7 +36,12 @@ const (
 	profileSourceNone    profileSource = ""
 	profileSourceFlag    profileSource = "--profile"
 	profileSourceBMCPEnv profileSource = "BMCP_PROFILE"
-	profileSourceAWSEnv  profileSource = "AWS_PROFILE"
+	// A profile typed at the `bmcp init` prompt. Named for this invocation just
+	// as the flag is, but it did not come from the flag, and a diagnostic that
+	// says "--profile" sends the operator to inspect an argument they never
+	// passed.
+	profileSourcePrompt profileSource = "the bmcp init prompt"
+	profileSourceAWSEnv profileSource = "AWS_PROFILE"
 	// Separate from profileSourceAWSEnv only so a message names the variable the
 	// operator actually set. The two behave identically in every decision.
 	profileSourceAWSDefaultEnv profileSource = "AWS_DEFAULT_PROFILE"
@@ -49,7 +54,7 @@ const (
 // the rest of the change is written around: only a profile named now outranks
 // the credentials the environment carries. See sharedProfileFor.
 func (source profileSource) namedForThisInvocation() bool {
-	return source == profileSourceFlag || source == profileSourceBMCPEnv
+	return source == profileSourceFlag || source == profileSourceBMCPEnv || source == profileSourcePrompt
 }
 
 type effectiveConfig struct {

@@ -323,7 +323,7 @@ func (a *app) cmdInit(flags globalFlags, args []string) int {
 		if line, err := reader.ReadString('\n'); err == nil {
 			if v := strings.TrimSpace(line); v != "" {
 				flags.profile = v
-				cfg.Profile, cfg.ProfileSource = v, profileSourceFlag
+				cfg.Profile, cfg.ProfileSource = v, profileSourcePrompt
 			}
 		}
 	} else if !exists && flags.url == "" {
