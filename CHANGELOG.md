@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.8.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.8.0...v0.8.1) (2026-09-07)
+
+
+### Bug Fixes
+
+* cursor project-scope path, and the backup a failed write left behind ([#56](https://github.com/sirob-tech/boris-mcp-cli/issues/56)) ([9be5a9b](https://github.com/sirob-tech/boris-mcp-cli/commit/9be5a9bc3fd6d7b1e146c8b0471da82a61c699ce)), closes [#52](https://github.com/sirob-tech/boris-mcp-cli/issues/52) [#53](https://github.com/sirob-tech/boris-mcp-cli/issues/53)
+* let environment credentials outrank a config-file AWS profile ([#59](https://github.com/sirob-tech/boris-mcp-cli/issues/59)) ([7325eba](https://github.com/sirob-tech/boris-mcp-cli/commit/7325eba51a781d2c45ce1850d36c21f9c075e45d)), closes [#58](https://github.com/sirob-tech/boris-mcp-cli/issues/58)
+
+### Upgrade notes
+
+#59 changes which AWS credentials `bmcp` uses. Installed binaries self-update,
+so this reaches a machine on its next `bmcp doctor`, `bmcp sync` or `bmcp init`
+without anyone opting in. Nothing here needs a config change to take effect.
+
+A profile named for the invocation — `--profile`, `BMCP_PROFILE`, or the
+`bmcp init` prompt — still wins over everything. What changed is that an
+*ambient* profile (`AWS_PROFILE`, `AWS_DEFAULT_PROFILE`, or `aws_profile` in
+`~/.bmcp/config.toml`) now yields to credentials the environment carries. That
+is the fix: `aws-vault exec <profile> -- bmcp ...` and CI runners with injected
+credentials work for the first time. It also means:
+
+* **A machine with `aws_profile` in `config.toml` and stale AWS keys in its
+  environment will switch to those keys and may start failing** where the
+  profile used to work. Leftover `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`
+  from direnv, a sourced `.env`, or an old `aws-vault` shell are the usual
+  source. Clear them, or pass `--profile <name>` to override for one call.
+* `AWS_DEFAULT_PROFILE` is now read as an alias of `AWS_PROFILE`, so it takes
+  precedence over `aws_profile` in `config.toml` where it was previously
+  ignored.
+* On ECS or EKS Pod Identity, leave `aws_profile` out of `config.toml`.
+  `AWS_CONTAINER_CREDENTIALS_*` does not displace a profile — in the AWS SDK it
+  is a *profile's* fallback, tried after that profile's own SSO, static keys and
+  `credential_process`.
+* A pod injecting `AWS_WEB_IDENTITY_TOKEN_FILE` **without** `AWS_ROLE_ARN` now
+  fails closed with the SDK's `role ARN is not set`, rather than quietly
+  authenticating as an ambient profile. Half-configured IRSA is reported, not
+  worked around.
+* Exporting `BMCP_PROFILE` from a shell rc counts as naming a profile every
+  time, and will defeat `aws-vault exec` for every later call. Use
+  `aws_profile` in `config.toml` for a standing default.
+
+To see which credentials a machine will use, run `bmcp doctor`: it now reports a
+`credentials` row naming the source, and authentication failures name the source
+they tried. Both are local and authenticate nothing.
+
 ## [0.8.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.7.1...v0.8.0) (2026-09-04)
 
 
