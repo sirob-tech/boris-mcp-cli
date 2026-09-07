@@ -230,10 +230,32 @@ bmcp init --url <url> --profile <aws-profile>
 ```
 
 `--profile` is optional; if omitted, the AWS SDK default credential chain is
-used. The BORIS MCP server requires AWS credentials for any account in the AWS
-Organization. `init` saves config, syncs the remote tool catalog, and in
-interactive sessions offers to install agent instructions for detected
-harnesses.
+used. `init` saves config, syncs the remote tool catalog, and in interactive
+sessions offers to install agent instructions for detected harnesses.
+
+### Which AWS credentials are used
+
+The BORIS MCP server requires AWS credentials for any account in the AWS
+Organization. `bmcp` resolves them in this order:
+
+1. `--profile <name>`, or `BMCP_PROFILE` — a profile named for this
+   invocation. Applied ahead of anything in the environment, because asking
+   for a profile now is an instruction rather than a default.
+2. Credentials the environment carries: `AWS_ACCESS_KEY_ID` and
+   `AWS_SECRET_ACCESS_KEY` (what `aws-vault exec` and most CI runners inject),
+   `AWS_WEB_IDENTITY_TOKEN_FILE` (IRSA), or `AWS_CONTAINER_CREDENTIALS_*`.
+3. `AWS_PROFILE`, then `aws_profile` in `config.toml`.
+4. The AWS SDK's own default chain — the `default` profile, then an instance
+   role.
+
+So `aws-vault exec <profile> -- bmcp ...` works, and so does a CI runner or
+container that injects credentials into the environment, with an `aws_profile`
+still sitting in `config.toml` from `bmcp init`. Pass `--profile` when you want
+the profile to win instead.
+
+`bmcp doctor --deep` names the source it resolved, and an authentication
+failure names the one it tried — so a failure never sends you to repair a
+profile the call never consulted.
 
 Harness detection checks for a known executable on `PATH` or an existing config
 directory such as `~/.claude`, `~/.codex`, `~/.config/opencode`, `~/.cursor`,

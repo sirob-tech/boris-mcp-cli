@@ -27,12 +27,31 @@ type configFile struct {
 	CallTimeout    time.Duration
 }
 
+// profileSource is where effectiveConfig.Profile came from. It matters to
+// credential resolution and nowhere else — see sharedProfileFor — and the
+// values double as the label an auth failure names the profile's origin by.
+type profileSource string
+
+const (
+	profileSourceNone    profileSource = ""
+	profileSourceFlag    profileSource = "--profile"
+	profileSourceBMCPEnv profileSource = "BMCP_PROFILE"
+	profileSourceAWSEnv  profileSource = "AWS_PROFILE"
+	profileSourceFile    profileSource = "aws_profile in config.toml"
+)
+
 type effectiveConfig struct {
-	Home           string
-	ConfigPath     string
-	ToolsPath      string
-	URL            string
-	Profile        string
+	Home       string
+	ConfigPath string
+	ToolsPath  string
+	URL        string
+	Profile    string
+	// ProfileSource carries Profile's provenance because the AWS SDK's
+	// credential hierarchy depends on it: a profile the caller named for this
+	// invocation is an instruction, while one this machine happens to have
+	// persisted is only a default, and awsCredentials must not treat the second
+	// as the first. See sharedProfileFor.
+	ProfileSource  profileSource
 	Region         string
 	Service        string
 	SyncTTL        time.Duration
@@ -56,9 +75,13 @@ func defaultEffective(flags globalFlags) effectiveConfig {
 			home = filepath.Join(userHome, ".bmcp")
 		}
 	}
+	profileSrc := profileSourceNone
+	if flags.profile != "" {
+		profileSrc = profileSourceFlag
+	}
 	return effectiveConfig{
 		Home: home, ConfigPath: filepath.Join(home, "config.toml"), ToolsPath: filepath.Join(home, "tools.json"),
-		URL: flags.url, Profile: flags.profile, Region: flags.region, Service: flags.service,
+		URL: flags.url, Profile: flags.profile, ProfileSource: profileSrc, Region: flags.region, Service: flags.service,
 		SyncTTL: defaultTTL, ConnectTimeout: defaultConnect, SyncTimeout: defaultSync, CallTimeout: defaultCall,
 		NonInteractive: flags.nonInteractive || truthy(os.Getenv("BMCP_NON_INTERACTIVE")),
 		AutoUpdate:     true,
@@ -115,7 +138,7 @@ func (a *app) loadEffective(flags globalFlags, require bool) (effectiveConfig, b
 		cfg.URL = firstNonEmpty(os.Getenv("BMCP_URL"), fileCfg.URL)
 	}
 	if flags.profile == "" {
-		cfg.Profile = firstNonEmpty(os.Getenv("BMCP_PROFILE"), os.Getenv("AWS_PROFILE"), fileCfg.AWSProfile)
+		cfg.Profile, cfg.ProfileSource = resolveProfile(fileCfg.AWSProfile)
 	}
 	if flags.region == "" {
 		cfg.Region = firstNonEmpty(os.Getenv("BMCP_REGION"), fileCfg.Region)
@@ -308,6 +331,26 @@ func inferRegion(raw string) string {
 		}
 	}
 	return ""
+}
+
+// resolveProfile keeps the profile's provenance alongside its value. The
+// precedence is unchanged — BMCP_PROFILE, then AWS_PROFILE, then the config
+// file — but firstNonEmpty threw away which of the three answered, and that is
+// the one thing credential resolution needs to know.
+func resolveProfile(fileProfile string) (string, profileSource) {
+	for _, candidate := range []struct {
+		value  string
+		source profileSource
+	}{
+		{os.Getenv("BMCP_PROFILE"), profileSourceBMCPEnv},
+		{os.Getenv("AWS_PROFILE"), profileSourceAWSEnv},
+		{fileProfile, profileSourceFile},
+	} {
+		if candidate.value != "" {
+			return candidate.value, candidate.source
+		}
+	}
+	return "", profileSourceNone
 }
 
 func firstNonEmpty(vals ...string) string {

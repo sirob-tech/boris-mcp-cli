@@ -843,7 +843,13 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 		deep = flags.doctorDeep || !a.catalogIsFresh(cfg, disk, diskErr)
 		if deep {
 			_, _, authErr := a.loadCredentials(context.Background(), cfg)
-			add("auth", authErr == nil, messageOrOK(authErr))
+			// Names the credential source rather than a bare "ok". #58 was
+			// invisible from the outside partly because nothing bmcp printed said
+			// which of profile, environment and default chain was actually in
+			// play, so a machine whose environment credentials were being
+			// discarded looked exactly like one where they were used. The failing
+			// message carries the same detail, from authFailure.
+			add("auth", authErr == nil, messageOr(authErr, describeCredentialSource(cfg)))
 			if authErr == nil {
 				synced, syncErr := a.syncTools(context.Background(), cfg)
 				add("remote", syncErr == nil, messageOrOK(syncErr))
@@ -1096,7 +1102,8 @@ Global flags:
                                Takes no arguments and no command
   --no-auto-update             Do not update automatically during this command
   --url, -u <url>              Override BORIS MCP URL
-  --profile, -p <profile>      Override AWS profile
+  --profile, -p <profile>      Use this AWS profile, ahead of any credentials
+                               the environment carries
   --region <region>            Override SigV4 region
   --service <service>          Override SigV4 service
   --format <human|json|ndjson> Answer under the machine-output contract. json is
@@ -1205,8 +1212,13 @@ func shouldReadPayloadFromStdin(r io.Reader) bool {
 }
 
 func messageOrOK(err error) string {
+	return messageOr(err, "ok")
+}
+
+// messageOr is messageOrOK for a check whose passing state is worth naming.
+func messageOr(err error, ok string) string {
 	if err == nil {
-		return "ok"
+		return ok
 	}
 	return err.Error()
 }
