@@ -30,30 +30,22 @@ func (a *app) loadCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cre
 // specified programmatically we should only consider the 'other' configuration
 // sources that have been provided. This ensures we correctly honor the expected
 // credential hierarchy." A bare AWS_PROFILE deliberately does not trip that
-// check, so environment credentials still outrank it.
+// check, so environment credentials still outrank it — and bmcp passing every
+// profile it resolved, from wherever it resolved it, is what inverted that (#58).
 //
-// bmcp used to pass every profile it resolved, wherever it resolved it from.
-// That gave a value `bmcp init` persisted into config.toml months ago more
-// precedence than the credentials the operator injected into this very process
-// — so `aws-vault exec <profile> -- bmcp ...` never worked, no CI runner or
-// container with credentials in the environment could call a tool, and the
-// failure advised `aws sso login --profile X` for a profile the operator had
-// deliberately not asked for (#58).
-//
-// So: a profile named for this invocation (--profile, BMCP_PROFILE) still wins,
-// because naming a profile now is an instruction rather than a default, and
-// BMCP_PROFILE is a variable the SDK will never read on its own — yielding it
-// would drop it silently. An ambient profile (AWS_PROFILE, or aws_profile in
-// config.toml) yields to ambient credentials. When it does not yield, passing
-// it programmatically resolves exactly as the SDK's own AWS_PROFILE handling
-// would, because that is the branch the SDK takes once the environment carries
-// no credentials of its own.
+// So: a profile named for this invocation still wins, because naming one now is
+// an instruction rather than a default, and because BMCP_PROFILE is a variable
+// the SDK will never read on its own — yielding it would drop the request
+// silently rather than fall through to anything. An ambient profile
+// (AWS_PROFILE, or aws_profile in config.toml) yields to ambient credentials.
+// When it does not yield, passing it programmatically resolves exactly as the
+// SDK's own AWS_PROFILE handling would, because that is the branch the SDK
+// takes once the environment carries no credentials of its own.
 func sharedProfileFor(cfg effectiveConfig) (profile, outrankedBy string) {
 	if cfg.Profile == "" {
 		return "", ""
 	}
-	switch cfg.ProfileSource {
-	case profileSourceFlag, profileSourceBMCPEnv:
+	if cfg.ProfileSource.namedForThisInvocation() {
 		return cfg.Profile, ""
 	}
 	if source := envCredentialSource(); source != "" {
@@ -62,35 +54,87 @@ func sharedProfileFor(cfg effectiveConfig) (profile, outrankedBy string) {
 	return cfg.Profile, ""
 }
 
-// envCredentialSource names the credentials the environment carries on its own,
-// or "" when it carries none.
+// envCredentialSource names the credentials the environment carries that
+// outrank a shared-config profile, or "" when it carries none.
 //
-// It reads the environment through the SDK's own parser rather than a hand-kept
-// list of variable names, and tests exactly the fields the switches in
-// resolveCredentialChain and resolveCredsFromProfile test — so what counts as
-// "the environment has credentials" here cannot drift from what the SDK would
-// actually have used.
+// "Outrank a profile" is the whole content of this function, and it is a
+// narrower question than "does the environment have credentials somewhere".
+// Only two sources sit in resolveCredentialChain's *outer* switch, above the
+// profile branch: static keys, and a web identity token. Those two bypass every
+// profile. Everything else the environment can carry — AWS_CONTAINER_CREDENTIALS_*
+// at resolve_credentials.go:182-188, and IMDS below them — lives *inside*
+// resolveCredsFromProfile, beneath that profile's own static keys,
+// credential_source, web identity, SSO and credential_process arms. Those are a
+// profile's fallback, never its superior.
 //
-// IMDS is absent by design: an instance role is not an environment signal,
-// there is nothing to detect without a network probe, and the SDK reaches it
-// from inside the profile branch anyway.
+// Naming one of the inner sources here would be wrong twice over. The claim
+// itself would be false, and acting on it would not even reach the source
+// named: declining the profile hands resolution to the `default` profile, which
+// the SDK reads whenever no profile is set — so bmcp would announce container
+// credentials and then sign as an unrelated identity, or block on the
+// link-local endpoint on a machine whose profile had been resolving instantly.
+//
+// The environment is read through the SDK's own parser rather than a hand-kept
+// list of variable names, so which variables count cannot drift from the fields
+// the SDK tests.
 func envCredentialSource() string {
 	env, err := awsconfig.NewEnvConfig()
 	if err != nil {
-		// A malformed AWS_* value is the SDK's to report from LoadDefaultConfig,
-		// with its own message. Reporting "no environment credentials" here would
-		// only change which error the operator sees.
+		// LoadDefaultConfig builds the same EnvConfig and fails with the same
+		// error, so the run reports the real cause either way.
 		return ""
 	}
 	switch {
 	case env.Credentials.HasKeys():
+		// HasKeys wants both halves, so a stray AWS_ACCESS_KEY_ID on its own does
+		// not cost the operator their profile.
 		return "environment credentials (AWS_ACCESS_KEY_ID)"
-	case env.WebIdentityTokenFilePath != "":
+	case env.WebIdentityTokenFilePath != "" && env.RoleARN != "":
+		// Both, deliberately, where the SDK's own arm tests only the token file and
+		// then fails with "role ARN is not set". A sidecar that injects the token
+		// alone would otherwise cost a working profile to buy a guaranteed error;
+		// requiring the pair can only turn that failure into a success.
 		return "web identity credentials (AWS_WEB_IDENTITY_TOKEN_FILE)"
-	case env.ContainerCredentialsRelativePath != "" || env.ContainerCredentialsEndpoint != "":
-		return "container credentials (AWS_CONTAINER_CREDENTIALS_*)"
 	}
 	return ""
+}
+
+// ambientProfileRegion is the region a declined profile would have supplied, or
+// "" when something better already supplies one.
+//
+// Declining a profile for credential purposes must not also drop the region it
+// carried for SigV4 purposes. The SDK does not have this problem with
+// AWS_PROFILE — it goes on reading that variable for non-credential config
+// whatever the credential chain does — but a config.toml profile is invisible
+// to it, so withholding the profile withheld its region too. With no region
+// left, bmcp either signed with the `default` profile's region or refused the
+// call outright with "AWS region could not be inferred", on a machine that had
+// been working.
+//
+// The ordering mirrors what the SDK does for a bare AWS_PROFILE: an explicit
+// region and the environment's own both win, and this fills in beneath them and
+// ahead of the `default` profile. Errors are ignored because a profile that
+// cannot be read has no region to offer, and reporting that is the credential
+// path's job rather than this one's.
+func ambientProfileRegion(ctx context.Context, cfg effectiveConfig) string {
+	if cfg.Region != "" {
+		return ""
+	}
+	if env, err := awsconfig.NewEnvConfig(); err != nil || env.Region != "" {
+		return ""
+	}
+	// Loaded with the profile applied, taking only the region from the result.
+	// That is the SDK's own shared-config resolution, so it honours
+	// AWS_CONFIG_FILE, AWS_SHARED_CREDENTIALS_FILE and the default paths without
+	// this function restating any of them — LoadSharedConfigProfile would have
+	// needed all three passed in by hand, and silently read ~/.aws/config
+	// instead when they were not. The credential provider it also builds is
+	// discarded without being retrieved, so nothing here reaches the network.
+	withProfile, err := awsconfig.LoadDefaultConfig(ctx, awsconfig.WithSharedConfigProfile(cfg.Profile))
+	if err != nil {
+		return ""
+	}
+	return withProfile.Region
 }
 
 // describeCredentialSource says which credentials an invocation with this
@@ -98,24 +142,34 @@ func envCredentialSource() string {
 // config, and authenticates nothing.
 //
 // It exists because #58's failure was as much about diagnosis as resolution.
-// Nothing bmcp printed — not the auth error, not doctor — said which of the
-// several possible credential sources was in play, so an operator whose
-// environment credentials were being ignored had no way to see that from the
-// outside.
+// Nothing bmcp printed said which of the several possible credential sources
+// was in play, so an operator whose environment credentials were being
+// discarded had no way to see that from the outside.
 func describeCredentialSource(cfg effectiveConfig) string {
 	profile, outrankedBy := sharedProfileFor(cfg)
 	switch {
 	case profile != "":
-		return fmt.Sprintf("AWS profile %s from %s", profile, cfg.ProfileSource)
+		return "AWS profile " + profile + profileOrigin(cfg.ProfileSource)
 	case outrankedBy != "":
-		return fmt.Sprintf("%s, which outrank AWS profile %s from %s", outrankedBy, cfg.Profile, cfg.ProfileSource)
+		return outrankedBy + ", which outrank AWS profile " + cfg.Profile + profileOrigin(cfg.ProfileSource)
 	}
-	// No profile configured at all. The SDK's default chain would still pick the
-	// environment up, and naming what it will pick beats naming the chain.
+	// No profile to report. Naming what the SDK's default chain will actually
+	// pick still beats naming the chain.
 	if source := envCredentialSource(); source != "" {
 		return source
 	}
 	return "the default AWS credential chain"
+}
+
+// profileOrigin renders " from <source>", or nothing when the source is
+// unknown. Nothing should reach it with a profile and no source, but a message
+// trailing off after "from" would be a worse way to discover that than one
+// which simply omits the clause.
+func profileOrigin(source profileSource) string {
+	if source == profileSourceNone {
+		return ""
+	}
+	return " from " + string(source)
 }
 
 func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Credentials, string, error) {
@@ -127,9 +181,14 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 	// read cfg.Profile was really asking "did this attempt resolve credentials
 	// through a profile", and once an ambient profile can be outranked those two
 	// questions have different answers.
-	profile, _ := sharedProfileFor(cfg)
-	if profile != "" {
+	profile, outrankedBy := sharedProfileFor(cfg)
+	switch {
+	case profile != "":
 		opts = append(opts, awsconfig.WithSharedConfigProfile(profile))
+	case outrankedBy != "":
+		if region := ambientProfileRegion(ctx, cfg); region != "" {
+			opts = append(opts, awsconfig.WithRegion(region))
+		}
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
@@ -160,7 +219,10 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 	}
 	if err != nil {
 		if profile != "" && looksLikeSSO(err) {
-			return aws.Credentials{}, "", authError{fmt.Errorf("AWS SSO credentials unavailable. Run: aws sso login --profile %s", profile)}
+			// Naming the source here too, because this is the message #58 was filed
+			// against: an operator who never chose this profile was being sent to log
+			// into it, with nothing saying where it had come from.
+			return aws.Credentials{}, "", authError{fmt.Errorf("AWS SSO credentials unavailable (using %s). Run: aws sso login --profile %s", describeCredentialSource(cfg), profile)}
 		}
 		return aws.Credentials{}, "", authError{authFailure(cfg, err)}
 	}

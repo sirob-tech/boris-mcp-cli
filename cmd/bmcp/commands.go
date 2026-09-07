@@ -323,7 +323,7 @@ func (a *app) cmdInit(flags globalFlags, args []string) int {
 		if line, err := reader.ReadString('\n'); err == nil {
 			if v := strings.TrimSpace(line); v != "" {
 				flags.profile = v
-				cfg.Profile = v
+				cfg.Profile, cfg.ProfileSource = v, profileSourceFlag
 			}
 		}
 	} else if !exists && flags.url == "" {
@@ -839,17 +839,25 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 	} else {
 		add("config", true, cfg.ConfigPath)
 		add("url", validateURL(cfg.URL, flags.allowHTTP) == nil, sanitizeURL(cfg.URL))
+		// Which credentials a call would use, on every path including the routine
+		// one. #58 was undiagnosable from the outside partly because nothing bmcp
+		// printed said whether the configured profile or something ambient in the
+		// environment was in play, so a machine quietly discarding its environment
+		// credentials reported exactly what a healthy one did.
+		//
+		// Always ok, because it is a statement rather than a check:
+		// describeCredentialSource reads the environment and the resolved config
+		// and authenticates nothing, so it has nothing to fail at. That is also
+		// what lets it run while the catalog is fresh, where the promise
+		// BORIS.md makes is that doctor reaches neither AWS nor the server. The
+		// `auth` row below is the one that says whether these credentials work,
+		// and it still only appears once something has asked to go remote.
+		add("credentials", true, describeCredentialSource(cfg))
 		disk, diskErr := readCache(cfg.ToolsPath)
 		deep = flags.doctorDeep || !a.catalogIsFresh(cfg, disk, diskErr)
 		if deep {
 			_, _, authErr := a.loadCredentials(context.Background(), cfg)
-			// Names the credential source rather than a bare "ok". #58 was
-			// invisible from the outside partly because nothing bmcp printed said
-			// which of profile, environment and default chain was actually in
-			// play, so a machine whose environment credentials were being
-			// discarded looked exactly like one where they were used. The failing
-			// message carries the same detail, from authFailure.
-			add("auth", authErr == nil, messageOr(authErr, describeCredentialSource(cfg)))
+			add("auth", authErr == nil, messageOrOK(authErr))
 			if authErr == nil {
 				synced, syncErr := a.syncTools(context.Background(), cfg)
 				add("remote", syncErr == nil, messageOrOK(syncErr))
@@ -1212,13 +1220,8 @@ func shouldReadPayloadFromStdin(r io.Reader) bool {
 }
 
 func messageOrOK(err error) string {
-	return messageOr(err, "ok")
-}
-
-// messageOr is messageOrOK for a check whose passing state is worth naming.
-func messageOr(err error, ok string) string {
 	if err == nil {
-		return ok
+		return "ok"
 	}
 	return err.Error()
 }

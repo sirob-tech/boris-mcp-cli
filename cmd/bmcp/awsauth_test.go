@@ -23,7 +23,12 @@ const (
 // a test observes only what it sets — never the developer's own ~/.aws, and
 // never a leftover aws-vault session from the shell that ran `go test`.
 //
-// IMDS is disabled for the same reason: a case that resolves no credentials at
+// HOME is redirected too, because that is where the SDK looks for the SSO token
+// cache: a test that applies the sso-only profile would otherwise read the
+// developer's real cached token and pass or fail on whether they happened to be
+// logged in.
+//
+// IMDS is disabled for a related reason: a case that resolves no credentials at
 // all must fail on that, not on a several-second probe of a link-local address.
 func isolateAWSEnv(t *testing.T) {
 	t.Helper()
@@ -39,14 +44,17 @@ func isolateAWSEnv(t *testing.T) {
 		t.Setenv(name, "")
 	}
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	t.Setenv("HOME", t.TempDir())
 
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config")
 	credsPath := filepath.Join(dir, "credentials")
-	// has-static resolves without a network round trip, so a test can assert
-	// which identity won rather than only which error came back. sso-only is the
-	// shape #58 was reported against: a profile that resolves through SSO, and
-	// so cannot work at all in a CI runner or container.
+	// has-static resolves offline, so a test can assert which identity won rather
+	// than only which error came back, and it carries a region so the region tests
+	// have something to lose. sso-only is the shape #58 was reported against: a
+	// profile that resolves through SSO, and so cannot work in CI or a container.
+	// Deliberately no [default] profile — nothing here should quietly fall back to
+	// one, and its absence is what makes that assertable.
 	write := func(path, body string) {
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 			t.Fatalf("write %s: %v", path, err)
@@ -76,6 +84,24 @@ func setEnvCredentials(t *testing.T) {
 	t.Setenv("AWS_SESSION_TOKEN", "envtoken")
 }
 
+// applyProfileProvenance puts the environment into the state that would have
+// produced this provenance, so no test asserts against a shape resolveProfile
+// could never hand it.
+//
+// AWS_PROFILE especially is not inert: its mere presence switches the SDK to the
+// strict shared-config loader (resolveConfigLoaders in config.go), so a test
+// that claims that provenance while leaving the variable unset exercises the
+// lenient loader and the default profile instead of the path it names.
+func applyProfileProvenance(t *testing.T, source profileSource, profile string) {
+	t.Helper()
+	switch source {
+	case profileSourceBMCPEnv:
+		t.Setenv("BMCP_PROFILE", profile)
+	case profileSourceAWSEnv:
+		t.Setenv("AWS_PROFILE", profile)
+	}
+}
+
 func authTestApp() *app {
 	return &app{
 		stdin:  strings.NewReader(""),
@@ -86,6 +112,16 @@ func authTestApp() *app {
 		// even if the test host happens to have a terminal.
 		machine: true,
 	}
+}
+
+// A deadline, so a reintroduced bug that sends resolution to the link-local
+// container or IMDS endpoint fails in seconds instead of hanging the suite for
+// a minute and a half.
+func authTestContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	t.Cleanup(cancel)
+	return ctx
 }
 
 // The reproduction from #58, as a test. A profile persisted in config.toml used
@@ -107,7 +143,7 @@ func TestConfigFileProfileYieldsToEnvironmentCredentials(t *testing.T) {
 		Region:         "us-east-1",
 		NonInteractive: true,
 	}
-	creds, region, err := authTestApp().awsCredentials(context.Background(), cfg)
+	creds, region, err := authTestApp().awsCredentials(authTestContext(t), cfg)
 	if err != nil {
 		t.Fatalf("environment credentials should have resolved: %v", err)
 	}
@@ -125,6 +161,7 @@ func TestConfigFileProfileYieldsToEnvironmentCredentials(t *testing.T) {
 // test can only pass by picking the right one.
 func TestAWSProfileEnvYieldsToEnvironmentCredentials(t *testing.T) {
 	isolateAWSEnv(t)
+	applyProfileProvenance(t, profileSourceAWSEnv, "has-static")
 	setEnvCredentials(t)
 	cfg := effectiveConfig{
 		Profile:        "has-static",
@@ -132,7 +169,7 @@ func TestAWSProfileEnvYieldsToEnvironmentCredentials(t *testing.T) {
 		Region:         "us-east-1",
 		NonInteractive: true,
 	}
-	creds, _, err := authTestApp().awsCredentials(context.Background(), cfg)
+	creds, _, err := authTestApp().awsCredentials(authTestContext(t), cfg)
 	if err != nil {
 		t.Fatalf("credentials should have resolved: %v", err)
 	}
@@ -146,23 +183,18 @@ func TestAWSProfileEnvYieldsToEnvironmentCredentials(t *testing.T) {
 // carries — and BMCP_PROFILE has to, because the SDK never reads that variable
 // itself, so yielding it would drop the operator's request silently.
 func TestExplicitProfileOutranksEnvironmentCredentials(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		source profileSource
-	}{
-		{name: "--profile flag", source: profileSourceFlag},
-		{name: "BMCP_PROFILE", source: profileSourceBMCPEnv},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, source := range []profileSource{profileSourceFlag, profileSourceBMCPEnv} {
+		t.Run(string(source), func(t *testing.T) {
 			isolateAWSEnv(t)
+			applyProfileProvenance(t, source, "has-static")
 			setEnvCredentials(t)
 			cfg := effectiveConfig{
 				Profile:        "has-static",
-				ProfileSource:  tc.source,
+				ProfileSource:  source,
 				Region:         "us-east-1",
 				NonInteractive: true,
 			}
-			creds, _, err := authTestApp().awsCredentials(context.Background(), cfg)
+			creds, _, err := authTestApp().awsCredentials(authTestContext(t), cfg)
 			if err != nil {
 				t.Fatalf("credentials should have resolved: %v", err)
 			}
@@ -185,7 +217,7 @@ func TestConfigFileProfileStillAppliesWithoutEnvironmentCredentials(t *testing.T
 		Region:         "us-east-1",
 		NonInteractive: true,
 	}
-	creds, _, err := authTestApp().awsCredentials(context.Background(), cfg)
+	creds, _, err := authTestApp().awsCredentials(authTestContext(t), cfg)
 	if err != nil {
 		t.Fatalf("the configured profile should have resolved: %v", err)
 	}
@@ -194,46 +226,160 @@ func TestConfigFileProfileStillAppliesWithoutEnvironmentCredentials(t *testing.T
 	}
 }
 
-// The truth table, stated once. Written against sharedProfileFor rather than
-// through the SDK because the environment shapes below cannot all resolve
-// offline — web identity and container credentials need a network peer — and
-// the decision under test is which source wins, not whether it then works.
+// Container credentials are a profile's *fallback* in the SDK, never its
+// superior: they sit inside resolveCredsFromProfile, below that profile's own
+// static keys, SSO and credential_process arms. So an ambient profile must
+// still be applied when they are present.
+//
+// Treating them as outranking was wrong in three ways, and this test catches
+// all three. With no [default] profile in the fixtures, declining the profile
+// resolves through the container endpoint — a 90-second block on a link-local
+// address that the deadline turns into a fast failure; with one, it would sign
+// as an unrelated identity; and either way bmcp announced a precedence the SDK
+// does not implement. Assertable entirely offline, precisely because the
+// correct answer never dials anything.
+func TestContainerCredentialsDoNotDisplaceAProfile(t *testing.T) {
+	for _, source := range []profileSource{profileSourceAWSEnv, profileSourceFile} {
+		for _, envVar := range []string{"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI"} {
+			t.Run(string(source)+"/"+envVar, func(t *testing.T) {
+				isolateAWSEnv(t)
+				applyProfileProvenance(t, source, "has-static")
+				t.Setenv(envVar, "http://169.254.170.23/v1/credentials")
+				cfg := effectiveConfig{
+					Profile:        "has-static",
+					ProfileSource:  source,
+					Region:         "us-east-1",
+					NonInteractive: true,
+				}
+				creds, _, err := authTestApp().awsCredentials(authTestContext(t), cfg)
+				if err != nil {
+					t.Fatalf("the profile should have resolved without reaching the container endpoint: %v", err)
+				}
+				if creds.AccessKeyID != profileKey {
+					t.Fatalf("resolved %q, want the profile's %q", creds.AccessKeyID, profileKey)
+				}
+			})
+		}
+	}
+}
+
+// Declining a profile for credential purposes must not also drop the region it
+// carried for signing. An outranked config.toml profile used to take its region
+// with it, and since the SDK cannot see that profile there was nothing to fall
+// back to: on a BORIS URL whose host carries no region for inferRegion to find,
+// the call died with "AWS region could not be inferred" on a machine that had
+// been working — or, with a [default] profile present, silently signed in that
+// profile's region instead.
+func TestOutrankedProfileStillSuppliesItsRegion(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		envRegion string
+		cfgRegion string
+		want      string
+	}{
+		// eu-west-1 is what [profile has-static] carries in the fixture.
+		{name: "the outranked profile supplies it", want: "eu-west-1"},
+		// Both of these outrank the profile's region in the SDK when AWS_PROFILE is
+		// what names the profile, so they have to here too.
+		{name: "the environment still wins", envRegion: "ap-south-1", want: "ap-south-1"},
+		{name: "an explicit region still wins", cfgRegion: "us-west-2", want: "us-west-2"},
+		{
+			name:      "an explicit region wins over the environment",
+			envRegion: "ap-south-1", cfgRegion: "us-west-2", want: "us-west-2",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateAWSEnv(t)
+			setEnvCredentials(t)
+			if tc.envRegion != "" {
+				t.Setenv("AWS_REGION", tc.envRegion)
+			}
+			cfg := effectiveConfig{
+				Profile:        "has-static",
+				ProfileSource:  profileSourceFile,
+				Region:         tc.cfgRegion,
+				NonInteractive: true,
+			}
+			creds, region, err := authTestApp().awsCredentials(authTestContext(t), cfg)
+			if err != nil {
+				t.Fatalf("environment credentials should have resolved: %v", err)
+			}
+			if creds.AccessKeyID != envKey {
+				t.Fatalf("resolved %q, want the environment's %q", creds.AccessKeyID, envKey)
+			}
+			if region != tc.want {
+				t.Fatalf("region %q, want %q", region, tc.want)
+			}
+		})
+	}
+}
+
+// The truth table, stated once, with each expectation attached to the axis that
+// owns it rather than to a row's position in a parallel slice.
+//
+// Written against sharedProfileFor rather than through the SDK because two of
+// these environment shapes cannot resolve offline — and every shape that *can*
+// is covered end to end by the tests above.
 func TestSharedProfileForHierarchy(t *testing.T) {
-	type env struct {
+	environments := []struct {
 		name string
 		set  func(t *testing.T)
-	}
-	envs := []env{
-		{name: "no environment credentials", set: func(*testing.T) {}},
-		{name: "static keys", set: setEnvCredentials},
-		{name: "web identity", set: func(t *testing.T) {
+		// outranksProfile is whether this environment carries a source that
+		// resolveCredentialChain's outer switch places above every profile.
+		outranksProfile bool
+	}{
+		{name: "empty"},
+		{name: "static keys", set: setEnvCredentials, outranksProfile: true},
+		{
+			name: "web identity with a role",
+			set: func(t *testing.T) {
+				t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", filepath.Join(t.TempDir(), "token"))
+				t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/Example")
+			},
+			outranksProfile: true,
+		},
+		// A token file with no role ARN is not usable credentials: the SDK's own
+		// arm takes it and then fails with "role ARN is not set", so treating it
+		// as outranking would trade a working profile for a certain error.
+		{name: "web identity with no role", set: func(t *testing.T) {
 			t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", filepath.Join(t.TempDir(), "token"))
-			t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/Example")
 		}},
-		{name: "container relative uri", set: func(t *testing.T) {
+		// Partial static keys are not credentials either — HasKeys wants both —
+		// which is what a hand-rolled env check would most likely get wrong.
+		{name: "access key id alone", set: func(t *testing.T) {
+			t.Setenv("AWS_ACCESS_KEY_ID", envKey)
+		}},
+		{name: "secret access key alone", set: func(t *testing.T) {
+			t.Setenv("AWS_SECRET_ACCESS_KEY", "envsecret")
+		}},
+		// Container credentials and IMDS live below the profile, not above it.
+		{name: "container credentials", set: func(t *testing.T) {
 			t.Setenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "/v2/credentials/abc")
 		}},
-		{name: "container full uri", set: func(t *testing.T) {
-			t.Setenv("AWS_CONTAINER_CREDENTIALS_FULL_URI", "http://169.254.170.23/v1/credentials")
-		}},
 	}
-	// applied[i] is whether the profile is passed to the SDK under envs[i].
-	for _, tc := range []struct {
-		source  profileSource
-		applied []bool
+	sources := []struct {
+		source profileSource
+		// yieldsToEnv is whether this provenance makes the profile ambient.
+		yieldsToEnv bool
 	}{
-		{source: profileSourceFlag, applied: []bool{true, true, true, true, true}},
-		{source: profileSourceBMCPEnv, applied: []bool{true, true, true, true, true}},
-		{source: profileSourceAWSEnv, applied: []bool{true, false, false, false, false}},
-		{source: profileSourceFile, applied: []bool{true, false, false, false, false}},
-	} {
-		for i, e := range envs {
-			t.Run(string(tc.source)+"/"+e.name, func(t *testing.T) {
+		{source: profileSourceFlag},
+		{source: profileSourceBMCPEnv},
+		{source: profileSourceAWSEnv, yieldsToEnv: true},
+		{source: profileSourceFile, yieldsToEnv: true},
+	}
+	for _, s := range sources {
+		for _, e := range environments {
+			t.Run(string(s.source)+"/"+e.name, func(t *testing.T) {
 				isolateAWSEnv(t)
-				e.set(t)
-				profile, outrankedBy := sharedProfileFor(effectiveConfig{Profile: "p", ProfileSource: tc.source})
-				if want := tc.applied[i]; (profile != "") != want {
-					t.Fatalf("profile applied=%v (%q, outranked by %q), want applied=%v", profile != "", profile, outrankedBy, want)
+				applyProfileProvenance(t, s.source, "p")
+				if e.set != nil {
+					e.set(t)
+				}
+				want := !(s.yieldsToEnv && e.outranksProfile)
+				profile, outrankedBy := sharedProfileFor(effectiveConfig{Profile: "p", ProfileSource: s.source})
+				if (profile != "") != want {
+					t.Fatalf("profile applied=%v (%q, outranked by %q), want applied=%v",
+						profile != "", profile, outrankedBy, want)
 				}
 				// Exactly one of the two is set, so a caller can always say why.
 				if (profile != "") == (outrankedBy != "") {
@@ -269,7 +415,6 @@ func TestAuthFailureNamesTheCredentialSource(t *testing.T) {
 			// The profile was applied, so say so, and say where it came from: the
 			// operator cannot fix a config.toml value they do not know is in play.
 			name: "profile that does not exist",
-			env:  func(*testing.T) {},
 			cfg: effectiveConfig{
 				Profile:       "definitely-not-a-real-profile",
 				ProfileSource: profileSourceFile,
@@ -281,14 +426,31 @@ func TestAuthFailureNamesTheCredentialSource(t *testing.T) {
 			},
 		},
 		{
+			// An explicit profile is a hard failure even with usable credentials in
+			// the environment, because the operator named it. Asserted so the
+			// absence of a fallback reads as a decision rather than an oversight.
+			name: "explicit profile does not fall back to the environment",
+			env:  setEnvCredentials,
+			cfg: effectiveConfig{
+				Profile:       "definitely-not-a-real-profile",
+				ProfileSource: profileSourceFlag,
+				Region:        "us-east-1",
+			},
+			contains: []string{
+				"failed to get shared config profile",
+				"AWS profile definitely-not-a-real-profile from --profile",
+			},
+		},
+		{
 			// The profile was outranked, so the failure came from the environment.
 			// Advising `aws sso login` for the configured profile — which is what
 			// this used to do — sends the operator to repair something this attempt
 			// never consulted.
 			name: "environment credentials outranking an SSO profile",
 			env: func(t *testing.T) {
-				// A token file that does not exist: the environment carries web
-				// identity credentials, and they fail, with no network involved.
+				// A token file that does not exist, with the role ARN that makes it
+				// count: the environment carries web identity credentials, and they
+				// fail, with no network involved.
 				t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", filepath.Join(t.TempDir(), "absent-token"))
 				t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/Example")
 			},
@@ -303,13 +465,30 @@ func TestAuthFailureNamesTheCredentialSource(t *testing.T) {
 			},
 			absent: []string{"aws sso login"},
 		},
+		{
+			// And the converse: when the SSO profile *was* what resolution used, the
+			// advice is right — but it still has to say where the profile came from,
+			// which is the specific thing #58 called "actively misleading".
+			name: "SSO profile that was applied",
+			cfg: effectiveConfig{
+				Profile:       "sso-only",
+				ProfileSource: profileSourceFile,
+				Region:        "us-east-1",
+			},
+			contains: []string{
+				"aws sso login --profile sso-only",
+				"AWS profile sso-only from aws_profile in config.toml",
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			isolateAWSEnv(t)
-			tc.env(t)
+			if tc.env != nil {
+				tc.env(t)
+			}
 			cfg := tc.cfg
 			cfg.NonInteractive = true
-			_, _, err := authTestApp().awsCredentials(context.Background(), cfg)
+			_, _, err := authTestApp().awsCredentials(authTestContext(t), cfg)
 			if err == nil {
 				t.Fatal("expected an auth failure")
 			}
@@ -330,28 +509,44 @@ func TestAuthFailureNamesTheCredentialSource(t *testing.T) {
 	}
 }
 
-// The precedence order is unchanged; what is new is that the answer carries
-// which source gave it, because that is what credential resolution turns on.
+// The precedence order, and the source that answered. AWS_DEFAULT_PROFILE is
+// new here: the SDK treats it as an alias of AWS_PROFILE, so leaving it out
+// meant a config-file profile was applied programmatically over one the
+// operator had exported.
 func TestResolveProfileTracksProvenance(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		bmcpEnv    string
 		awsEnv     string
+		awsDefault string
 		file       string
 		wantValue  string
 		wantSource profileSource
 	}{
 		{name: "nothing set", wantSource: profileSourceNone},
 		{name: "file only", file: "from-file", wantValue: "from-file", wantSource: profileSourceFile},
-		{name: "aws env beats file", awsEnv: "from-aws", file: "from-file", wantValue: "from-aws", wantSource: profileSourceAWSEnv},
 		{
-			name: "bmcp env beats both", bmcpEnv: "from-bmcp", awsEnv: "from-aws", file: "from-file",
+			name: "aws env beats file", awsEnv: "from-aws", file: "from-file",
+			wantValue: "from-aws", wantSource: profileSourceAWSEnv,
+		},
+		{
+			name: "aws default profile beats file", awsDefault: "from-aws-default", file: "from-file",
+			wantValue: "from-aws-default", wantSource: profileSourceAWSEnv,
+		},
+		{
+			name: "aws profile beats aws default profile", awsEnv: "from-aws", awsDefault: "from-aws-default",
+			wantValue: "from-aws", wantSource: profileSourceAWSEnv,
+		},
+		{
+			name:    "bmcp env beats everything",
+			bmcpEnv: "from-bmcp", awsEnv: "from-aws", awsDefault: "from-aws-default", file: "from-file",
 			wantValue: "from-bmcp", wantSource: profileSourceBMCPEnv,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("BMCP_PROFILE", tc.bmcpEnv)
 			t.Setenv("AWS_PROFILE", tc.awsEnv)
+			t.Setenv("AWS_DEFAULT_PROFILE", tc.awsDefault)
 			value, source := resolveProfile(tc.file)
 			if value != tc.wantValue || source != tc.wantSource {
 				t.Fatalf("got (%q, %q), want (%q, %q)", value, source, tc.wantValue, tc.wantSource)
@@ -391,44 +586,6 @@ func TestFlagProfileIsRecordedAsExplicit(t *testing.T) {
 	}
 }
 
-// doctor --deep is what BORIS.md sends an agent to when a call has already
-// failed on auth, so it is the one place that has to answer "which credentials
-// is bmcp using" out loud. Reporting a bare "ok" left #58 undiagnosable: a
-// machine silently ignoring its environment credentials printed the same row as
-// one using them.
-func TestDoctorDeepNamesTheCredentialSource(t *testing.T) {
-	isolateAWSEnv(t)
-	setEnvCredentials(t)
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Chdir(t.TempDir())
-	tools := []tool{{Name: "tools___search_aws", Description: "Search."}}
-	borisHome := setupInstallCatalog(t, home, tools)
-	fileCfg, err := readConfig(filepath.Join(borisHome, "config.toml"))
-	if err != nil {
-		t.Fatalf("read config: %v", err)
-	}
-	fileCfg.AWSProfile = "has-static"
-	if err := writeConfig(filepath.Join(borisHome, "config.toml"), fileCfg); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	var stdout, stderr bytes.Buffer
-	a := &app{
-		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
-		now: time.Now, httpClient: &fakeMCP{tools: tools}, credentials: staticCreds(),
-	}
-	if code := a.run([]string{"doctor", "--deep"}); code != 0 {
-		t.Fatalf("doctor exit %d, stdout:\n%s\nstderr: %s", code, stdout.String(), stderr.String())
-	}
-	if rows := doctorRows(t, stdout.String()); rows["auth"] != "ok" {
-		t.Fatalf("auth row %q, want ok, in:\n%s", rows["auth"], stdout.String())
-	}
-	want := "environment credentials (AWS_ACCESS_KEY_ID), which outrank AWS profile has-static from aws_profile in config.toml"
-	if !strings.Contains(stdout.String(), want) {
-		t.Fatalf("doctor should report %q, got:\n%s", want, stdout.String())
-	}
-}
-
 // What doctor prints and what an auth failure names, for each shape the
 // resolution can settle into.
 func TestDescribeCredentialSource(t *testing.T) {
@@ -440,7 +597,6 @@ func TestDescribeCredentialSource(t *testing.T) {
 	}{
 		{
 			name: "nothing configured and nothing in the environment",
-			env:  func(*testing.T) {},
 			want: "the default AWS credential chain",
 		},
 		{
@@ -452,7 +608,6 @@ func TestDescribeCredentialSource(t *testing.T) {
 		},
 		{
 			name: "profile applied",
-			env:  func(*testing.T) {},
 			cfg:  effectiveConfig{Profile: "has-static", ProfileSource: profileSourceFile},
 			want: "AWS profile has-static from aws_profile in config.toml",
 		},
@@ -468,13 +623,105 @@ func TestDescribeCredentialSource(t *testing.T) {
 			cfg:  effectiveConfig{Profile: "has-static", ProfileSource: profileSourceFlag},
 			want: "AWS profile has-static from --profile",
 		},
+		{
+			// Unreachable through resolveProfile, which never returns a value
+			// without a source. Pinned because a message trailing off after "from"
+			// would be a poor way to discover it had become reachable.
+			name: "profile with no provenance",
+			cfg:  effectiveConfig{Profile: "typed-at-a-prompt"},
+			want: "AWS profile typed-at-a-prompt",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			isolateAWSEnv(t)
-			tc.env(t)
+			if tc.env != nil {
+				tc.env(t)
+			}
 			if got := describeCredentialSource(tc.cfg); got != tc.want {
 				t.Fatalf("got %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// doctorCredentials seeds a machine with a catalog and an aws_profile, then runs
+// doctor and returns its stdout. args selects the routine or the deep path.
+func doctorCredentials(t *testing.T, profile string, creds credentialsFunc, args ...string) (string, int) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	tools := []tool{{Name: "tools___search_aws", Description: "Search."}}
+	borisHome := setupInstallCatalog(t, home, tools)
+	fileCfg, err := readConfig(filepath.Join(borisHome, "config.toml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	fileCfg.AWSProfile = profile
+	if err := writeConfig(filepath.Join(borisHome, "config.toml"), fileCfg); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: &fakeMCP{tools: tools}, credentials: creds,
+	}
+	code := a.run(append([]string{"doctor"}, args...))
+	if stderr.Len() > 0 {
+		t.Logf("doctor stderr: %s", stderr.String())
+	}
+	return stdout.String(), code
+}
+
+// The diagnostic half of #58. A machine silently discarding its environment
+// credentials used to print exactly what a healthy one did, so the operator had
+// no way to see which identity was in play — and the routine path is where they
+// would look, because it is the one BORIS.md puts in front of every session.
+//
+// Reported on that path too, and that is safe: describeCredentialSource reads
+// the environment and the resolved config, so the promise that a fresh-catalog
+// doctor reaches neither AWS nor the server still holds. refusingCreds is what
+// holds it: it fails the test if anything authenticates.
+func TestDoctorNamesTheCredentialSourceWithoutAuthenticating(t *testing.T) {
+	isolateAWSEnv(t)
+	setEnvCredentials(t)
+	stdout, code := doctorCredentials(t, "has-static", refusingCreds(t))
+	if code != 0 {
+		t.Fatalf("doctor exit %d, stdout:\n%s", code, stdout)
+	}
+	rows := doctorRows(t, stdout)
+	if rows["credentials"] != "ok" {
+		t.Fatalf("credentials row %q, want ok, in:\n%s", rows["credentials"], stdout)
+	}
+	if _, ok := rows["auth"]; ok {
+		t.Fatalf("the routine path must not report auth, got:\n%s", stdout)
+	}
+	want := "environment credentials (AWS_ACCESS_KEY_ID), which outrank AWS profile has-static from aws_profile in config.toml"
+	if !strings.Contains(stdout, want) {
+		t.Fatalf("doctor should report %q, got:\n%s", want, stdout)
+	}
+}
+
+// The failing auth row, end to end, with credentials resolved for real. It is
+// the highest-stakes output in the change: AGENTS.md says agents read a failing
+// doctor as "BORIS is broken" and stop, so the exit code and the message both
+// have to be right.
+func TestDoctorDeepReportsAFailingAuthRowWithItsSource(t *testing.T) {
+	isolateAWSEnv(t)
+	stdout, code := doctorCredentials(t, "definitely-not-a-real-profile", nil, "--deep")
+	if code != exitGeneric {
+		t.Fatalf("doctor exit %d, want %d, stdout:\n%s", code, exitGeneric, stdout)
+	}
+	rows := doctorRows(t, stdout)
+	if rows["auth"] != "fail" {
+		t.Fatalf("auth row %q, want fail, in:\n%s", rows["auth"], stdout)
+	}
+	for _, want := range []string{
+		"failed to get shared config profile",
+		"AWS profile definitely-not-a-real-profile from aws_profile in config.toml",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("doctor should report %q, got:\n%s", want, stdout)
+		}
 	}
 }

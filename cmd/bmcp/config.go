@@ -40,6 +40,15 @@ const (
 	profileSourceFile    profileSource = "aws_profile in config.toml"
 )
 
+// namedForThisInvocation reports whether the caller asked for this profile now,
+// rather than the machine carrying a persisted or exported default. It is the
+// one question credential resolution asks of the provenance, and the concept
+// the rest of the change is written around: only a profile named now outranks
+// the credentials the environment carries. See sharedProfileFor.
+func (source profileSource) namedForThisInvocation() bool {
+	return source == profileSourceFlag || source == profileSourceBMCPEnv
+}
+
 type effectiveConfig struct {
 	Home       string
 	ConfigPath string
@@ -333,22 +342,24 @@ func inferRegion(raw string) string {
 	return ""
 }
 
-// resolveProfile keeps the profile's provenance alongside its value. The
-// precedence is unchanged — BMCP_PROFILE, then AWS_PROFILE, then the config
-// file — but firstNonEmpty threw away which of the three answered, and that is
-// the one thing credential resolution needs to know.
+// resolveProfile keeps the profile's provenance alongside its value, because
+// firstNonEmpty threw away which source answered and that is the one thing
+// credential resolution needs to know.
+//
+// AWS_DEFAULT_PROFILE is read here where the old chain ignored it. The SDK
+// treats it as an alias of AWS_PROFILE (profileEnvKeys in env_config.go), so
+// leaving it out meant a config-file profile was applied programmatically over
+// a profile the operator had exported — the same inversion #58 is about, one
+// variable along.
 func resolveProfile(fileProfile string) (string, profileSource) {
-	for _, candidate := range []struct {
-		value  string
-		source profileSource
-	}{
-		{os.Getenv("BMCP_PROFILE"), profileSourceBMCPEnv},
-		{os.Getenv("AWS_PROFILE"), profileSourceAWSEnv},
-		{fileProfile, profileSourceFile},
-	} {
-		if candidate.value != "" {
-			return candidate.value, candidate.source
-		}
+	if v := os.Getenv("BMCP_PROFILE"); v != "" {
+		return v, profileSourceBMCPEnv
+	}
+	if v := firstNonEmpty(os.Getenv("AWS_PROFILE"), os.Getenv("AWS_DEFAULT_PROFILE")); v != "" {
+		return v, profileSourceAWSEnv
+	}
+	if fileProfile != "" {
+		return fileProfile, profileSourceFile
 	}
 	return "", profileSourceNone
 }
