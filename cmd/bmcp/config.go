@@ -37,7 +37,10 @@ const (
 	profileSourceFlag    profileSource = "--profile"
 	profileSourceBMCPEnv profileSource = "BMCP_PROFILE"
 	profileSourceAWSEnv  profileSource = "AWS_PROFILE"
-	profileSourceFile    profileSource = "aws_profile in config.toml"
+	// Separate from profileSourceAWSEnv only so a message names the variable the
+	// operator actually set. The two behave identically in every decision.
+	profileSourceAWSDefaultEnv profileSource = "AWS_DEFAULT_PROFILE"
+	profileSourceFile          profileSource = "aws_profile in config.toml"
 )
 
 // namedForThisInvocation reports whether the caller asked for this profile now,
@@ -355,8 +358,11 @@ func resolveProfile(fileProfile string) (string, profileSource) {
 	if v := os.Getenv("BMCP_PROFILE"); v != "" {
 		return v, profileSourceBMCPEnv
 	}
-	if v := firstNonEmpty(os.Getenv("AWS_PROFILE"), os.Getenv("AWS_DEFAULT_PROFILE")); v != "" {
+	if v := os.Getenv("AWS_PROFILE"); v != "" {
 		return v, profileSourceAWSEnv
+	}
+	if v := os.Getenv("AWS_DEFAULT_PROFILE"); v != "" {
+		return v, profileSourceAWSDefaultEnv
 	}
 	if fileProfile != "" {
 		return fileProfile, profileSourceFile

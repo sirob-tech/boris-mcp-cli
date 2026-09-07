@@ -99,6 +99,8 @@ func applyProfileProvenance(t *testing.T, source profileSource, profile string) 
 		t.Setenv("BMCP_PROFILE", profile)
 	case profileSourceAWSEnv:
 		t.Setenv("AWS_PROFILE", profile)
+	case profileSourceAWSDefaultEnv:
+		t.Setenv("AWS_DEFAULT_PROFILE", profile)
 	}
 }
 
@@ -365,6 +367,7 @@ func TestSharedProfileForHierarchy(t *testing.T) {
 		{source: profileSourceFlag},
 		{source: profileSourceBMCPEnv},
 		{source: profileSourceAWSEnv, yieldsToEnv: true},
+		{source: profileSourceAWSDefaultEnv, yieldsToEnv: true},
 		{source: profileSourceFile, yieldsToEnv: true},
 	}
 	for _, s := range sources {
@@ -531,7 +534,9 @@ func TestResolveProfileTracksProvenance(t *testing.T) {
 		},
 		{
 			name: "aws default profile beats file", awsDefault: "from-aws-default", file: "from-file",
-			wantValue: "from-aws-default", wantSource: profileSourceAWSEnv,
+			// Named as itself, not as AWS_PROFILE: an operator told to check the
+			// wrong variable is the failure mode this change is about.
+			wantValue: "from-aws-default", wantSource: profileSourceAWSDefaultEnv,
 		},
 		{
 			name: "aws profile beats aws default profile", awsEnv: "from-aws", awsDefault: "from-aws-default",
