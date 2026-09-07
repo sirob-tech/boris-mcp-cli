@@ -323,7 +323,7 @@ func (a *app) cmdInit(flags globalFlags, args []string) int {
 		if line, err := reader.ReadString('\n'); err == nil {
 			if v := strings.TrimSpace(line); v != "" {
 				flags.profile = v
-				cfg.Profile = v
+				cfg.Profile, cfg.ProfileSource = v, profileSourcePrompt
 			}
 		}
 	} else if !exists && flags.url == "" {
@@ -839,6 +839,20 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 	} else {
 		add("config", true, cfg.ConfigPath)
 		add("url", validateURL(cfg.URL, flags.allowHTTP) == nil, sanitizeURL(cfg.URL))
+		// Which credentials a call would use, on every path including the routine
+		// one. #58 was undiagnosable from the outside partly because nothing bmcp
+		// printed said whether the configured profile or something ambient in the
+		// environment was in play, so a machine quietly discarding its environment
+		// credentials reported exactly what a healthy one did.
+		//
+		// Always ok, because it is a statement rather than a check:
+		// describeCredentialSource reads the environment and the resolved config
+		// and authenticates nothing, so it has nothing to fail at. That is also
+		// what lets it run while the catalog is fresh, where the promise
+		// BORIS.md makes is that doctor reaches neither AWS nor the server. The
+		// `auth` row below is the one that says whether these credentials work,
+		// and it still only appears once something has asked to go remote.
+		add("credentials", true, describeCredentialSource(cfg))
 		disk, diskErr := readCache(cfg.ToolsPath)
 		deep = flags.doctorDeep || !a.catalogIsFresh(cfg, disk, diskErr)
 		if deep {
@@ -1096,7 +1110,8 @@ Global flags:
                                Takes no arguments and no command
   --no-auto-update             Do not update automatically during this command
   --url, -u <url>              Override BORIS MCP URL
-  --profile, -p <profile>      Override AWS profile
+  --profile, -p <profile>      Use this AWS profile, ahead of any credentials
+                               the environment carries
   --region <region>            Override SigV4 region
   --service <service>          Override SigV4 service
   --format <human|json|ndjson> Answer under the machine-output contract. json is

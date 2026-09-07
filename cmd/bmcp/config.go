@@ -27,12 +27,48 @@ type configFile struct {
 	CallTimeout    time.Duration
 }
 
+// profileSource is where effectiveConfig.Profile came from. It matters to
+// credential resolution and nowhere else — see sharedProfileFor — and the
+// values double as the label an auth failure names the profile's origin by.
+type profileSource string
+
+const (
+	profileSourceNone    profileSource = ""
+	profileSourceFlag    profileSource = "--profile"
+	profileSourceBMCPEnv profileSource = "BMCP_PROFILE"
+	// A profile typed at the `bmcp init` prompt. Named for this invocation just
+	// as the flag is, but it did not come from the flag, and a diagnostic that
+	// says "--profile" sends the operator to inspect an argument they never
+	// passed.
+	profileSourcePrompt profileSource = "the bmcp init prompt"
+	profileSourceAWSEnv profileSource = "AWS_PROFILE"
+	// Separate from profileSourceAWSEnv only so a message names the variable the
+	// operator actually set. The two behave identically in every decision.
+	profileSourceAWSDefaultEnv profileSource = "AWS_DEFAULT_PROFILE"
+	profileSourceFile          profileSource = "aws_profile in config.toml"
+)
+
+// namedForThisInvocation reports whether the caller asked for this profile now,
+// rather than the machine carrying a persisted or exported default. It is the
+// one question credential resolution asks of the provenance, and the concept
+// the rest of the change is written around: only a profile named now outranks
+// the credentials the environment carries. See sharedProfileFor.
+func (source profileSource) namedForThisInvocation() bool {
+	return source == profileSourceFlag || source == profileSourceBMCPEnv || source == profileSourcePrompt
+}
+
 type effectiveConfig struct {
-	Home           string
-	ConfigPath     string
-	ToolsPath      string
-	URL            string
-	Profile        string
+	Home       string
+	ConfigPath string
+	ToolsPath  string
+	URL        string
+	Profile    string
+	// ProfileSource carries Profile's provenance because the AWS SDK's
+	// credential hierarchy depends on it: a profile the caller named for this
+	// invocation is an instruction, while one this machine happens to have
+	// persisted is only a default, and awsCredentials must not treat the second
+	// as the first. See sharedProfileFor.
+	ProfileSource  profileSource
 	Region         string
 	Service        string
 	SyncTTL        time.Duration
@@ -56,9 +92,13 @@ func defaultEffective(flags globalFlags) effectiveConfig {
 			home = filepath.Join(userHome, ".bmcp")
 		}
 	}
+	profileSrc := profileSourceNone
+	if flags.profile != "" {
+		profileSrc = profileSourceFlag
+	}
 	return effectiveConfig{
 		Home: home, ConfigPath: filepath.Join(home, "config.toml"), ToolsPath: filepath.Join(home, "tools.json"),
-		URL: flags.url, Profile: flags.profile, Region: flags.region, Service: flags.service,
+		URL: flags.url, Profile: flags.profile, ProfileSource: profileSrc, Region: flags.region, Service: flags.service,
 		SyncTTL: defaultTTL, ConnectTimeout: defaultConnect, SyncTimeout: defaultSync, CallTimeout: defaultCall,
 		NonInteractive: flags.nonInteractive || truthy(os.Getenv("BMCP_NON_INTERACTIVE")),
 		AutoUpdate:     true,
@@ -115,7 +155,7 @@ func (a *app) loadEffective(flags globalFlags, require bool) (effectiveConfig, b
 		cfg.URL = firstNonEmpty(os.Getenv("BMCP_URL"), fileCfg.URL)
 	}
 	if flags.profile == "" {
-		cfg.Profile = firstNonEmpty(os.Getenv("BMCP_PROFILE"), os.Getenv("AWS_PROFILE"), fileCfg.AWSProfile)
+		cfg.Profile, cfg.ProfileSource = resolveProfile(fileCfg.AWSProfile)
 	}
 	if flags.region == "" {
 		cfg.Region = firstNonEmpty(os.Getenv("BMCP_REGION"), fileCfg.Region)
@@ -308,6 +348,31 @@ func inferRegion(raw string) string {
 		}
 	}
 	return ""
+}
+
+// resolveProfile keeps the profile's provenance alongside its value, because
+// firstNonEmpty threw away which source answered and that is the one thing
+// credential resolution needs to know.
+//
+// AWS_DEFAULT_PROFILE is read here where the old chain ignored it. The SDK
+// treats it as an alias of AWS_PROFILE (profileEnvKeys in env_config.go), so
+// leaving it out meant a config-file profile was applied programmatically over
+// a profile the operator had exported — the same inversion #58 is about, one
+// variable along.
+func resolveProfile(fileProfile string) (string, profileSource) {
+	if v := os.Getenv("BMCP_PROFILE"); v != "" {
+		return v, profileSourceBMCPEnv
+	}
+	if v := os.Getenv("AWS_PROFILE"); v != "" {
+		return v, profileSourceAWSEnv
+	}
+	if v := os.Getenv("AWS_DEFAULT_PROFILE"); v != "" {
+		return v, profileSourceAWSDefaultEnv
+	}
+	if fileProfile != "" {
+		return fileProfile, profileSourceFile
+	}
+	return "", profileSourceNone
 }
 
 func firstNonEmpty(vals ...string) string {

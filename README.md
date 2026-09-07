@@ -230,10 +230,45 @@ bmcp init --url <url> --profile <aws-profile>
 ```
 
 `--profile` is optional; if omitted, the AWS SDK default credential chain is
-used. The BORIS MCP server requires AWS credentials for any account in the AWS
-Organization. `init` saves config, syncs the remote tool catalog, and in
-interactive sessions offers to install agent instructions for detected
-harnesses.
+used. `init` saves config, syncs the remote tool catalog, and in interactive
+sessions offers to install agent instructions for detected harnesses.
+
+### Which AWS credentials are used
+
+The BORIS MCP server requires AWS credentials for any account in the AWS
+Organization. `bmcp` resolves them in this order:
+
+1. `--profile <name>`, or `BMCP_PROFILE` — a profile named for this
+   invocation. Applied ahead of anything in the environment, because asking
+   for a profile now is an instruction rather than a default.
+2. Credentials the environment carries: `AWS_ACCESS_KEY_ID` with
+   `AWS_SECRET_ACCESS_KEY` (what `aws-vault exec` and most CI runners inject),
+   or `AWS_WEB_IDENTITY_TOKEN_FILE` with `AWS_ROLE_ARN` (IRSA).
+3. `AWS_PROFILE` or `AWS_DEFAULT_PROFILE`, then `aws_profile` in `config.toml`.
+4. Whatever that profile resolves through — SSO, `credential_process`,
+   `source_profile`, `AWS_CONTAINER_CREDENTIALS_*`, an instance role — or, with
+   no profile at all, the SDK's default chain.
+
+So `aws-vault exec <profile> -- bmcp ...` works, and so does a CI runner that
+injects credentials into the environment, with an `aws_profile` still sitting in
+`config.toml` from `bmcp init`. Pass `--profile` when you want the profile to
+win instead.
+
+Only the two sources in step 2 outrank a profile, because they are the only two
+the AWS SDK itself places above one. `AWS_CONTAINER_CREDENTIALS_*` is not among
+them — in the SDK it is a *profile's* fallback, tried after that profile's own
+SSO, static keys and `credential_process` — so on ECS or EKS Pod Identity, leave
+`aws_profile` out of `config.toml` rather than expecting the task role to
+displace it.
+
+Because `BMCP_PROFILE` counts as naming a profile for the invocation, exporting
+it from a shell profile will quietly defeat `aws-vault exec` for every later
+call. Prefer `aws_profile` in `config.toml` for a standing default, and keep
+`BMCP_PROFILE` for a shell where you mean it.
+
+Every `bmcp doctor` reports a `credentials` row naming the source a call would
+use, and an authentication failure names the one it tried — so a failure never
+sends you to repair a profile the call never consulted.
 
 Harness detection checks for a known executable on `PATH` or an existing config
 directory such as `~/.claude`, `~/.codex`, `~/.config/opencode`, `~/.cursor`,

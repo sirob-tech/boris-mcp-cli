@@ -864,6 +864,8 @@ This is a local check: while the cached tool catalog is fresh it authenticates n
 
 If a tool call later fails on authentication or connectivity, run ` + "`bmcp doctor --deep`" + `, which checks credentials, the server and the live catalog for real, and says which of them is at fault. The BORIS MCP server requires AWS credentials for any account in the AWS Organization; if auth is unavailable, use the normal environment credential workflow available in this harness or explain the credential requirement to the user.
 
+Every ` + "`bmcp doctor`" + ` reports a ` + "`credentials`" + ` row naming which credentials a call would use: an AWS profile and where that profile came from, or the credentials the environment carries and the profile they outrank. If that names a source the user did not intend — stale ` + "`AWS_ACCESS_KEY_ID`" + ` in the environment displacing their configured profile, say — ` + "`bmcp --profile <name> <tool>`" + ` overrides it for one call, since a profile named for the invocation outranks anything ambient.
+
 Useful commands:
 
 - ` + "`bmcp list`" + `: list remote tools as NDJSON, one object per line: ` + "`name`" + ` (full name, always callable), ` + "`display_name`" + `, ` + "`description`" + `, ` + "`last_sync`" + `. Call tools by ` + "`name`" + `. Add ` + "`--format human`" + ` for indented text, or ` + "`--format json`" + ` for one document whose ` + "`count`" + ` says how many records it should hold.
