@@ -3,11 +3,17 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/credentials/processcreds"
 )
 
 // The static credentials the fixture profile carries, and the ones the
@@ -681,6 +687,9 @@ func doctorCredentials(t *testing.T, profile string, creds credentialsFunc, args
 	if stderr.Len() > 0 {
 		t.Logf("doctor stderr: %s", stderr.String())
 	}
+	// Both streams, because a fix that moved the SDK's text from the report to a
+	// warning on stderr would satisfy an assertion that only read stdout.
+	assertNoLeak(t, stderr.String())
 	return stdout.String(), code
 }
 
@@ -813,5 +822,454 @@ func TestInitPromptProfileNamesItselfHonestly(t *testing.T) {
 	want := "AWS profile has-static from the bmcp init prompt"
 	if got := describeCredentialSource(cfg); got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+// The fake secret the credential_process fixtures emit. Distinct from every
+// other key in this file so an assertion that it is absent cannot pass because
+// something else was redacted.
+const (
+	leakedKeyID  = "AKIALEAKEDFIXTURE"
+	leakedSecret = "leakedsecretfixturevalue"
+)
+
+// credentialProcessProfile appends a profile backed by a credential_process
+// helper to the fixture config and returns its name. body is written to the
+// helper's stdout verbatim — including whatever precedes the JSON, which is the
+// whole point: a banner, a warning line or a shell profile's own output is what
+// makes the SDK's parse fail with the credentials still in the buffer.
+func credentialProcessProfile(t *testing.T, name, body string) string {
+	t.Helper()
+	helper := filepath.Join(t.TempDir(), "helper.sh")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\ncat <<'CREDENTIALS'\n"+body+"\nCREDENTIALS\n"), 0o700); err != nil {
+		t.Fatalf("write helper: %v", err)
+	}
+	appendSharedConfig(t, "\n[profile "+name+"]\nregion = us-east-1\ncredential_process = "+helper+"\n")
+	return name
+}
+
+// appendSharedConfig adds sections to the config file isolateAWSEnv installed,
+// so a case needing its own profile shape does not have to be carried by every
+// test that calls isolateAWSEnv.
+func appendSharedConfig(t *testing.T, body string) {
+	t.Helper()
+	// Checked against the temp root rather than merely for being set. A developer
+	// who exports AWS_CONFIG_FILE would otherwise have had these fixture profiles
+	// — and a credential_process line naming a path that vanishes at test exit —
+	// appended to their own ~/.aws/config by a test that believed it was isolated.
+	path := os.Getenv("AWS_CONFIG_FILE")
+	if !strings.HasPrefix(path, os.TempDir()) {
+		t.Fatalf("appendSharedConfig would write outside the test's fixtures: AWS_CONFIG_FILE=%q; isolateAWSEnv must run first", path)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open shared config: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(body); err != nil {
+		t.Fatalf("append shared config: %v", err)
+	}
+}
+
+// #60. processcreds embeds the helper's complete stdout in its parse error, and
+// bmcp forwarded that error unchanged into the auth_failure `message` field and
+// doctor --deep's auth row — both places built to be captured verbatim into
+// agent transcripts and CI logs.
+//
+// The assertion is that the secret is absent, not that the wording is right: an
+// assertion on the wording would pass on output that still carried the key.
+func TestCredentialProcessOutputNeverReachesAnErrorMessage(t *testing.T) {
+	// A banner line before otherwise valid JSON, which is the shape every real
+	// report of this takes — a wrapper, a helper, or the operator's own shell
+	// profile writing one line to stdout.
+	const bannerThenJSON = `Note: vault backend v2
+{"Version":1,"AccessKeyId":"` + leakedKeyID + `","SecretAccessKey":"` + leakedSecret + `"}`
+
+	// The same output with a SessionToken, as any helper issuing temporary
+	// credentials returns. This is case B from the issue: looksLikeSSO matched the
+	// substring "token" inside the leaked payload, so the two defects masked each
+	// other — the secret was suppressed, and the operator was told to run
+	// `aws sso login` for a profile with no SSO configuration at all.
+	const withSessionToken = `Note: vault backend v2
+{"Version":1,"AccessKeyId":"` + leakedKeyID + `","SecretAccessKey":"` + leakedSecret + `","SessionToken":"` + leakedSecret + `"}`
+
+	for _, tc := range []struct {
+		name     string
+		body     string
+		contains []string
+	}{
+		{
+			name: "unparseable output",
+			body: bannerThenJSON,
+			contains: []string{
+				"credential_process helper printed output that is not valid credential JSON",
+				"AWS profile leaky from aws_profile in config.toml",
+			},
+		},
+		{
+			name: "unparseable output carrying a session token",
+			body: withSessionToken,
+			contains: []string{
+				"credential_process helper printed output that is not valid credential JSON",
+				"AWS profile leaky from aws_profile in config.toml",
+			},
+		},
+		{
+			// Valid JSON of the wrong shape, which reaches json.UnmarshalTypeError
+			// rather than json.SyntaxError. A separate arm of the type switch, and
+			// one an assertion on the SyntaxError case alone would leave dead.
+			name: "output whose fields have the wrong type",
+			body: `{"Version":"1","AccessKeyId":"` + leakedKeyID + `","SecretAccessKey":"` + leakedSecret + `"}`,
+			contains: []string{
+				"credential_process helper printed output that is not valid credential JSON",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateAWSEnv(t)
+			profile := credentialProcessProfile(t, "leaky", tc.body)
+			cfg := effectiveConfig{
+				Profile:        profile,
+				ProfileSource:  profileSourceFile,
+				Region:         "us-east-1",
+				NonInteractive: true,
+			}
+			_, _, err := authTestApp().awsCredentials(authTestContext(t), cfg)
+			if err == nil {
+				t.Fatal("expected an auth failure")
+			}
+			if !isAuthErr(err) {
+				t.Fatalf("expected an auth_failure, got %T: %v", err, err)
+			}
+			assertNoLeak(t, err.Error())
+			// And the advice is about the helper rather than about SSO, which the
+			// profile does not use.
+			if strings.Contains(err.Error(), "aws sso login") {
+				t.Fatalf("credential_process profile sent to aws sso login: %q", err.Error())
+			}
+			for _, want := range tc.contains {
+				if !strings.Contains(err.Error(), want) {
+					t.Fatalf("message %q should contain %q", err.Error(), want)
+				}
+			}
+		})
+	}
+}
+
+// The same leak through doctor --deep, which is the other place the SDK's error
+// text is printed verbatim — and the one BORIS.md tells agents to run when a
+// call has already failed on auth, so it is the more likely of the two to end
+// up in a transcript.
+func TestDoctorDeepDoesNotPrintCredentialProcessOutput(t *testing.T) {
+	isolateAWSEnv(t)
+	profile := credentialProcessProfile(t, "leaky", `Note: vault backend v2
+{"Version":1,"AccessKeyId":"`+leakedKeyID+`","SecretAccessKey":"`+leakedSecret+`"}`)
+	stdout, code := doctorCredentials(t, profile, nil, "--deep")
+	if code != exitGeneric {
+		t.Fatalf("doctor exit %d, want %d, stdout:\n%s", code, exitGeneric, stdout)
+	}
+	rows := doctorRows(t, stdout)
+	if rows["auth"] != "fail" {
+		t.Fatalf("auth row %q, want fail, in:\n%s", rows["auth"], stdout)
+	}
+	assertNoLeak(t, stdout)
+	if !strings.Contains(stdout, "credential_process helper printed output that is not valid credential JSON") {
+		t.Fatalf("doctor should name the helper as the cause, got:\n%s", stdout)
+	}
+}
+
+// assertNoLeak fails if any part of the helper's stdout survived into text bmcp
+// printed. The banner is checked alongside the keys because it is the reason
+// the parse failed: if it reached the output, so did everything after it.
+//
+// The eight-character prefixes are what make this an assertion about redaction
+// rather than about exact strings. A fix that truncated the SDK's text at a
+// byte budget, or kept a recognisable head of the key the way a masked value
+// does, would pass a whole-string check while still handing over enough to
+// identify the credential — and #60 is explicit that a partial redaction reads
+// as safe when it is not.
+func assertNoLeak(t *testing.T, out string) {
+	t.Helper()
+	for _, secret := range []string{
+		leakedSecret, leakedKeyID, "vault backend v2", "parse failed of process output",
+		leakedSecret[:8], leakedKeyID[:8],
+	} {
+		if strings.Contains(out, secret) {
+			t.Fatalf("credential_process output leaked %q into:\n%s", secret, out)
+		}
+	}
+}
+
+// A helper that fails outright rather than printing something unparseable. It
+// carries no payload, but it is withheld on the same rule, so what the operator
+// gets has to still say enough to act on — and the exit status is the detail
+// worth keeping, since 127 and 126 name a helper that is missing or not
+// executable.
+func TestCredentialProcessExitStatusIsReported(t *testing.T) {
+	isolateAWSEnv(t)
+	helper := filepath.Join(t.TempDir(), "missing-helper.sh")
+	appendSharedConfig(t, "\n[profile broken]\nregion = us-east-1\ncredential_process = "+helper+"\n")
+	cfg := effectiveConfig{
+		Profile:        "broken",
+		ProfileSource:  profileSourceFile,
+		Region:         "us-east-1",
+		NonInteractive: true,
+	}
+	_, _, err := authTestApp().awsCredentials(authTestContext(t), cfg)
+	if err == nil {
+		t.Fatal("expected an auth failure")
+	}
+	// "exited with status" and not just "credential_process helper": the generic
+	// fallback satisfies the looser string, so without this the exec.ExitError
+	// branch could be deleted with the suite still green.
+	for _, want := range []string{"credential_process helper exited with status ", "AWS profile broken from aws_profile in config.toml"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("message %q should contain %q", err.Error(), want)
+		}
+	}
+}
+
+// SSO remediation is decided by configuration now, not by whether the error
+// text happens to contain "sso", "token" or "expired".
+func TestProfileUsesSSO(t *testing.T) {
+	isolateAWSEnv(t)
+	appendSharedConfig(t, `
+[sso-session corp]
+sso_start_url = https://example.awsapps.com/start
+sso_region = us-east-1
+
+[profile sso-session-form]
+sso_session = corp
+sso_account_id = 123456789012
+sso_role_name = ExampleRole
+region = us-east-1
+
+[profile role-from-sso]
+role_arn = arn:aws:iam::123456789012:role/Chained
+source_profile = sso-session-form
+region = us-east-1
+
+[profile role-from-static]
+role_arn = arn:aws:iam::123456789012:role/Chained
+source_profile = has-static
+region = us-east-1
+
+[profile stale-sso-over-static]
+sso_session = corp
+role_arn = arn:aws:iam::123456789012:role/Chained
+source_profile = has-static
+region = us-east-1
+
+[profile imds-over-sso]
+role_arn = arn:aws:iam::123456789012:role/Target
+credential_source = Ec2InstanceMetadata
+sso_session = corp
+region = us-east-1
+
+[profile sso-over-helper]
+sso_session = corp
+sso_account_id = 123456789012
+sso_role_name = ExampleRole
+credential_process = /bin/false
+region = us-east-1
+`)
+	for _, tc := range []struct {
+		name    string
+		profile string
+		want    bool
+	}{
+		// The legacy form, with the start URL on the profile itself.
+		{name: "legacy sso_start_url", profile: "sso-only", want: true},
+		// The current form. Matched on sso_session, because the start URL lives in
+		// the session section rather than on the profile.
+		{name: "sso_session", profile: "sso-session-form", want: true},
+		// A role assumed from an SSO profile. The profile carries no SSO keys of its
+		// own, but an expired token still stops it working and `aws sso login` is
+		// still the fix, so the source_profile chain has to be followed.
+		{name: "role chained onto an SSO profile", profile: "role-from-sso", want: true},
+		{name: "role chained onto static keys", profile: "role-from-static", want: false},
+		// A stale sso_session line above a chain that resolves from static keys.
+		// clearCredentialOptions wipes the legacy SSO keys off a chained profile
+		// but leaves SSOSessionName, so a walk that asked every node would call
+		// this SSO and send the operator to a login the chain never uses.
+		{name: "stale sso_session above static keys", profile: "stale-sso-over-static", want: false},
+		{name: "static keys", profile: "has-static", want: false},
+		// The SDK ranks credential_source above SSO and validates no collision
+		// between them, so this profile resolves through IMDS. Calling it SSO
+		// would send an operator whose IMDS is unreachable to an irrelevant login.
+		{name: "credential_source outranking sso_session", profile: "imds-over-sso", want: false},
+		// The converse, and the reason credential_process is not in that list:
+		// the SDK ranks it below SSO, so a profile with both does resolve SSO.
+		{name: "sso_session outranking credential_process", profile: "sso-over-helper", want: true},
+		// The case the substring match got wrong: no SSO anywhere, and a failure
+		// whose text is full of the word "token".
+		{name: "credential_process", profile: credentialProcessProfile(t, "helper-backed", `{"Version":1}`), want: false},
+		{name: "profile that does not exist", profile: "definitely-not-a-real-profile", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := profileUsesSSO(authTestContext(t), tc.profile); got != tc.want {
+				t.Fatalf("profileUsesSSO(%q) = %v, want %v", tc.profile, got, tc.want)
+			}
+		})
+	}
+}
+
+// The regression the config-based SSO check introduced, and the fix for it.
+//
+// looksLikeSSO fired only on errors whose text mentioned SSO, so a network
+// failure on an SSO profile reported the network failure. profileUsesSSO fires
+// on every failure an SSO profile can produce, which is the point — but the
+// first version of it replaced the cause with "run aws sso login", so a DNS
+// failure, an AccessDenied on a chained role and an expired token all rendered
+// identically, and only one of the three is fixed by logging in.
+func TestSSOFailureStillReportsItsCause(t *testing.T) {
+	isolateAWSEnv(t)
+	// sso-only rather than a profile with a malformed SSO section: a malformed one
+	// fails inside LoadDefaultConfig, which returns before the branch this test is
+	// about. This one loads cleanly and fails at Retrieve, with no cached token
+	// under the temp HOME isolateAWSEnv installed.
+	cfg := effectiveConfig{
+		Profile:        "sso-only",
+		ProfileSource:  profileSourceFile,
+		Region:         "us-east-1",
+		NonInteractive: true,
+	}
+	_, _, err := authTestApp().awsCredentials(authTestContext(t), cfg)
+	if err == nil {
+		t.Fatal("expected an auth failure")
+	}
+	// The remedy, the source, and — the part that regressed — the cause the SDK
+	// reported, which the first version of this branch replaced outright.
+	for _, want := range []string{
+		"failed to refresh cached credentials",
+		"AWS profile sso-only from aws_profile in config.toml",
+		"aws sso login --profile sso-only",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("message %q should contain %q", err.Error(), want)
+		}
+	}
+}
+
+// The signal case of the exit-status branch, which no fixture can reach in
+// reasonable time: processcreds kills a helper that overruns DefaultTimeout,
+// one minute. Fed a synthetic ProviderError instead, wrapping a real
+// *exec.ExitError from a process that died on a signal, because the thing under
+// test is what ExitCode() returns for one — -1, which is not a status and must
+// not be printed as one.
+func TestCredentialProcessKilledHelperIsNotReportedAsAStatus(t *testing.T) {
+	isolateAWSEnv(t)
+	runErr := exec.Command("sh", "-c", "kill -9 $$").Run()
+	var exitErr *exec.ExitError
+	if !errors.As(runErr, &exitErr) {
+		t.Fatalf("expected an *exec.ExitError from a killed process, got %T: %v", runErr, runErr)
+	}
+	if exitErr.ExitCode() >= 0 {
+		t.Skipf("this platform reports a signalled process as status %d, so there is nothing to guard", exitErr.ExitCode())
+	}
+	err := credentialProcessFailure(
+		effectiveConfig{Profile: "cp", ProfileSource: profileSourceFile},
+		&processcreds.ProviderError{Err: fmt.Errorf("credential process timed out: %w", exitErr)},
+	)
+	if err == nil {
+		t.Fatal("a processcreds error must be withheld and replaced")
+	}
+	if strings.Contains(err.Error(), "-1") {
+		t.Fatalf("a signalled helper reported as a status: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "killed") {
+		t.Fatalf("message %q should say the helper was killed", err.Error())
+	}
+}
+
+// #60's misdiagnosis class, in the one shape that survived the first fix: a
+// profile carrying a stale sso_session line above a source_profile chain whose
+// leaf is a credential_process helper.
+//
+// The SDK resolves this through source_profile (resolveCredsFromProfile tests
+// Source first), so the helper is what actually fails — but a walk that asked
+// every node whether it had SSO keys would call this an SSO profile and send
+// the operator to `aws sso login` for a chain that never touches SSO.
+func TestSSOKeysAboveACredentialProcessChainDoNotClaimSSO(t *testing.T) {
+	isolateAWSEnv(t)
+	leaf := credentialProcessProfile(t, "helper-leaf", `Note: vault backend v2
+{"Version":1,"AccessKeyId":"`+leakedKeyID+`","SecretAccessKey":"`+leakedSecret+`"}`)
+	appendSharedConfig(t, `
+[profile mixed]
+sso_session = corp
+role_arn = arn:aws:iam::123456789012:role/Chained
+source_profile = `+leaf+`
+region = us-east-1
+
+[sso-session corp]
+sso_start_url = https://example.awsapps.com/start
+sso_region = us-east-1
+`)
+	if profileUsesSSO(authTestContext(t), "mixed") {
+		t.Fatal("a chain resolving through credential_process was classified as SSO")
+	}
+	cfg := effectiveConfig{
+		Profile:        "mixed",
+		ProfileSource:  profileSourceFile,
+		Region:         "us-east-1",
+		NonInteractive: true,
+	}
+	_, _, err := authTestApp().awsCredentials(authTestContext(t), cfg)
+	if err == nil {
+		t.Fatal("expected an auth failure")
+	}
+	assertNoLeak(t, err.Error())
+	if strings.Contains(err.Error(), "aws sso login") {
+		t.Fatalf("sent to aws sso login for a credential_process chain: %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "credential_process helper") {
+		t.Fatalf("message %q should name the helper as the cause", err.Error())
+	}
+}
+
+// The contract surface #60 was reported against, asserted where it is actually
+// produced rather than on the Go error behind it: stdout stays empty, the
+// failure document is alone on stderr, and its `message` field carries no part
+// of what the helper printed.
+func TestFormatJSONFailureDocumentCarriesNoCredentialProcessOutput(t *testing.T) {
+	isolateAWSEnv(t)
+	profile := credentialProcessProfile(t, "leaky", `Note: vault backend v2
+{"Version":1,"AccessKeyId":"`+leakedKeyID+`","SecretAccessKey":"`+leakedSecret+`"}`)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	tools := []tool{{Name: "tools___search_aws", Description: "Search."}}
+	borisHome := setupInstallCatalog(t, home, tools)
+	fileCfg, err := readConfig(filepath.Join(borisHome, "config.toml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	fileCfg.AWSProfile = profile
+	if err := writeConfig(filepath.Join(borisHome, "config.toml"), fileCfg); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now}
+	if code := a.run([]string{"--format", "json", "--non-interactive", "tools___search_aws"}); code == 0 {
+		t.Fatalf("expected a failure, got exit 0; stdout:\n%s", stdout.String())
+	}
+	assertNoLeak(t, stdout.String())
+	assertNoLeak(t, stderr.String())
+	if stdout.Len() != 0 {
+		t.Fatalf("a failure must leave stdout empty, got:\n%s", stdout.String())
+	}
+	var doc struct {
+		OK      bool   `json:"ok"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(stderr.Bytes(), &doc); err != nil {
+		t.Fatalf("stderr is not one JSON document (%v):\n%s", err, stderr.String())
+	}
+	if doc.OK {
+		t.Fatalf("expected ok:false, got:\n%s", stderr.String())
+	}
+	assertNoLeak(t, doc.Message)
+	if !strings.Contains(doc.Message, "credential_process helper") {
+		t.Fatalf("message %q should name the helper as the cause", doc.Message)
 	}
 }
