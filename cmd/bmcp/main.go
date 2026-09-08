@@ -56,6 +56,15 @@ type app struct {
 	credentials credentialsFunc
 	lookPath    func(string) (string, error)
 	interactive func() bool
+	// stderrTTY is injectable because a test cannot make a pipe a character
+	// device, and the branch it selects — keeping a credential_process helper's
+	// stderr visible — exists only for a terminal. See retrieveCredentials.
+	stderrTTY func() bool
+	// helperStderrDiscarded records that retrieveCredentials sent a
+	// credential_process helper's stderr to /dev/null, so a failure message can
+	// say so. Without it an operator reads an empty CI log as "the helper printed
+	// nothing" when bmcp is what threw it away.
+	helperStderrDiscarded bool
 	// executable and verifySignature are injectable so the swap can be tested.
 	// Without them a test exercising the update path resolves to, and would
 	// overwrite, the `go test` binary itself.
@@ -144,6 +153,26 @@ func (a *app) isInteractive() bool {
 
 func isInteractive() bool {
 	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+func (a *app) stderrIsTerminal() bool {
+	if a.stderrTTY != nil {
+		return a.stderrTTY()
+	}
+	return stderrIsTerminal()
+}
+
+// stderrIsTerminal asks the question "is anything capturing what a subprocess
+// writes to fd 2" — a pipe, a file, a CI log or an agent transcript all answer
+// yes, and only a terminal answers no. It reads os.Stderr rather than a.stderr
+// because the fd, not bmcp's own writer, is what a child process inherits, so it
+// must be consulted before anything reassigns that variable.
+func stderrIsTerminal() bool {
+	info, err := os.Stderr.Stat()
 	if err != nil {
 		return false
 	}

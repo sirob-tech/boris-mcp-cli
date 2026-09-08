@@ -222,9 +222,9 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
-		return aws.Credentials{}, "", authError{authFailure(cfg, err)}
+		return aws.Credentials{}, "", authError{a.authFailure(cfg, err)}
 	}
-	creds, err := awsCfg.Credentials.Retrieve(ctx)
+	creds, err := a.retrieveCredentials(ctx, cfg, awsCfg.Credentials)
 	if err == nil {
 		return creds, awsCfg.Region, nil
 	}
@@ -257,13 +257,23 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 			// fix. Reporting only "aws sso login failed: exit status 1" for a machine
 			// whose real problem was DNS names the symptom this code created and
 			// hides the one the operator has.
-			return aws.Credentials{}, "", authError{fmt.Errorf("aws sso login failed: %v, and the credential failure it was trying to repair was: %w", runErr, authFailure(cfg, err))}
+			return aws.Credentials{}, "", authError{fmt.Errorf("aws sso login failed: %v, and the credential failure it was trying to repair was: %w", runErr, a.authFailure(cfg, err))}
 		}
 		awsCfg, err = awsconfig.LoadDefaultConfig(ctx, opts...)
 		if err != nil {
-			return aws.Credentials{}, "", authError{authFailure(cfg, err)}
+			return aws.Credentials{}, "", authError{a.authFailure(cfg, err)}
 		}
-		creds, err = awsCfg.Credentials.Retrieve(ctx)
+		// Through the same wrapper as the first attempt, as defence in depth rather
+		// than because a helper is known to run here: reaching this line needs
+		// profileUsesSSO to have said yes, which means the leaf of the
+		// source_profile chain resolves through SSO — and the SDK's
+		// resolveCredsFromProfile ranks SSO above credential_process at that leaf,
+		// so no helper should be involved. Wrapped anyway, because the cost is one
+		// call and the alternative is an unwrapped Retrieve whose safety depends on
+		// that precedence never changing. No test covers it: reaching it needs the
+		// `aws sso login` subprocess to succeed, and it is built inline with no
+		// injection point.
+		creds, err = a.retrieveCredentials(ctx, cfg, awsCfg.Credentials)
 	}
 	if err != nil {
 		if usesSSO {
@@ -283,19 +293,156 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 			// authFailure names the source, which is the message #58 was filed
 			// against: an operator who never chose this profile was being sent to log
 			// into it, with nothing saying where it had come from.
-			return aws.Credentials{}, "", authError{fmt.Errorf("%w. If the AWS SSO session for %s has expired, run: aws sso login --profile %s", authFailure(cfg, err), profile, profile)}
+			return aws.Credentials{}, "", authError{fmt.Errorf("%w. If the AWS SSO session for %s has expired, run: aws sso login --profile %s", a.authFailure(cfg, err), profile, profile)}
 		}
-		return aws.Credentials{}, "", authError{authFailure(cfg, err)}
+		return aws.Credentials{}, "", authError{a.authFailure(cfg, err)}
 	}
 	return creds, awsCfg.Region, nil
+}
+
+// retrieveCredentials resolves credentials with a credential_process helper's
+// stderr pointed wherever this invocation can afford to have it.
+//
+// #61. processcreds hands the helper the process-global os.Stderr —
+// DefaultNewCommandBuilder.NewCommand, "display stderr on console for MFA" — and
+// reads that variable when Retrieve builds the command. So the helper writes to
+// fd 2 directly, outside everything bmcp renders and outside everything #60
+// withholds: a helper with tracing on echoes the credential JSON it just
+// printed, on *success*, into whatever is capturing that descriptor. That is a
+// CI log or an agent transcript, and under a machine format it is also the
+// stream bmcp promised would carry nothing but one parseable document.
+//
+// The config API cannot reach the assignment — Provider.commandBuilder is
+// unexported and processcreds.Options carries only Timeout and
+// CredentialSources, so WithProcessCredentialOptions is no help. Swapping the
+// package variable around Retrieve is what is left. Building the provider
+// ourselves with a custom NewCommandBuilder was the alternative and was
+// rejected: it would mean reimplementing source_profile and assume-role
+// chaining inside the credential path, which is where subtle breakage lives.
+//
+// The swap is safe here for two reasons. bmcp is synchronous — nothing under
+// cmd/bmcp starts a goroutine — so there is no other reader to race. And
+// a.stderr holds os.Stderr's *value* from startup, so bmcp's own output keeps
+// going to the original descriptor whatever this does to the variable.
+//
+// It wraps Retrieve and nothing else on purpose: the `aws sso login` branch
+// above deliberately hands its subprocess os.Stderr, and that is a browser
+// prompt an operator needs to see.
+func (a *app) retrieveCredentials(ctx context.Context, cfg effectiveConfig, provider aws.CredentialsProvider) (aws.Credentials, error) {
+	// The MFA prompt the SDK's comment protects is worth keeping only where all
+	// three of these hold: someone is watching fd 2, bmcp has not promised to keep
+	// that stream free of prose, and this invocation has not declared that nothing
+	// will answer a prompt. Anything else discards it.
+	//
+	// cfg.NonInteractive is in the conjunction because a prompt nobody will answer
+	// buys nothing, so keeping it is pure exposure. That matters because of the
+	// residual case below, and it is the same triple the `aws sso login` branch
+	// above already applies.
+	//
+	// The residual case, measured rather than assumed: a *pty* is a character
+	// device, so `script -q log bmcp <tool>`, `docker run -t`, `ssh -t` and a
+	// logging tmux pane all look exactly like an operator's own terminal here and
+	// their transcripts do capture what the helper writes. No terminal test can
+	// separate those — x/term.IsTerminal answers the same — so what is left is to
+	// narrow the branch by something other than the descriptor, which is what
+	// a.machine and cfg.NonInteractive do, and to say plainly that a human-format
+	// interactive run under a recorder is still exposed.
+	if !a.machine && !cfg.NonInteractive && a.stderrIsTerminal() {
+		return provider.Retrieve(ctx)
+	}
+	sink, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		// Failing closed, but only where there is something to contain. Refusing
+		// unconditionally would fail static keys, SSO, web identity and IMDS —
+		// none of which spawn a subprocess — and would explain the refusal in
+		// terms of a credential_process helper the profile may not even have.
+		if chainRunsACredentialProcess(provider) {
+			return aws.Credentials{}, fmt.Errorf("cannot open %s to contain a credential_process helper's output: %w", os.DevNull, err)
+		}
+		return provider.Retrieve(ctx)
+	}
+	a.helperStderrDiscarded = true
+	restore := os.Stderr
+	os.Stderr = sink
+	// Put back only when the retrieval actually finished — and left in place,
+	// still open, when it did not.
+	//
+	// The claim above that nothing races this is true of bmcp and false of the
+	// SDK, in the one call it has to hold for. LoadDefaultConfig always wraps the
+	// provider in an aws.CredentialsCache (config's wrapWithCredentialsCache),
+	// whose Retrieve runs the real provider on a singleflight goroutine and then
+	// selects on the caller's ctx.Done(). On a cancelled or expired context it
+	// abandons that goroutine and returns — and the goroutine is handed a
+	// suppressedContext, whose Done() is nil and Deadline() reports none, so
+	// nothing ever stops it. It reaches NewCommand afterwards, reads os.Stderr
+	// *then*, and runs the helper with whatever the variable now holds.
+	//
+	// Restoring on that path therefore hands the helper the captured descriptor
+	// after bmcp has already reported failure, which is exactly the disclosure
+	// this function exists to prevent. Reproduced 3/3 before this check existed.
+	// Closing the sink instead is no better: exec starts the child anyway, with
+	// fd 2 closed, so the first file the helper opens becomes its stderr.
+	//
+	// So the sink stays, and the fd is leaked on purpose. bmcp is a short-lived
+	// CLI that is now failing; a.stderr still holds the original descriptor from
+	// startup, so its own output is unaffected, and the `aws sso login` branch
+	// cannot be reached with a dead context anyway.
+	//
+	// ctx.Err() == nil is the conservative side of the test: it can only be nil
+	// if Retrieve returned through the channel, which happens after the
+	// goroutine's work is done. A context that expires just after a successful
+	// retrieval merely keeps the sink for the rest of the run, which costs
+	// nothing. This is a fact about aws-sdk-go-v2's cache, so it is worth
+	// re-checking on an SDK bump.
+	defer func() {
+		if ctx.Err() != nil {
+			return
+		}
+		os.Stderr = restore
+		sink.Close()
+	}()
+	return provider.Retrieve(ctx)
+}
+
+// chainRunsACredentialProcess reports whether the resolved provider chain can
+// execute a credential_process helper, so the refusal above is scoped to the
+// chains that have something to disclose.
+//
+// aws.CredentialsCache forwards ProviderSources to the provider it wraps, and
+// the assume-role provider forwards its source's — so a source_profile chain
+// whose leaf is a helper reports the process source through every hop above it.
+// Measured across the shapes that matter, and pinned by
+// TestChainRunsACredentialProcessSeesEveryProcessShape: a plain
+// credential_process profile reports it, an assume-role chain over one reports
+// it, and static keys, an sso_session profile and a legacy SSO profile do not.
+//
+// A provider that does not implement the interface answers yes. That is the
+// safe direction: unknown means "assume a subprocess", so a chain the SDK stops
+// describing fails closed rather than quietly running a helper uncontained.
+//
+// Both process constants are tested although no measured shape reports one
+// without the other — dropping either arm changes no answer today. Cheap
+// insurance rather than a pinned behaviour, and the test above prints the
+// sources it saw so a future divergence says which arm carried it.
+func chainRunsACredentialProcess(provider aws.CredentialsProvider) bool {
+	source, ok := provider.(aws.CredentialProviderSource)
+	if !ok {
+		return true
+	}
+	for _, s := range source.ProviderSources() {
+		if s == aws.CredentialSourceProcess || s == aws.CredentialSourceProfileProcess {
+			return true
+		}
+	}
+	return false
 }
 
 // authFailure names the credential source alongside the SDK's error, so the
 // operator is not left guessing which of profile, environment and default chain
 // produced it — and in particular is not sent to repair a profile this attempt
 // never consulted.
-func authFailure(cfg effectiveConfig, err error) error {
-	if withheld := credentialProcessFailure(cfg, err); withheld != nil {
+func (a *app) authFailure(cfg effectiveConfig, err error) error {
+	if withheld := a.credentialProcessFailure(cfg, err); withheld != nil {
 		return withheld
 	}
 	return fmt.Errorf("%w (using %s)", err, describeCredentialSource(cfg))
@@ -324,7 +471,7 @@ func authFailure(cfg effectiveConfig, err error) error {
 // every dependency bump, and a credential path is the wrong place to track
 // that. What went wrong is still reported — from the error's own type, never
 // its text, so nothing the helper wrote can reach the message by another route.
-func credentialProcessFailure(cfg effectiveConfig, err error) error {
+func (a *app) credentialProcessFailure(cfg effectiveConfig, err error) error {
 	var provErr *processcreds.ProviderError
 	if !errors.As(err, &provErr) {
 		return nil
@@ -351,7 +498,16 @@ func credentialProcessFailure(cfg effectiveConfig, err error) error {
 		// name something that is not a status and lose the fact that it was killed.
 		cause = "was killed before it returned credentials, which is what happens when it overruns its timeout"
 	}
-	return fmt.Errorf("credential_process helper %s (using %s). Run the helper yourself to see what it printed — its output is withheld here because it can contain live credentials", cause, describeCredentialSource(cfg))
+	// Naming the discard, when there was one. Withholding the SDK's error text
+	// leaves the helper's own diagnostics as the operator's next step, and #61
+	// took those away too — so a message that only said "run it yourself" would
+	// let an empty CI log read as "the helper printed nothing" when bmcp is what
+	// threw it away.
+	discarded := ""
+	if a.helperStderrDiscarded {
+		discarded = ", and anything it wrote to stderr was discarded rather than shown here, for the same reason"
+	}
+	return fmt.Errorf("credential_process helper %s (using %s). Run the helper yourself to see what it printed — its output is withheld here because it can contain live credentials%s", cause, describeCredentialSource(cfg), discarded)
 }
 
 // profileUsesSSO reports whether profile resolves through AWS SSO, following
