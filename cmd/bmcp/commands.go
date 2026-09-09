@@ -678,6 +678,13 @@ func (a *app) runCall(flags globalFlags, name string, payload string, readStdin 
 	if err := t.Validate(input); err != nil {
 		return a.fail(flags, exitValidation, "tool_validation_failed", err.Error())
 	}
+	// Asked for after Validate, which runs against the advertised schema and
+	// does not declare the marker. Never under --raw: that flag exists to show
+	// exactly what the server sent.
+	askPicture := !flags.raw && wantsPicture(t.Name)
+	if askPicture {
+		input = withPictureRequest(input)
+	}
 	fmt.Fprintf(a.prose(), "Calling %s...\n", displayToolName(t.Name))
 	result, err := a.callTool(context.Background(), cfg, t.Name, input)
 	if err != nil {
@@ -692,6 +699,9 @@ func (a *app) runCall(flags globalFlags, name string, payload string, readStdin 
 	}
 	if !flags.raw {
 		result = unwrapMCPTextEnvelope(result)
+	}
+	if askPicture {
+		result = takePicture(cfg.Home, result)
 	}
 	if flags.machine() {
 		// --pretty is not consulted here. The json document is already indented and
