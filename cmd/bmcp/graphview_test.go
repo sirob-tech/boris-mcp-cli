@@ -104,10 +104,29 @@ func TestTakePictureLeavesEverythingElseAlone(t *testing.T) {
 	}
 }
 
-func TestTakePictureSurvivesAnUnwritableHome(t *testing.T) {
-	payload := `{"result":{"_svg":"<svg/>"}}`
-	if got := string(takePicture("", []byte(payload))); got != payload {
-		t.Errorf("an unwritable home must leave the answer intact, got %s", got)
+func TestTakePictureDropsTheMarkupEvenWhenItCannotBeWritten(t *testing.T) {
+	// The markup must go whether or not the file lands. Keeping the answer
+	// intact here would hand ~13 KB of it to a model, which is the one outcome
+	// the render field exists to prevent.
+	payload := `{"result":{"status":"ok","_svg":"<svg/>"}}`
+	got := string(takePicture("", []byte(payload)))
+
+	if strings.Contains(got, "<svg") || strings.Contains(got, renderField) {
+		t.Fatalf("markup survived an unwritable home: %s", got)
+	}
+	if !strings.Contains(got, `"status":"ok"`) {
+		t.Errorf("the answer itself must survive: %s", got)
+	}
+	var envelope struct {
+		Result struct {
+			Picture string `json:"picture"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(got), &envelope); err != nil {
+		t.Fatalf("rewritten payload is not valid JSON: %v", err)
+	}
+	if !strings.Contains(envelope.Result.Picture, "could not be written") {
+		t.Errorf("the caller must be told why there is no picture, got %q", envelope.Result.Picture)
 	}
 }
 
