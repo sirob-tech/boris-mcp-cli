@@ -63,21 +63,27 @@ const widgetTemplate = `<div style="font:13px system-ui,-apple-system,sans-serif
 })();
 </script>`
 
+// Tall enough to read a couple of dozen nodes, short enough that the answer it
+// belongs to stays on screen with it.
+const maxPictureHeight = "460px"
+
 const noPictureYet = `<p style="color:#6b7280">No graph has been drawn yet. ` +
 	`Ask for a resource by description and the picture appears here.</p>`
 
 func widgetHTML(svg string) string {
 	body := noPictureYet
 	if svg != "" {
-		body = scaleToWidth(svg)
+		body = fitWithinPanel(svg)
 	}
 	return fmt.Sprintf(widgetTemplate, body, version, pictureToolName)
 }
 
-// scaleToWidth drops the fixed pixel size so the drawing fits the panel it is
-// mounted in, keeping the viewBox to preserve its aspect ratio. Markup it cannot
-// read comes back untouched: showing it unscaled beats showing nothing.
-func scaleToWidth(svg string) string {
+// fitWithinPanel drops the fixed pixel size so the drawing scales to the panel
+// it is mounted in, bounded on both axes. Width alone left a tall graph filling
+// the whole conversation; the height cap keeps it to a glanceable size, and
+// auto width with the viewBox intact preserves the aspect ratio. Markup it
+// cannot read comes back untouched: showing it unscaled beats showing nothing.
+func fitWithinPanel(svg string) string {
 	start := strings.Index(svg, "<svg")
 	if start < 0 {
 		return svg
@@ -104,5 +110,7 @@ func scaleToWidth(svg string) string {
 			open = open[:at] + rest[close+2:]
 		}
 	}
-	return `<svg style="width:100%;height:auto"` + open[len("<svg"):] + svg[start+end:]
+	const fit = `max-width:100%;max-height:` + maxPictureHeight +
+		`;width:auto;height:auto;display:block;margin:0 auto`
+	return `<svg style="` + fit + `"` + open[len("<svg"):] + svg[start+end:]
 }

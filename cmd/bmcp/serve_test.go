@@ -486,9 +486,9 @@ func TestScrubMarkupCleansProseWrappedAroundABody(t *testing.T) {
 	}
 }
 
-func TestScaleToWidthDropsTheFixedSize(t *testing.T) {
+func TestFitWithinPanelDropsTheFixedSize(t *testing.T) {
 	svg := `<svg xmlns="http://www.w3.org/2000/svg" width="777.16" height="872.22" viewBox="0 0 777.16 872.22" role="img"><rect width="100%" height="100%"/><title>x</title></svg>`
-	out := scaleToWidth(svg)
+	out := fitWithinPanel(svg)
 	if strings.Contains(out, `width="777.16"`) || strings.Contains(out, `height="872.22"`) {
 		t.Errorf("fixed size survived: %s", out)
 	}
@@ -503,10 +503,10 @@ func TestScaleToWidthDropsTheFixedSize(t *testing.T) {
 	}
 }
 
-func TestScaleToWidthReturnsMarkupItCannotRead(t *testing.T) {
+func TestFitWithinPanelReturnsMarkupItCannotRead(t *testing.T) {
 	for _, in := range []string{"not markup at all", "<svg without a close", ""} {
-		if out := scaleToWidth(in); out != in {
-			t.Errorf("scaleToWidth(%q) = %q, want it unchanged", in, out)
+		if out := fitWithinPanel(in); out != in {
+			t.Errorf("fitWithinPanel(%q) = %q, want it unchanged", in, out)
 		}
 	}
 }
@@ -562,5 +562,24 @@ func TestServeDeclaresResourcesOnlyAfterNegotiation(t *testing.T) {
 	caps, _ := handshake["result"].(map[string]any)["capabilities"].(map[string]any)
 	if _, declared := caps["resources"]; !declared {
 		t.Errorf("a client that negotiated MCP Apps needs the resources capability: %s", lines[0])
+	}
+}
+
+func TestFitWithinPanelBoundsBothAxes(t *testing.T) {
+	// Width alone let a tall graph fill the whole conversation; the drawing has
+	// to stay glanceable next to the answer it belongs to.
+	svg := `<svg xmlns="http://www.w3.org/2000/svg" width="922" height="878" viewBox="0 0 922 878"><title>x</title></svg>`
+	out := fitWithinPanel(svg)
+
+	for _, want := range []string{"max-width:100%", "max-height:" + maxPictureHeight, "width:auto", "height:auto"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in %s", want, out)
+		}
+	}
+	if strings.Contains(out, `width="922"`) || strings.Contains(out, `height="878"`) {
+		t.Errorf("the intrinsic size must go, or the caps cannot bind: %s", out)
+	}
+	if !strings.Contains(out, `viewBox="0 0 922 878"`) {
+		t.Errorf("viewBox must survive so the aspect ratio holds: %s", out)
 	}
 }
