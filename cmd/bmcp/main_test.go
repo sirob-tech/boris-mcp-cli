@@ -2764,7 +2764,7 @@ func TestRefreshExistingInstructionsIgnoresAnEmptyCache(t *testing.T) {
 		t.Fatalf("write instructions: %v", err)
 	}
 	for _, cache := range []*toolCache{nil, {Version: 1, Tools: []tool{}}} {
-		if results := refreshExistingInstructions(cache, true); len(results) != 0 {
+		if results := refreshExistingInstructions(cache, true, ""); len(results) != 0 {
 			t.Fatalf("expected no refresh for an empty cache, got %+v", results)
 		}
 	}

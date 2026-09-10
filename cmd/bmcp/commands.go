@@ -497,7 +497,17 @@ type refreshSummary struct {
 // broken" and stop using it — an unwritable ~/.claude is not that.
 func (a *app) refreshInstructions(cache *toolCache, includeProject bool) refreshSummary {
 	var summary refreshSummary
-	for _, result := range refreshExistingInstructions(cache, includeProject) {
+	// Unresolved on purpose: the stable path the user invokes survives a package
+	// manager moving the real file, which a symlink-resolved one does not.
+	executable := ""
+	fn := a.executable
+	if fn == nil {
+		fn = os.Executable
+	}
+	if path, err := fn(); err == nil {
+		executable = path
+	}
+	for _, result := range refreshExistingInstructions(cache, includeProject, executable) {
 		for _, file := range result.Files {
 			switch {
 			case file.Path == "":
