@@ -306,7 +306,8 @@ bmcp doctor
 The installer does not register BORIS as a local MCP server. It writes
 instructions that teach agents to call the existing `bmcp` CLI and include
 the currently synced BORIS tool catalog. Run `bmcp init` first so the
-installer has config and a tool catalog to read.
+installer has config and a tool catalog to read. To register bmcp itself as
+a server instead, see [Run as an MCP server](#run-as-an-mcp-server).
 
 User-global install is the default:
 
@@ -383,6 +384,40 @@ This is what keeps the catalog honest across a self-update. The run that applies
 an update finishes on the binary it already loaded, so it writes that binary's
 instructions; the next `doctor` run is the new binary and installs the new
 ones.
+
+## Run as an MCP server
+
+`bmcp serve` speaks MCP over stdin and stdout, so a client can call BORIS
+directly instead of shelling out to the CLI. It re-exports the synced catalog
+under the same fully-qualified tool names and proxies each call to the endpoint
+`bmcp <tool>` already uses. Run `bmcp init` first: `serve` answers `tools/list`
+from the local catalog rather than syncing on every call, and loads that catalog
+once at startup.
+
+Register it wherever the client keeps its MCP servers. For Claude Code:
+
+```bash
+claude mcp add --scope user boris -- bmcp serve
+```
+
+It belongs in a client's server list, not in a terminal: stdout carries JSON-RPC
+frames and nothing else, and the process runs until the client closes the pipe.
+
+### Graph pictures
+
+The two resource finders, `search_infrastructure_by_description` and
+`search_infrastructure_relationships`, also draw their answer as a graph. Under
+`serve` the drawing is offered to the client as an MCP Apps UI resource
+(`ui://boris/graph.html`), so a person can see it inline while the model
+receives the same text answer as before with no markup in it. A client that does
+not implement MCP Apps never reads the resource and sees no change.
+
+Called as a CLI, the same two tools write the drawing to
+`$BMCP_HOME/last-graph.svg` and replace it with a `picture` field naming that
+path. The filename is stable so a viewer left open on it follows along.
+
+Either way the picture is a decoration: if drawing it fails the tool still
+answers, and `BMCP_RENDER=off` stops asking for one.
 
 ## Use
 

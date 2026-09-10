@@ -61,6 +61,9 @@ var commands = []command{
 	{names: []string{"list", "ls", "tools"}, scope: scopeList, run: (*app).cmdList},
 	{names: []string{"describe", "d"}, run: (*app).cmdDescribe},
 	{names: []string{"call"}, run: (*app).cmdCall},
+	// No autoUpdate: the process is long-lived, and a binary swap would land
+	// underneath a live IDE connection.
+	{names: []string{"serve"}, run: (*app).cmdServe},
 	{names: []string{"install"}, rawArgs: true, run: (*app).cmdInstall},
 }
 
@@ -1095,9 +1098,15 @@ func usage(w io.Writer) {
   bmcp list|ls|tools [--schemas] [--format human|json|ndjson]
   bmcp describe|d <tool>
   bmcp call <tool> ['{"arg":"value"}']
+  bmcp serve
   bmcp [--format json] [--max-bytes <n>] <exact_tool_name> --arg value
   bmcp update [--check] [--to <version>] [--rollback]
   bmcp version
+
+Flags for bmcp serve:
+  (none)                       Speak MCP over stdin and stdout, re-exporting the
+                               remote catalog, until the client closes the pipe.
+                               For an IDE's MCP server list, not for a terminal
 
 Flags for bmcp list:
   --schemas                    Include each tool's input schema, so the catalog
