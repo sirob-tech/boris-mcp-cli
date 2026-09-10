@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.9.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.8.1...v0.9.0) (2026-09-10)
+
+
+### Features
+
+* register bmcp as an MCP server for the clients that can render the graph ([#71](https://github.com/sirob-tech/boris-mcp-cli/issues/71)) ([de432cf](https://github.com/sirob-tech/boris-mcp-cli/commit/de432cf61b521b5a8863d1012f9ab3d7ec9bedea))
+
+
+### Bug Fixes
+
+* keep graph markup out of context when the picture cannot be written ([#70](https://github.com/sirob-tech/boris-mcp-cli/issues/70)) ([cd26035](https://github.com/sirob-tech/boris-mcp-cli/commit/cd260357331170b71911c7cae111bec8770ab0ff))
+* stop credential_process output reaching bmcp's own error messages ([#62](https://github.com/sirob-tech/boris-mcp-cli/issues/62)) ([1a223e7](https://github.com/sirob-tech/boris-mcp-cli/commit/1a223e7191426e5aa8285105b341c69fe224409e)), closes [#60](https://github.com/sirob-tech/boris-mcp-cli/issues/60)
+
 ## [0.8.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.8.0...v0.8.1) (2026-09-07)
 
 
