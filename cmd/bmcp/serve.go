@@ -148,13 +148,18 @@ func (s *server) handle(req serveRequest) (any, *rpcError) {
 		if params.ProtocolVersion == "" {
 			params.ProtocolVersion = serveProtocolVersion
 		}
+		capabilities := map[string]any{"tools": map[string]any{}}
+		// Declared only to a client that negotiated MCP Apps. Some clients turn
+		// the resources capability alone into a model-facing read tool that is
+		// not restricted to listed resources, which would let a model pull the
+		// widget's markup into its own context by guessing the URI.
+		if s.apps {
+			capabilities["resources"] = map[string]any{}
+		}
 		return map[string]any{
 			"protocolVersion": params.ProtocolVersion,
-			"capabilities": map[string]any{
-				"tools":     map[string]any{},
-				"resources": map[string]any{},
-			},
-			"serverInfo": map[string]any{"name": "bmcp", "version": version},
+			"capabilities":    capabilities,
+			"serverInfo":      map[string]any{"name": "bmcp", "version": version},
 		}, nil
 
 	case "ping":
@@ -306,7 +311,7 @@ func (s *server) readResource(raw json.RawMessage) (any, *rpcError) {
 		URI string `json:"uri"`
 	}
 	_ = json.Unmarshal(raw, &params)
-	if params.URI != "" && params.URI != widgetURI {
+	if !s.apps || (params.URI != "" && params.URI != widgetURI) {
 		return nil, &rpcError{Code: -32602, Message: "unknown resource: " + params.URI}
 	}
 	s.mu.Lock()

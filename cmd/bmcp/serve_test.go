@@ -520,3 +520,47 @@ func TestWidgetHTMLSaysSoWhenThereIsNoPictureYet(t *testing.T) {
 		t.Errorf("the widget must say why it is empty: %s", out)
 	}
 }
+
+func TestServeHidesTheResourceFromAClientWithoutMCPApps(t *testing.T) {
+	// Some clients turn the resources capability alone into a model-facing read
+	// tool that ignores the listing, so declaring it would let a model fetch the
+	// widget's markup by guessing the URI.
+	doer := &callRecorder{fakeMCP: &fakeMCP{tools: finderCatalog()}}
+	serveConfiguredHome(t, doer)
+	lines := serveLines(t, doer, initPlainRPC,
+		`{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"`+widgetURI+`"}}`,
+	)
+
+	var handshake map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &handshake); err != nil {
+		t.Fatal(err)
+	}
+	caps, _ := handshake["result"].(map[string]any)["capabilities"].(map[string]any)
+	if _, declared := caps["resources"]; declared {
+		t.Errorf("the resources capability must not be offered: %s", lines[0])
+	}
+
+	var read map[string]any
+	if err := json.Unmarshal([]byte(lines[1]), &read); err != nil {
+		t.Fatal(err)
+	}
+	if _, bad := read["error"]; !bad {
+		t.Fatalf("the widget must not be readable: %s", lines[1])
+	}
+	assertNoMarkup(t, "unnegotiated resources/read", lines[1])
+}
+
+func TestServeDeclaresResourcesOnlyAfterNegotiation(t *testing.T) {
+	doer := &callRecorder{fakeMCP: &fakeMCP{tools: finderCatalog()}}
+	serveConfiguredHome(t, doer)
+	lines := serveLines(t, doer, initWithUI)
+
+	var handshake map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &handshake); err != nil {
+		t.Fatal(err)
+	}
+	caps, _ := handshake["result"].(map[string]any)["capabilities"].(map[string]any)
+	if _, declared := caps["resources"]; !declared {
+		t.Errorf("a client that negotiated MCP Apps needs the resources capability: %s", lines[0])
+	}
+}

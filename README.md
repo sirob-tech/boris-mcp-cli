@@ -394,14 +394,64 @@ under the same fully-qualified tool names and proxies each call to the endpoint
 from the local catalog rather than syncing on every call, and loads that catalog
 once at startup.
 
-Register it wherever the client keeps its MCP servers. For Claude Code:
+Which config file you register it in decides whether pictures appear. Only the
+client that owns the connection can negotiate MCP Apps, and for the Claude
+desktop app that is the app itself — for servers listed in its own config, or
+installed as an extension. A server registered with the Claude Code CLI
+(`claude mcp add`, `~/.claude.json`, `.mcp.json`) is spawned by the CLI instead,
+which does not implement the extension: the tools work and no picture is ever
+drawn.
 
-```bash
-claude mcp add --scope user boris -- bmcp serve
+To get pictures, register with the app. On macOS, in
+`~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "boris": {
+      "command": "/absolute/path/to/bmcp",
+      "args": ["serve"]
+    }
+  }
+}
 ```
+
+Use an absolute path: the app does not inherit a shell's `PATH`. Restart the
+client afterwards — MCP servers are read at startup. The tools then appear in
+every tab, pictures included.
 
 It belongs in a client's server list, not in a terminal: stdout carries JSON-RPC
 frames and nothing else, and the process runs until the client closes the pipe.
+
+### Where to register it
+
+The tools work in every client below. Pictures need a client that implements
+MCP Apps, and need the server registered with the process that owns the
+connection — for Claude and Codex that is the desktop app, not the terminal.
+
+| Client | Pictures | Register in |
+| --- | --- | --- |
+| Claude desktop app | yes | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Cursor | yes | `~/.cursor/mcp.json`, or `<project>/.cursor/mcp.json` |
+| Codex desktop | yes, with `features.enable_mcp_apps = true` | `~/.codex/config.toml` |
+| Claude Code CLI | no | `claude mcp add`, `~/.claude.json`, `.mcp.json` |
+| Codex CLI | no | `~/.codex/config.toml` |
+| Kiro | no | `~/.kiro/settings/mcp.json` (JSONC) |
+| OpenCode | no | `~/.config/opencode/opencode.json` |
+
+Two want a shape other than `mcpServers`:
+
+```toml
+# ~/.codex/config.toml
+[mcp_servers.boris]
+command = "/absolute/path/to/bmcp"
+args = ["serve"]
+```
+
+```json
+// ~/.config/opencode/opencode.json — the key is "mcp", and command is an array
+{ "mcp": { "boris": { "type": "local", "command": ["/absolute/path/to/bmcp", "serve"], "enabled": true } } }
+```
 
 ### Graph pictures
 
@@ -410,7 +460,9 @@ The two resource finders, `search_infrastructure_by_description` and
 `serve` the drawing is offered to the client as an MCP Apps UI resource
 (`ui://boris/graph.html`), so a person can see it inline while the model
 receives the same text answer as before with no markup in it. A client that does
-not implement MCP Apps never reads the resource and sees no change.
+not implement MCP Apps — including a `bmcp serve` registered with the Claude
+Code CLI rather than with the app — never reads the resource and sees no
+change.
 
 Called as a CLI, the same two tools write the drawing to
 `$BMCP_HOME/last-graph.svg` and replace it with a `picture` field naming that
