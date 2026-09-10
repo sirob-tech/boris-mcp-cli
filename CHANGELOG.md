@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.9.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.8.1...v0.9.0) (2026-09-10)
+
+
+### Features
+
+* register bmcp as an MCP server for the clients that can render the graph ([#71](https://github.com/sirob-tech/boris-mcp-cli/issues/71)) ([de432cf](https://github.com/sirob-tech/boris-mcp-cli/commit/de432cf61b521b5a8863d1012f9ab3d7ec9bedea))
+* serve BORIS over stdio, so a client can call it directly and show the graph inline ([#68](https://github.com/sirob-tech/boris-mcp-cli/issues/68)) ([2f34aa7](https://github.com/sirob-tech/boris-mcp-cli/commit/2f34aa771c5397818df951b85514b24aa094dd70))
+* draw the resource finders' answers as a graph picture ([#67](https://github.com/sirob-tech/boris-mcp-cli/issues/67)) ([a5e2621](https://github.com/sirob-tech/boris-mcp-cli/commit/a5e2621424f9ccbcd9696419bd4f2a6044bd4e13))
+
+
+### Bug Fixes
+
+* keep graph markup out of context when the picture cannot be written ([#70](https://github.com/sirob-tech/boris-mcp-cli/issues/70)) ([cd26035](https://github.com/sirob-tech/boris-mcp-cli/commit/cd260357331170b71911c7cae111bec8770ab0ff))
+* offer the graph widget only to clients that negotiated MCP Apps ([#69](https://github.com/sirob-tech/boris-mcp-cli/issues/69)) ([8e30213](https://github.com/sirob-tech/boris-mcp-cli/commit/8e30213ce72d9b297be1aeca7263d41e65e89462))
+* stop credential_process output reaching bmcp's own error messages ([#62](https://github.com/sirob-tech/boris-mcp-cli/issues/62)) ([1a223e7](https://github.com/sirob-tech/boris-mcp-cli/commit/1a223e7191426e5aa8285105b341c69fe224409e)), closes [#60](https://github.com/sirob-tech/boris-mcp-cli/issues/60)
+
 ## [0.8.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.8.0...v0.8.1) (2026-09-07)
 
 
