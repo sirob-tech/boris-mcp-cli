@@ -82,16 +82,15 @@ func takePicture(home string, raw []byte) []byte {
 		return raw
 	}
 
-	path, err := writePicture(home, svg)
-	if err != nil {
-		return raw
-	}
+	// Removed before anything can fail. Returning the original once the field is
+	// known to be there is what would put ~13 KB of markup in front of a model,
+	// which is the one thing this field must never do.
 	delete(result, renderField)
-	encodedPath, err := json.Marshal(path)
+	note, err := json.Marshal(pictureNote(home, svg))
 	if err != nil {
 		return raw
 	}
-	result[pictureField] = encodedPath
+	result[pictureField] = note
 
 	rewrittenInner, err := json.Marshal(result)
 	if err != nil {
@@ -103,6 +102,15 @@ func takePicture(home string, raw []byte) []byte {
 		return raw
 	}
 	return rewritten
+}
+
+// pictureNote writes the picture and reports where it went, or why it did not.
+func pictureNote(home, svg string) string {
+	path, err := writePicture(home, svg)
+	if err != nil {
+		return "the picture could not be written: " + err.Error()
+	}
+	return path
 }
 
 // writePicture writes the markup whole and renames it into place, so a viewer
