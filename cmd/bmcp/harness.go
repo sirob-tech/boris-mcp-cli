@@ -783,7 +783,7 @@ func printRefreshResult(w io.Writer, result installResult) {
 // user who ran the wrong command in the wrong directory one file and leaves a
 // .bak- beside it. Under `doctor` it would be every agent session, unattended,
 // everywhere.
-func refreshExistingInstructions(cache *toolCache, includeProject bool) []installResult {
+func refreshExistingInstructions(cache *toolCache, includeProject bool, executable string) []installResult {
 	// Belt and braces behind the syncTools guard. With no tools to render, every
 	// managed file would be rewritten with renderInstructionToolList's "no tools
 	// available" placeholder in place of the catalog, spending a backup
@@ -831,6 +831,13 @@ func refreshExistingInstructions(cache *toolCache, includeProject bool) []instal
 				}
 				if r, refreshed := f.refresh(); refreshed {
 					seen[f.path] = true
+					files = append(files, r)
+				}
+			}
+			// Only alongside a harness that is already installed, and only at user
+			// scope: this runs unattended from whatever directory an agent is in.
+			if len(files) > 0 && scope.name == "user" {
+				if r, wrote := registerMCPServer(mcpConfigPath(h.name, home), executable); wrote {
 					files = append(files, r)
 				}
 			}
