@@ -8,6 +8,8 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/term"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 )
 
@@ -56,6 +58,29 @@ type app struct {
 	credentials credentialsFunc
 	lookPath    func(string) (string, error)
 	interactive func() bool
+	// stderrTTY is injectable because a test cannot make a pipe a character
+	// device, and the branch it selects — keeping a credential_process helper's
+	// stderr visible — exists only for a terminal. See retrieveCredentials.
+	stderrTTY func() bool
+	// realStderr is os.Stderr's value from startup: the descriptor a child
+	// process would have inherited as fd 2 before anything reassigned the
+	// variable. retrieveCredentials points os.Stderr at /dev/null and, on a
+	// cancelled retrieval, deliberately leaves it there — so the variable is not
+	// a reliable answer to "what is fd 2" for the rest of the run. Everything
+	// that needs the real answer reads this instead: the terminal test, and every
+	// subprocess bmcp spawns itself.
+	realStderr *os.File
+	// stderrSunk latches when a retrieval was abandoned with the /dev/null sink
+	// still installed. An SDK goroutine outliving that call can still read
+	// os.Stderr to build its command, so from then on nothing may write the
+	// variable — not to install a second sink, and not to put the original back.
+	// See retrieveCredentials.
+	stderrSunk bool
+	// helperStderrDiscarded records that retrieveCredentials sent a
+	// credential_process helper's stderr to /dev/null, so a failure message can
+	// say so. Without it an operator reads an empty CI log as "the helper printed
+	// nothing" when bmcp is what threw it away.
+	helperStderrDiscarded bool
 	// executable and verifySignature are injectable so the swap can be tested.
 	// Without them a test exercising the update path resolves to, and would
 	// overwrite, the `go test` binary itself.
@@ -148,4 +173,50 @@ func isInteractive() bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// subprocessStderr is the descriptor a child of bmcp should be given for fd 2:
+// the value os.Stderr held at startup, never whatever retrieveCredentials may
+// have left in the variable since. Handing a subprocess the live global is how a
+// sink installed for a *helper* ends up swallowing the output of an unrelated
+// command — `aws sso login`'s verification URL, for one.
+//
+// The fallback exists for tests, which build an app directly. Production always
+// pins it in main().
+func (a *app) subprocessStderr() *os.File {
+	if a.realStderr != nil {
+		return a.realStderr
+	}
+	return os.Stderr
+}
+
+func (a *app) stderrIsTerminal() bool {
+	if a.stderrTTY != nil {
+		return a.stderrTTY()
+	}
+	return stderrIsTerminal(a.subprocessStderr())
+}
+
+// stderrIsTerminal asks "could a person read what a subprocess writes to fd 2,
+// right now" — a pipe, a file, a CI log and an agent transcript all answer no.
+//
+// It is a real terminal test, not a character-device test. Those are not the
+// same question and the difference is a disclosure: /dev/console and /dev/kmsg
+// are character devices that persist what is written to them — kmsg into the
+// kernel log, console into a serial console a cloud provider will hand back
+// through its API — so `bmcp <tool> 2>/dev/kmsg` from an init script would have
+// passed a ModeCharDevice test and put a credential_process helper's trace into
+// a durable log. term.IsTerminal issues the terminal ioctl, which those devices
+// fail and a tty passes.
+//
+// A pty still answers yes, and nothing here can separate an operator's own
+// terminal from one a recorder is driving (`script`, `docker run -t`, a logging
+// tmux pane). That residual is why the policy in retrieveCredentials has two
+// more conjuncts.
+//
+// It takes the descriptor rather than reading os.Stderr so that a caller cannot
+// be handed the answer for a sink retrieveCredentials installed — see
+// subprocessStderr.
+func stderrIsTerminal(f *os.File) bool {
+	return term.IsTerminal(int(f.Fd()))
 }

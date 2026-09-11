@@ -6,13 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/processcreds"
 )
 
@@ -118,6 +122,13 @@ func authTestApp() *app {
 		now:    time.Now,
 		// A machine invocation, so no branch here may shell out to `aws sso login`
 		// even if the test host happens to have a terminal.
+		//
+		// #61's cases turn this off to reach the human-format branch of the stderr
+		// policy, so that guarantee no longer rests here alone. What holds for them
+		// is the rest of the same condition: the login branch needs profileUsesSSO
+		// as well, and their profiles are credential_process ones with no SSO
+		// anywhere. A case that turns machine off for an SSO profile has to set
+		// cfg.NonInteractive itself.
 		machine: true,
 	}
 }
@@ -1167,7 +1178,7 @@ func TestCredentialProcessKilledHelperIsNotReportedAsAStatus(t *testing.T) {
 	if exitErr.ExitCode() >= 0 {
 		t.Skipf("this platform reports a signalled process as status %d, so there is nothing to guard", exitErr.ExitCode())
 	}
-	err := credentialProcessFailure(
+	err := authTestApp().credentialProcessFailure(
 		effectiveConfig{Profile: "cp", ProfileSource: profileSourceFile},
 		&processcreds.ProviderError{Err: fmt.Errorf("credential process timed out: %w", exitErr)},
 	)
@@ -1272,4 +1283,926 @@ func TestFormatJSONFailureDocumentCarriesNoCredentialProcessOutput(t *testing.T)
 	if !strings.Contains(doc.Message, "credential_process helper") {
 		t.Fatalf("message %q should name the helper as the cause", doc.Message)
 	}
+}
+
+// #61. The channel #60's fix cannot reach: processcreds hands the helper the
+// process-global os.Stderr, so whatever the helper writes there lands on fd 2
+// directly, without passing through a bmcp error at all. It fires on
+// *successful* retrieval, which is what makes it worse than #60 — a helper with
+// tracing on echoes the credential JSON it just printed.
+//
+// The rows below are the ways the policy's conjunction can resolve, with one row
+// per conjunct carrying the decision alone — so dropping any of the three fails a
+// test rather than only narrowing coverage. A row that leaves interactive false
+// cannot do that job: cfg.NonInteractive short-circuits the whole conjunction, so
+// each of the other two conjuncts needs an interactive row as well.
+func TestCredentialProcessStderrDoesNotReachACapturedDescriptor(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		machine bool
+		tty     bool
+		// interactive drives cfg.NonInteractive, inverted so the zero value is the
+		// safe one: a case that says nothing about prompting does not get a prompt.
+		interactive bool
+		// visible is what the policy promises for this shape: only a terminal that
+		// could answer a prompt still gets one.
+		visible bool
+	}{
+		{
+			// The CI and agent-harness shape, and the one the issue was filed
+			// against: fd 2 is a pipe or a file, so anything written to it is kept.
+			name: "human format with stderr captured",
+			tty:  false,
+		},
+		{
+			// A machine format discards it even on a terminal. --format json
+			// promises that stderr carries one parseable document and nothing else,
+			// and a prompt no machine caller can answer is not worth breaking that
+			// for.
+			name:    "machine format on a terminal",
+			machine: true,
+			tty:     true,
+		},
+		{
+			// The MFA path the SDK's assignment exists for, and the one this policy
+			// keeps: an operator at a terminal who has not said that nothing will
+			// answer a prompt.
+			name:        "human format on a terminal",
+			tty:         true,
+			interactive: true,
+			visible:     true,
+		},
+		{
+			// The same terminal, with --non-interactive. A prompt nobody will answer
+			// is pure exposure, and this is the case that closes the pty recorder:
+			// `script -q log bmcp --non-interactive <tool>` no longer captures it.
+			name: "non-interactive on a terminal",
+			tty:  true,
+		},
+		{
+			// The same terminal and an operator who could answer, under a machine
+			// format. Only !a.machine can carry this row — the other two conjuncts
+			// both say "keep" — so without it, deleting a.machine from the policy
+			// leaves the whole suite green.
+			name:        "machine format interactive on a terminal",
+			machine:     true,
+			tty:         true,
+			interactive: true,
+		},
+		{
+			// #61's own reproduction, with nothing else to fall back on: a human
+			// format, no --non-interactive, and fd 2 on a file or a pipe. Only
+			// a.stderrIsTerminal() can carry it, and it is the shape a plain
+			// `bmcp <tool>` has in CI, where no flag is passed at all.
+			name:        "human format interactive with stderr captured",
+			tty:         false,
+			interactive: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateAWSEnv(t)
+			profile := stderrWritingCredentialProcessProfile(t, "chatty")
+			cfg := effectiveConfig{
+				Profile:        profile,
+				ProfileSource:  profileSourceFile,
+				Region:         "us-east-1",
+				NonInteractive: !tc.interactive,
+			}
+			a := authTestApp()
+			a.machine = tc.machine
+			a.stderrTTY = func() bool { return tc.tty }
+
+			var creds aws.Credentials
+			var err error
+			captured := captureStderrFd(t, func() {
+				creds, _, err = a.awsCredentials(authTestContext(t), cfg)
+				// Written after the call, through the variable rather than through
+				// a saved copy: the swap is only safe if it puts os.Stderr back, and
+				// a fix that left it pointing at /dev/null would silence every later
+				// subprocess in the process — starting with `aws sso login`.
+				fmt.Fprintln(os.Stderr, afterRetrieval)
+			})
+			// Asserted first, and asserted on the key that came back rather than on
+			// err alone: if the helper had failed it would have written no trace, and
+			// every leak assertion below would pass on an empty string. The point of
+			// #61 is that the leak happens when nothing goes wrong.
+			if err != nil {
+				t.Fatalf("retrieval should have succeeded, got: %v", err)
+			}
+			if creds.AccessKeyID != leakedKeyID {
+				t.Fatalf("credentials came from %q, want the helper's %q", creds.AccessKeyID, leakedKeyID)
+			}
+
+			if !strings.Contains(captured, afterRetrieval) {
+				t.Fatalf("os.Stderr was not restored after retrieval; captured:\n%s", captured)
+			}
+			if tc.visible {
+				if !strings.Contains(captured, mfaPrompt) {
+					t.Fatalf("a terminal must still see the helper's prompt %q, got:\n%s", mfaPrompt, captured)
+				}
+				// The other half of the before/after pair, and the reason the
+				// absences below mean anything: this asserts the fixture actually
+				// reproduces #61. The secret reaches fd 2 only through `set -x`, so
+				// if this shell ever stopped tracing, every assertNoLeak above would
+				// go vacuous and nothing would say so.
+				if !strings.Contains(captured, leakedSecret) {
+					t.Fatalf("the fixture no longer traces the credential to stderr, so the discard cases assert nothing:\n%s", captured)
+				}
+				return
+			}
+			assertNoLeak(t, captured)
+			if strings.Contains(captured, mfaPrompt) {
+				t.Fatalf("helper stderr reached a captured descriptor:\n%s", captured)
+			}
+			// And bmcp's own writer is untouched by the swap: a.stderr holds the
+			// value os.Stderr had at startup, so restoring the variable is not what
+			// keeps bmcp's output working — nothing ever redirected it.
+			if out := a.stderr.(*bytes.Buffer).String(); out != "" {
+				t.Fatalf("bmcp wrote prose of its own during retrieval:\n%s", out)
+			}
+		})
+	}
+}
+
+// The same channel through the surface it breaks: a caller merging the streams
+// under --format json is promised one parseable document on stderr, and a
+// helper's trace lands on that stream ahead of it.
+func TestFormatJSONSuccessIsNotPollutedByCredentialProcessStderr(t *testing.T) {
+	isolateAWSEnv(t)
+	profile := stderrWritingCredentialProcessProfile(t, "chatty")
+	cfg := effectiveConfig{
+		Profile:       profile,
+		ProfileSource: profileSourceFile,
+		Region:        "us-east-1",
+		// Left false on purpose. With --non-interactive set here too, that conjunct
+		// discarded on its own and deleting a.machine from the policy left this test
+		// green — so authTestApp's machine format is the only gate in play.
+		NonInteractive: false,
+	}
+	a := authTestApp()
+	// A terminal that could answer a prompt, so the machine format is the only
+	// thing doing the work here. Without that gate this case is the leak.
+	a.stderrTTY = func() bool { return true }
+	var creds aws.Credentials
+	captured := captureStderrFd(t, func() {
+		var err error
+		creds, _, err = a.awsCredentials(authTestContext(t), cfg)
+		if err != nil {
+			t.Errorf("retrieval should have succeeded, got: %v", err)
+			return
+		}
+		fmt.Fprintln(os.Stderr, afterRetrieval)
+	})
+	// Asserted for the same reason as in the table above: an empty fd 2 is what a
+	// helper that never ran would also produce.
+	if creds.AccessKeyID != leakedKeyID {
+		t.Fatalf("credentials came from %q, want the helper's %q", creds.AccessKeyID, leakedKeyID)
+	}
+	if !strings.Contains(captured, afterRetrieval) {
+		t.Fatalf("os.Stderr was not restored after retrieval; captured:\n%s", captured)
+	}
+	if strings.TrimSpace(strings.ReplaceAll(captured, afterRetrieval, "")) != "" {
+		t.Fatalf("a machine format must leave fd 2 clean, got:\n%s", captured)
+	}
+}
+
+// The line standing in for the MFA prompt the SDK's os.Stderr assignment exists
+// to show. Distinct from the fixture keys so an assertion about the prompt
+// cannot be satisfied by a leaked credential, and vice versa.
+const mfaPrompt = "Enter MFA code for arm-token:"
+
+// A marker written to os.Stderr once retrieval has returned, to prove the
+// variable is back where it started.
+const afterRetrieval = "bmcp-still-owns-fd-2"
+
+// stderrWritingCredentialProcessProfile appends a profile whose helper writes to
+// stderr as well as stdout: `set -x` makes the shell trace the credential echo,
+// which is #61's reproduction verbatim, and the prompt line stands for a helper
+// waiting on a hardware token.
+//
+// Note that the trace fires on the successful path. Unlike #60's fixtures this
+// helper emits valid credential JSON and exits 0.
+func stderrWritingCredentialProcessProfile(t *testing.T, name string) string {
+	t.Helper()
+	helper := tracingCredentialHelper(t)
+	appendSharedConfig(t, "\n[profile "+name+"]\nregion = us-east-1\ncredential_process = "+helper+"\n")
+	return name
+}
+
+// tracingCredentialHelper writes the fixture that reproduces #61 and returns its
+// path, for the cases that build a processcreds provider directly rather than
+// going through a profile.
+//
+// `set -x` is the whole point: it echoes the credential JSON to stderr on
+// *success*, which is the channel this file exists to close. A shell that
+// stopped tracing would make every assertNoLeak in the package vacuous.
+func tracingCredentialHelper(t *testing.T) string {
+	t.Helper()
+	helper := filepath.Join(t.TempDir(), "helper.sh")
+	script := "#!/bin/sh\nset -x\necho '" + mfaPrompt + "' >&2\n" +
+		`echo '{"Version":1,"AccessKeyId":"` + leakedKeyID + `","SecretAccessKey":"` + leakedSecret + `"}'` + "\n"
+	if err := os.WriteFile(helper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write helper: %v", err)
+	}
+	return helper
+}
+
+// captureStderrFd points os.Stderr at a file for the duration of fn and returns
+// what was written to it.
+//
+// The variable, not the descriptor: a raw syscall.Write(2, …) is not captured
+// here, and does not need to be. #61's channel is precisely the *value* of
+// os.Stderr at the moment processcreds reads it to build the helper command —
+// that file becomes the child's fd 2 — so this is the only thing a test can
+// observe. Injecting app.stderr, which every other test in this file does, sees
+// nothing of it.
+//
+// A file rather than an os.Pipe on purpose. A pipe would deadlock a fixture that
+// wrote more than its buffer, because nothing drains it until fn returns; a
+// fixture writing a megabyte is a reasonable thing to want and would have failed
+// for a reason that had nothing to do with the code under test.
+//
+// Safe to swap a package variable because nothing under cmd/bmcp starts a
+// goroutine of its own, and Go runs a package's tests sequentially unless they
+// ask otherwise. Nothing here may call t.Parallel().
+func captureStderrFd(t *testing.T, fn func()) string {
+	t.Helper()
+	f, err := os.CreateTemp(t.TempDir(), "stderr")
+	if err != nil {
+		t.Fatalf("create capture file: %v", err)
+	}
+	restore := os.Stderr
+	// Deferred as well as done below, because a t.Fatalf inside fn unwinds through
+	// runtime.Goexit rather than returning: the restore still has to happen, and
+	// nothing after fn runs.
+	defer func() {
+		os.Stderr = restore
+		f.Close()
+	}()
+	os.Stderr = f
+	fn()
+	os.Stderr = restore
+	out, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatalf("read captured stderr: %v", err)
+	}
+	return string(out)
+}
+
+// The default the shipped binary uses, since every case above injects stderrTTY
+// to reach a branch a test cannot otherwise produce. A pipe is what CI, a shell
+// redirect and an agent harness all present, and it is the answer that decides
+// whether the helper's output is discarded — so it is worth asserting directly
+// rather than trusting that the injected form and the real one agree.
+func TestStderrIsTerminalIsFalseForACapturedDescriptor(t *testing.T) {
+	var direct, throughApp bool
+	captureStderrFd(t, func() {
+		direct = stderrIsTerminal(os.Stderr)
+		throughApp = (&app{}).stderrIsTerminal()
+	})
+	if direct {
+		t.Fatal("a regular file reported itself as a terminal")
+	}
+	if throughApp {
+		t.Fatal("an app with no injected stderrTTY did not fall through to the real check")
+	}
+	// A character device that is not a terminal must answer no. This is the
+	// distinction a ModeCharDevice test cannot draw, and the one that matters:
+	// /dev/kmsg and /dev/console are character devices whose contents persist,
+	// so treating every character device as "a person is watching" put a
+	// helper's trace into a kernel or serial-console log. /dev/null stands in
+	// for them here because it is the one such device every machine has.
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
+	}
+	defer devNull.Close()
+	if stderrIsTerminal(devNull) {
+		t.Fatalf("%s is a character device but not a terminal, and must not take the visible branch", os.DevNull)
+	}
+	// The answer in the other direction, which nothing else pins: a detector
+	// stuck on "captured" would take the MFA prompt away from every operator at
+	// a terminal with the whole suite still green. Needs a real tty, so it is
+	// skipped where the test host has no controlling terminal — CI, mostly.
+	if tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
+		defer tty.Close()
+		if !stderrIsTerminal(tty) {
+			t.Fatal("a controlling terminal was not recognised as one, which would discard every MFA prompt")
+		}
+	} else {
+		t.Logf("no controlling terminal here, so the positive case is unasserted: %v", err)
+	}
+	// And the reason the decision may not be taken on the live global: an app
+	// whose realStderr is pinned answers for fd 2 even while os.Stderr holds a
+	// sink. Without that, an abandoned retrieval's /dev/null decided every later
+	// policy question in the process.
+	captured, err := os.CreateTemp(t.TempDir(), "fd2")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	defer captured.Close()
+	pinned := &app{realStderr: captured}
+	restore := os.Stderr
+	defer func() { os.Stderr = restore }()
+	os.Stderr = devNull
+	if pinned.stderrIsTerminal() {
+		t.Fatal("the terminal test read the installed sink instead of the pinned descriptor")
+	}
+}
+
+// The property every case above assumes and none of them can check: that
+// a.machine is already set by the time credentials resolve.
+//
+// It is assigned in selectFormat during dispatch (cmd/bmcp/commands.go), and the
+// unit cases reach retrieveCredentials with it set by hand — so a dispatch order
+// that resolved credentials before selectFormat ran would leave them all green
+// while `bmcp --format json` leaked on a terminal. This goes through a.run, and
+// claims a terminal, so the machine gate is the only thing standing between the
+// helper and the descriptor.
+func TestFormatJSONDispatchSetsTheMachineGateBeforeCredentialsResolve(t *testing.T) {
+	isolateAWSEnv(t)
+	profile := stderrWritingCredentialProcessProfile(t, "chatty")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	fileCfg, err := readConfig(filepath.Join(borisHome, "config.toml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	fileCfg.AWSProfile = profile
+	if err := writeConfig(filepath.Join(borisHome, "config.toml"), fileCfg); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr, now: time.Now,
+		stderrTTY: func() bool { return true },
+	}
+	var code int
+	captured := captureStderrFd(t, func() {
+		// No --non-interactive: that conjunct would discard on its own, and this
+		// test would stay green with a.machine deleted from the policy — which is
+		// the one thing it exists to catch.
+		code = a.run([]string{"--format", "json", "tools___search_aws"})
+	})
+	// The pin has to have happened, and run() is the only place it can: every
+	// subprocess descriptor and the terminal test read it, so an app that reached
+	// a credential path without it would be one abandoned retrieval away from
+	// handing `aws sso login` a /dev/null.
+	if a.realStderr == nil {
+		t.Fatal("run() did not pin the startup stderr, so nothing can tell what fd 2 is")
+	}
+	// exitSync rather than "non-zero", because that is what says the helper ran.
+	// The catalog is cached and localhost:8787 is not listening, so a run that
+	// resolved credentials fails on the call; one that never got that far fails
+	// with exitAuth, having spawned nothing, and every absence below would then
+	// hold on an empty string.
+	if code != exitSync {
+		t.Fatalf("want exit %d, the failure of a run that resolved credentials, got %d; stderr:\n%s", exitSync, code, captured)
+	}
+	assertNoLeak(t, captured)
+	if strings.Contains(captured, mfaPrompt) {
+		t.Fatalf("helper stderr reached fd 2 under --format json:\n%s", captured)
+	}
+	// The contract the leak breaks, asserted where the caller sees it: bmcp's own
+	// writer holds one document, and fd 2 held nothing to interleave with it.
+	if captured != "" {
+		t.Fatalf("--format json must leave fd 2 clean, got:\n%s", captured)
+	}
+	assertNoLeak(t, stdout.String())
+	assertNoLeak(t, stderr.String())
+}
+
+// The hole the first version of this fix had, and the reason the swap is not
+// simply put back in a defer.
+//
+// LoadDefaultConfig always wraps the provider in an aws.CredentialsCache, whose
+// Retrieve runs the real provider on a singleflight goroutine and abandons it
+// the moment the caller's context is done — handing it a context whose Done() is
+// nil, so nothing ever stops it. That goroutine reads os.Stderr when it builds
+// the helper command, which is *after* Retrieve has returned. Restoring the
+// variable there handed the helper the captured descriptor after bmcp had
+// already reported failure; it reproduced 3 times out of 3.
+//
+// A cancelled context is not exotic: it is any invocation whose --call-timeout
+// or --sync-timeout is consumed before credentials resolve.
+//
+// The cache and the provider are built here rather than through
+// LoadDefaultConfig so the test can hold a real happens-before edge to that
+// goroutine. Waiting on a file the helper touches would order the two in
+// practice and still be a data race by definition — which is exactly what the
+// first version of this test was, intermittently failing `go test -race`.
+// TestChainRunsACredentialProcessSeesEveryProcessShape covers the other half,
+// that the config path really does produce an aws.CredentialsCache.
+func TestCredentialProcessStderrSurvivesACancelledRetrieval(t *testing.T) {
+	isolateAWSEnv(t)
+	helper := filepath.Join(t.TempDir(), "helper.sh")
+	script := "#!/bin/sh\nset -x\n" +
+		`echo '{"Version":1,"AccessKeyId":"` + leakedKeyID + `","SecretAccessKey":"` + leakedSecret + `"}'` + "\n"
+	if err := os.WriteFile(helper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write helper: %v", err)
+	}
+	retrieved := make(chan struct{})
+	// Held until the cancelled retrieval has returned, so the helper command is
+	// built — and os.Stderr read — strictly afterwards. That is the ordering the
+	// restore rule has to survive, and without the gate the worker is free to do
+	// its reading first, which would let an unconditional restore pass here.
+	release := make(chan struct{})
+	worker := &signallingProvider{
+		inner:   processcreds.NewProvider(helper),
+		release: release,
+		done:    retrieved,
+	}
+	cache := aws.NewCredentialsCache(worker)
+	a := authTestApp()
+	// Both inert, and kept only to say so. cfg.NonInteractive below already sends
+	// this case down the discard branch, which is the branch it needs: the visible
+	// branch installs no sink, so there would be nothing for the restore rule to
+	// get wrong. What this case pins is that the sink is *not* put back while an
+	// abandoned goroutine may still read it.
+	a.machine = false
+	a.stderrTTY = func() bool { return true }
+	cfg := effectiveConfig{
+		Profile:        "racy",
+		ProfileSource:  profileSourceFile,
+		Region:         "us-east-1",
+		NonInteractive: true,
+	}
+
+	var err error
+	captured := captureStderrFd(t, func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err = a.retrieveCredentials(ctx, cfg, cache)
+		// Only now may the worker proceed, which is what puts its read of
+		// os.Stderr after the retrieval returned.
+		close(release)
+		// Receiving here is what makes restoring os.Stderr afterwards safe: the
+		// send happens after the abandoned goroutine has finished reading it.
+		select {
+		case <-retrieved:
+		case <-time.After(30 * time.Second):
+			t.Error("the abandoned helper never finished, so this case asserted nothing")
+		}
+	})
+	if err == nil {
+		t.Fatal("a cancelled retrieval should have failed")
+	}
+	// Before any absence: the helper has to have actually run, or an empty capture
+	// would satisfy every check below.
+	assertAbandonedHelperRan(t, worker)
+	assertNoLeak(t, captured)
+	assertNoLeak(t, err.Error())
+}
+
+// signallingProvider drives the singleflight goroutine aws.CredentialsCache
+// abandons on cancellation, so a test can order it rather than hope.
+//
+// Two channels, and both are load-bearing. release holds the provider before it
+// runs, which is what forces the helper command to be *built* — the moment
+// processcreds reads os.Stderr — after the cancelled retrieval has already
+// returned. Without it the worker may do its reading first, and a test meant to
+// catch an unconditional restore passes on the wrong schedule. done closes once
+// the inner provider is finished, and result() then says whether it actually
+// produced credentials: the SDK returns command-start failures the same way it
+// returns a cancelled retrieval, so a test that only waited for the signal could
+// accept a run where the helper never executed and assert absences against an
+// empty capture.
+//
+// ProviderSources is forwarded so the chain still describes itself the way the
+// real one does.
+type signallingProvider struct {
+	inner   aws.CredentialsProvider
+	release <-chan struct{}
+	done    chan struct{}
+
+	mu    sync.Mutex
+	creds aws.Credentials
+	err   error
+}
+
+func (p *signallingProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	if p.release != nil {
+		<-p.release
+	}
+	creds, err := p.inner.Retrieve(ctx)
+	p.mu.Lock()
+	p.creds, p.err = creds, err
+	p.mu.Unlock()
+	close(p.done)
+	return creds, err
+}
+
+// result reports what the abandoned retrieval produced. Safe to call once done
+// is closed.
+func (p *signallingProvider) result() (aws.Credentials, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.creds, p.err
+}
+
+// assertAbandonedHelperRan fails unless the goroutine the cache walked away from
+// actually executed the helper and got its credentials. Every absence a
+// cancellation test asserts is vacuous without it.
+func assertAbandonedHelperRan(t *testing.T, p *signallingProvider) {
+	t.Helper()
+	creds, err := p.result()
+	if err != nil {
+		t.Fatalf("the abandoned retrieval never produced credentials, so the case asserted nothing: %v", err)
+	}
+	if creds.AccessKeyID != leakedKeyID {
+		t.Fatalf("the abandoned retrieval returned %q, want the helper's %q", creds.AccessKeyID, leakedKeyID)
+	}
+}
+
+func (p *signallingProvider) ProviderSources() []aws.CredentialSource {
+	return reportedSources(p.inner)
+}
+
+// Withholding the SDK's error text (#60) left "run the helper yourself" as the
+// operator's next step. #61 then discarded the helper's own stderr, so on a
+// captured descriptor there is nothing in the log at all — and a message that
+// still said only "run it yourself" would let that emptiness read as "the
+// helper printed nothing". The message has to name the discard, and only when
+// there was one.
+func TestCredentialProcessFailureSaysWhenItDiscardedTheHelpersStderr(t *testing.T) {
+	const clause = "discarded rather than shown"
+	for _, tc := range []struct {
+		name string
+		tty  bool
+		// interactive drives cfg.NonInteractive, inverted, exactly as in the policy
+		// table above: the clause has to track the gate, not a stand-in for it.
+		interactive bool
+		says        bool
+	}{
+		{name: "stderr captured", says: true},
+		{name: "non-interactive on a terminal", tty: true, says: true},
+		{name: "stderr is a terminal", tty: true, interactive: true, says: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateAWSEnv(t)
+			helper := filepath.Join(t.TempDir(), "helper.sh")
+			// The shape #60's fixtures cannot produce: a helper that explains itself
+			// on stderr and then fails, which is what every real wrapper does.
+			body := "#!/bin/sh\necho 'vault: profile prod is not unlocked' >&2\nexit 1\n"
+			if err := os.WriteFile(helper, []byte(body), 0o700); err != nil {
+				t.Fatalf("write helper: %v", err)
+			}
+			appendSharedConfig(t, "\n[profile broken]\nregion = us-east-1\ncredential_process = "+helper+"\n")
+			cfg := effectiveConfig{
+				Profile:        "broken",
+				ProfileSource:  profileSourceFile,
+				Region:         "us-east-1",
+				NonInteractive: !tc.interactive,
+			}
+			a := authTestApp()
+			a.machine = false
+			a.stderrTTY = func() bool { return tc.tty }
+			var err error
+			captureStderrFd(t, func() {
+				_, _, err = a.awsCredentials(authTestContext(t), cfg)
+			})
+			if err == nil {
+				t.Fatal("expected an auth failure")
+			}
+			if got := strings.Contains(err.Error(), clause); got != tc.says {
+				t.Fatalf("message names the discard = %v, want %v: %q", got, tc.says, err.Error())
+			}
+			// Whichever way that went, the helper's own words are still withheld —
+			// the clause explains the silence, it does not lift the rule.
+			if strings.Contains(err.Error(), "not unlocked") {
+				t.Fatalf("the helper's stderr reached the message: %q", err.Error())
+			}
+		})
+	}
+}
+
+// The contract #61 breaks, asserted on the stream the contract is about.
+//
+// Every other case here gives a.stderr a bytes.Buffer, so bmcp's document and
+// the helper's trace never land on the same place and nothing checks the claim
+// BORIS.md actually makes: that under a machine format stderr carries one
+// parseable document, so `2>&1` is safe. This builds the app with the captured
+// file as its own stderr — the arrangement a caller merging the streams has —
+// and decodes it.
+func TestFormatJSONMergedStderrIsExactlyOneDocument(t *testing.T) {
+	isolateAWSEnv(t)
+	profile := stderrWritingCredentialProcessProfile(t, "chatty")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___search_aws", Description: "Search."}})
+	fileCfg, err := readConfig(filepath.Join(borisHome, "config.toml"))
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	fileCfg.AWSProfile = profile
+	if err := writeConfig(filepath.Join(borisHome, "config.toml"), fileCfg); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	var stdout bytes.Buffer
+	var code int
+	captured := captureStderrFd(t, func() {
+		// os.Stderr, not a buffer: inside this closure that is the capture file, so
+		// bmcp's own output and anything the helper writes share one stream exactly
+		// as they would for a caller who wrote `2>&1`.
+		a := &app{stdin: strings.NewReader(""), stdout: &stdout, stderr: os.Stderr, now: time.Now}
+		code = a.run([]string{"--format", "json", "--non-interactive", "tools___search_aws"})
+	})
+	// exitSync rather than merely non-zero: the run has to have got past credential
+	// resolution, or the helper never ran and "one document, no leak" holds
+	// trivially for an auth failure that spawned nothing.
+	if code != exitSync {
+		t.Fatalf("want exit %d, the failure of a run that resolved credentials, got %d; stderr:\n%s", exitSync, code, captured)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("a failure must leave stdout empty, got:\n%s", stdout.String())
+	}
+	assertNoLeak(t, captured)
+	// One document and nothing after it. A trace line ahead of the document would
+	// fail on the first Decode; one appended would fail on the io.EOF check, which
+	// is the half a single Unmarshal would have missed.
+	dec := json.NewDecoder(strings.NewReader(captured))
+	var doc struct {
+		OK      bool   `json:"ok"`
+		Message string `json:"message"`
+	}
+	if err := dec.Decode(&doc); err != nil {
+		t.Fatalf("merged stderr is not one JSON document (%v):\n%s", err, captured)
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		t.Fatalf("merged stderr carries more than the document (%v):\n%s", err, captured)
+	}
+	if doc.OK {
+		t.Fatalf("expected ok:false, got:\n%s", captured)
+	}
+	assertNoLeak(t, doc.Message)
+}
+
+// The SDK assumption chainRunsACredentialProcess rests on, pinned so an SDK bump
+// that stopped reporting a process source fails here rather than silently
+// narrowing the refusal it guards.
+//
+// The chain case is the one that matters: the helper sits at the leaf of a
+// source_profile chain under an assume-role provider, and the report has to
+// survive both hops.
+func TestChainRunsACredentialProcessSeesEveryProcessShape(t *testing.T) {
+	isolateAWSEnv(t)
+	leaf := credentialProcessProfile(t, "cp-leaf", `{"Version":1,"AccessKeyId":"`+leakedKeyID+`","SecretAccessKey":"`+leakedSecret+`"}`)
+	appendSharedConfig(t, "\n[profile cp-chain]\nregion = us-east-1\nsource_profile = "+leaf+"\nrole_arn = arn:aws:iam::123456789012:role/example\n")
+	appendSharedConfig(t, `
+[profile sso-session-form]
+region = us-east-1
+sso_session = s
+sso_account_id = 123456789012
+sso_role_name = Example
+
+[sso-session s]
+sso_start_url = https://example.awsapps.com/start
+sso_region = us-east-1
+`)
+	for _, tc := range []struct {
+		profile string
+		want    bool
+	}{
+		{profile: leaf, want: true},
+		{profile: "cp-chain", want: true},
+		{profile: "has-static", want: false},
+		{profile: "sso-only", want: false},
+		{profile: "sso-session-form", want: false},
+	} {
+		t.Run(tc.profile, func(t *testing.T) {
+			awsCfg, err := awsconfig.LoadDefaultConfig(authTestContext(t), awsconfig.WithSharedConfigProfile(tc.profile))
+			if err != nil {
+				t.Fatalf("load config for %s: %v", tc.profile, err)
+			}
+			if got := chainRunsACredentialProcess(awsCfg.Credentials); got != tc.want {
+				t.Fatalf("chainRunsACredentialProcess(%s) = %v, want %v (sources reported: %v)",
+					tc.profile, got, tc.want, reportedSources(awsCfg.Credentials))
+			}
+		})
+	}
+	// And the unknown case answers yes, which is the direction that keeps a chain
+	// the SDK stops describing from running a helper uncontained.
+	if !chainRunsACredentialProcess(staticProviderWithoutSources{}) {
+		t.Fatal("a provider that reports no sources must be assumed to run a process")
+	}
+}
+
+// A provider deliberately not implementing aws.CredentialProviderSource.
+type staticProviderWithoutSources struct{}
+
+func (staticProviderWithoutSources) Retrieve(context.Context) (aws.Credentials, error) {
+	return aws.Credentials{}, nil
+}
+
+func reportedSources(provider aws.CredentialsProvider) []aws.CredentialSource {
+	if source, ok := provider.(aws.CredentialProviderSource); ok {
+		return source.ProviderSources()
+	}
+	return nil
+}
+
+// The hole the conditional restore left open, and what the latch closes.
+//
+// Two retrievals in one run, the first cancelled and — the point of the case —
+// *not* waited for, so the goroutine it abandoned may still be reading os.Stderr
+// to build its command. bmcp produces exactly this shape: a sync whose timeout
+// expires is downgraded to a warning rather than ending the run (cacheForCatalog),
+// and credentials are resolved again on a fresh context.
+//
+// The assertion is descriptor identity: the second retrieval must run under the
+// very file the abandoned one left installed. Before the latch it ran under a
+// second sink, which it then closed — while a worker that had already read the
+// variable held that same file as its child's fd 2. That is a closed descriptor
+// handed to a helper, and an unsynchronised write to os.Stderr besides.
+func TestASecondRetrievalDoesNotReassignStderrUnderAnAbandonedOne(t *testing.T) {
+	isolateAWSEnv(t)
+	helper := tracingCredentialHelper(t)
+	abandoned := make(chan struct{})
+	// Held until *both* retrievals have returned. That is the worst ordering for
+	// the bug under test: the abandoned worker reads os.Stderr after a second
+	// call has had every chance to reassign it.
+	release := make(chan struct{})
+	worker := &signallingProvider{
+		inner:   processcreds.NewProvider(helper),
+		release: release,
+		done:    abandoned,
+	}
+	first := aws.NewCredentialsCache(worker)
+	recorder := &stderrRecordingProvider{inner: processcreds.NewProvider(helper)}
+	second := aws.NewCredentialsCache(recorder)
+
+	a := authTestApp()
+	// Inert, and kept to say so: cfg.NonInteractive below sends both calls down
+	// the discard branch on its own, which is the branch this case needs. The
+	// visible branch installs no sink, and there would be nothing to reassign.
+	a.machine = false
+	a.stderrTTY = func() bool { return true }
+	cfg := effectiveConfig{
+		Profile:        "racy",
+		ProfileSource:  profileSourceFile,
+		Region:         "us-east-1",
+		NonInteractive: true,
+	}
+
+	var creds aws.Credentials
+	var installed, ranUnder *os.File
+	captured := captureStderrFd(t, func() {
+		// Pinned where os.Stderr is still the capture file — the same moment main()
+		// pins it, before anything has installed a sink.
+		a.realStderr = os.Stderr
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := a.retrieveCredentials(ctx, cfg, first); err == nil {
+			t.Error("a cancelled retrieval should have failed")
+		}
+		installed = os.Stderr
+
+		// Deliberately no wait on `abandoned`: a second retrieval racing the
+		// goroutine the first one left behind is the situation under test.
+		var err error
+		creds, err = a.retrieveCredentials(authTestContext(t), cfg, second)
+		if err != nil {
+			t.Errorf("the second retrieval should have succeeded, got: %v", err)
+		}
+		ranUnder = recorder.saw()
+
+		// Only now, so the abandoned worker builds its command after both calls.
+		close(release)
+		select {
+		case <-abandoned:
+		case <-time.After(30 * time.Second):
+			t.Error("the abandoned helper never finished, so this case asserted nothing")
+		}
+	})
+
+	// Asserted before any absence: a second retrieval that failed would have
+	// written no trace, and every check below would hold on an empty string.
+	if creds.AccessKeyID != leakedKeyID {
+		t.Fatalf("second retrieval returned %q, want the helper's %q", creds.AccessKeyID, leakedKeyID)
+	}
+	// The abandoned helper has to have actually executed, or "no leak" below holds
+	// for the trivial reason that nothing ever wrote.
+	assertAbandonedHelperRan(t, worker)
+	if installed == nil || ranUnder == nil {
+		t.Fatal("the retrievals did not record the descriptor they ran under")
+	}
+	if ranUnder != installed {
+		t.Fatal("the second retrieval installed a sink of its own over the one an abandoned goroutine may still be reading")
+	}
+	if !a.stderrSunk {
+		t.Fatal("an abandoned retrieval did not latch, so a later call is free to reassign os.Stderr under it")
+	}
+	assertNoLeak(t, captured)
+	if strings.Contains(captured, mfaPrompt) {
+		t.Fatalf("helper stderr reached the captured descriptor:\n%s", captured)
+	}
+}
+
+// stderrRecordingProvider reports the os.Stderr its retrieval actually ran
+// under, which is the thing processcreds reads to build the helper command.
+type stderrRecordingProvider struct {
+	inner aws.CredentialsProvider
+	mu    sync.Mutex
+	seen  *os.File
+}
+
+func (p *stderrRecordingProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	p.mu.Lock()
+	p.seen = os.Stderr
+	p.mu.Unlock()
+	return p.inner.Retrieve(ctx)
+}
+
+func (p *stderrRecordingProvider) saw() *os.File {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.seen
+}
+
+// The consequence that made the leaked sink worse than an untidy global, pinned
+// through the subprocess that suffers it.
+//
+// After a retrieval is abandoned, os.Stderr stays pointed at /dev/null on
+// purpose. `aws sso login` is not what that sink exists to contain — it is
+// bmcp's own subprocess, and an operator has to read the verification URL and
+// user code it prints. Handing it the global destroyed both and left bmcp
+// blocking on a device flow with nothing on screen.
+//
+// The fake `aws` on PATH is how the shell-out is observed without a real login.
+func TestSSOLoginAfterAnAbandonedRetrievalStillReachesTheOperator(t *testing.T) {
+	const verification = "bmcp-verification-url-and-user-code"
+	isolateAWSEnv(t)
+
+	// A fake `aws` that prints where a real one prints its device code, and fails
+	// so the caller still reports the original credential problem.
+	binDir := t.TempDir()
+	fake := filepath.Join(binDir, "aws")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho '"+verification+"' >&2\nexit 1\n"), 0o700); err != nil {
+		t.Fatalf("write fake aws: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	helper := tracingCredentialHelper(t)
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	worker := &signallingProvider{
+		inner:   processcreds.NewProvider(helper),
+		release: release,
+		done:    finished,
+	}
+
+	a := authTestApp()
+	// The shape that reaches the login: a human format, nothing saying the run is
+	// non-interactive, and a stdin someone could answer at.
+	a.machine = false
+	a.interactive = func() bool { return true }
+	a.stderrTTY = func() bool { return false }
+
+	captured := captureStderrFd(t, func() {
+		a.realStderr = os.Stderr
+
+		// Abandon a retrieval, which is what installs the sink and latches it.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := a.retrieveCredentials(ctx, effectiveConfig{
+			Profile:        "racy",
+			ProfileSource:  profileSourceFile,
+			Region:         "us-east-1",
+			NonInteractive: true,
+		}, aws.NewCredentialsCache(worker)); err == nil {
+			t.Error("a cancelled retrieval should have failed")
+		}
+		if !a.stderrSunk {
+			t.Fatal("the retrieval did not latch, so the rest of this case proves nothing")
+		}
+
+		// Now an SSO profile, whose retrieval cannot succeed here, so the login
+		// branch runs. Its subprocess must reach fd 2, not the sink.
+		_, _, err := a.awsCredentials(authTestContext(t), effectiveConfig{
+			Profile:       "sso-only",
+			ProfileSource: profileSourceFile,
+			Region:        "us-east-1",
+		})
+		if err == nil {
+			t.Error("an sso-only profile should not have resolved in a test")
+		}
+
+		close(release)
+		select {
+		case <-finished:
+		case <-time.After(30 * time.Second):
+			t.Error("the abandoned helper never finished")
+		}
+	})
+
+	assertAbandonedHelperRan(t, worker)
+	if !strings.Contains(captured, verification) {
+		t.Fatalf("aws sso login was handed the sink, so its device code never reached the operator; captured:\n%s", captured)
+	}
+	// And the sink still did its job for the thing it was installed for.
+	assertNoLeak(t, captured)
 }
