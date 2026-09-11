@@ -161,8 +161,67 @@ func isAuthErr(err error) bool {
 	return errors.As(err, &ae)
 }
 
+// httpStatusError carries the gateway's status code alongside the body it sent,
+// so callers can ask what the server actually said rather than matching on the
+// message text.
+//
+// The distinction it exists to draw is between "bmcp never produced a signed
+// request" — which is authError, decided entirely on this side — and "bmcp
+// signed a request and the gateway refused the identity in it". Only the server
+// can answer the second, and before this type the answer arrived as prose and
+// was indistinguishable from a 500 or a routing error.
+//
+// Deliberately not wrapped in authError. isAuthErr means "credentials never
+// produced a signed request", a pre-request invariant that awsauth.go's
+// remedies depend on; a 401 is the opposite case, and overloading the predicate
+// would send both down paths written for one of them.
+type httpStatusError struct {
+	status int
+	body   string
+}
+
+// The 401 hint rides on Error() rather than on doctor's row, so every path that
+// surfaces the error carries it: `bmcp <tool>`, `bmcp sync`, `bmcp serve` and
+// the failure document, not only the one command that classifies statuses.
+//
+// 401 alone. This gateway answers 401 for every credential failure measured
+// against it — an invalid signature and a wrong signing region both — and 400
+// for an unknown route, so 401 is the whole of the credential case. 403 is
+// excluded on purpose: nothing observed produces one, so a 403 arriving here
+// would have come from an interposed WAF or proxy, where naming the gateway and
+// the operator's credentials would be a misdiagnosis.
+func (e *httpStatusError) Error() string {
+	msg := fmt.Sprintf("remote MCP HTTP %d: %s", e.status, e.body)
+	if e.rejectedCredentials() {
+		msg += " (the BORIS gateway rejected the signed request, so the credentials it was signed with are not valid for it)"
+	}
+	return msg
+}
+
+// rejectedCredentials is the single home for the status decision the comment
+// above argues. Error() and the doctor classifier both ask it, so a later
+// change of mind about which statuses count cannot move the prose hint and the
+// `auth` row apart.
+func (e *httpStatusError) rejectedCredentials() bool {
+	return e.status == http.StatusUnauthorized
+}
+
+func isGatewayAuthRejection(err error) bool {
+	var status *httpStatusError
+	return errors.As(err, &status) && status.rejectedCredentials()
+}
+
+// isCredentialFailure is the union every caller means by "this failed on the
+// credentials": bmcp never produced a signed request, or the gateway refused
+// the one it did. The error name and the exit code are both derived from it, so
+// a machine document cannot say auth_failure while exiting with the code for
+// something else.
+func isCredentialFailure(err error) bool {
+	return isAuthErr(err) || isGatewayAuthRejection(err)
+}
+
 func errorName(err error) string {
-	if isAuthErr(err) {
+	if isCredentialFailure(err) {
 		return "auth_failure"
 	}
 	if errors.Is(err, errUpstream) {
@@ -270,7 +329,19 @@ func (c *mcpClient) initialize(ctx context.Context) (serverInfo, error) {
 		Instructions string `json:"instructions"`
 	}
 	_ = json.Unmarshal(body, &result)
-	_, _ = c.rpc(ctx, jsonRPCRequest{JSONRPC: "2.0", Method: "notifications/initialized"}, false)
+	// A notification is fire-and-forget and its transport error is ignored — with
+	// one exception. A gateway that answers it with 401 has refused these
+	// credentials, and discarding that lets the handshake continue to tools/list:
+	// a server that then answered normally would produce a wholly successful sync
+	// on top of a rejection this client had already been handed, which is the
+	// contradiction doctor's classification exists to make unreachable.
+	//
+	// Only the credential rejection propagates. Every other notification failure
+	// stays ignored, because a server is free to answer a notification in ways
+	// this client has no business failing on.
+	if _, notifyErr := c.rpc(ctx, jsonRPCRequest{JSONRPC: "2.0", Method: "notifications/initialized"}, false); isGatewayAuthRejection(notifyErr) {
+		return serverInfo{}, notifyErr
+	}
 	return serverInfo{Name: result.ServerInfo.Name, ProtocolVersion: result.ProtocolVersion, Instructions: result.Instructions}, nil
 }
 
@@ -393,12 +464,26 @@ func (c *mcpClient) rpc(ctx context.Context, rpcReq jsonRPCRequest, expectRespon
 	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
 		c.sessionID = sid
 	}
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
+	respBody, readErr := io.ReadAll(resp.Body)
+	// Status before body error, and that order is the point. A 401 whose body
+	// arrives truncated — an overstated Content-Length, a connection closed
+	// mid-body — used to be reported as "unexpected EOF" with the status thrown
+	// away, so a rejection this client had already received was classified as an
+	// ordinary transport failure and doctor printed `auth ok` over it. That is
+	// the exact pairing this type exists to prevent. What the server said about
+	// the request outranks how completely it managed to say it.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("remote MCP HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		body := strings.TrimSpace(string(respBody))
+		if readErr != nil {
+			// Named rather than swallowed: a truncated body is itself a symptom, and
+			// an operator comparing this against a clean 401 should be able to see
+			// that the two are not the same event.
+			body = strings.TrimSpace(body + " (body could not be read in full: " + readErr.Error() + ")")
+		}
+		return nil, &httpStatusError{status: resp.StatusCode, body: body}
+	}
+	if readErr != nil {
+		return nil, readErr
 	}
 	if !expectResponse {
 		return nil, nil

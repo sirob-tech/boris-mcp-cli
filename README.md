@@ -266,9 +266,39 @@ it from a shell profile will quietly defeat `aws-vault exec` for every later
 call. Prefer `aws_profile` in `config.toml` for a standing default, and keep
 `BMCP_PROFILE` for a shell where you mean it.
 
+One exception to step 2, and the only case where `bmcp` departs from this order
+on its own: environment credentials stamped with an `AWS_CREDENTIAL_EXPIRATION`
+that has already passed — a lapsed `aws-vault exec` shell — are treated as
+absent, so the profile from step 3 wins after all. The AWS SDK does not read
+that variable, so without this those credentials are inescapable: it sees static
+keys it believes cannot expire, signs with them, and every request is rejected
+while no `aws_profile` in `config.toml` can take over. Credentials naming no
+expiration, one still in the future, or one that does not parse as RFC 3339 are
+all untouched — an unrecognised stamp is evidence of a wrapper `bmcp` does not
+understand, not evidence that the keys are dead. The demotion is also withheld
+when the environment carries `AWS_WEB_IDENTITY_TOKEN_FILE`, because handing the
+SDK a profile steps over its whole environment tier and would authenticate an
+IRSA pod as the profile instead of as its own role.
+
+One caveat, because it decides an identity: nothing binds `AWS_CREDENTIAL_EXPIRATION`
+to the keys beside it. A shell where the keys were refreshed but that variable
+was left behind, or a CI step that replaces the credential variables without
+replacing it, will have working credentials passed over in favour of the
+profile — a different account, quietly. Every message `bmcp` prints in that case
+says so, naming the expiry it acted on, and `--profile <name>` overrides the
+choice for one call. If a wrapper leaves a stale stamp behind, unset the
+variable or drop `aws_profile` from `config.toml`.
+
 Every `bmcp doctor` reports a `credentials` row naming the source a call would
 use, and an authentication failure names the one it tried — so a failure never
-sends you to repair a profile the call never consulted.
+sends you to repair a profile the call never consulted. That row ends in
+`— found, not verified`: it says what resolved locally, having contacted
+nothing. A run that goes remote is what tests them — `bmcp doctor --deep`, or a
+plain `bmcp doctor` whose cached catalog is missing, unreadable or stale — and
+its `auth` and `remote` rows then come from that one attempt. `auth` fails only
+when `bmcp` never produced a signed request, in which case no `remote` row is
+emitted at all, or when the BORIS gateway refused the request it did sign; a
+connection that never arrives fails `remote` alone.
 
 Harness detection checks for a known executable on `PATH` or an existing config
 directory such as `~/.claude`, `~/.codex`, `~/.config/opencode`, `~/.cursor`,
@@ -520,7 +550,11 @@ Under `--format json` or `--format ndjson`, three rules hold for every command:
 
   Read `ok` to tell success from failure on a merged stream. `exit_code`
   repeats bmcp's own exit status, which is worth reading when a pipeline has
-  replaced it with its own. The document is always a **single line**, in both
+  replaced it with its own. `error` and `exit_code` always agree about the same
+  cause: credentials that never produced a signed request and a request the
+  BORIS gateway refused both report `auth_failure` with exit 3, on every command
+  that can meet them — `sync`, `list`, `describe`, `serve` and a tool call
+  alike. The document is always a **single line**, in both
   machine formats — the one place the output does not follow `--format` — so
   `tail -1` and `read -r line` keep working on it.
 

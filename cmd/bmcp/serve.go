@@ -74,7 +74,7 @@ func (a *app) cmdServe(flags globalFlags, args []string) int {
 	cache, err := a.cacheForCatalog(flags, cfg, true)
 	if err != nil {
 		code := exitSync
-		if isAuthErr(err) {
+		if isCredentialFailure(err) {
 			code = exitAuth
 		}
 		return a.fail(flags, code, errorName(err), err.Error())

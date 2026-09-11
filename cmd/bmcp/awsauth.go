@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -44,17 +45,115 @@ func (a *app) loadCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cre
 // When it does not yield, passing it programmatically resolves exactly as the
 // SDK's own AWS_PROFILE handling would, because that is the branch the SDK
 // takes once the environment carries no credentials of its own.
-func sharedProfileFor(cfg effectiveConfig) (profile, outrankedBy string) {
+//
+// One exception to the yielding, and it is the whole of #66's third symptom:
+// environment credentials that have provably expired are treated as absent —
+// unless the environment also carries a web identity token, see below — so the
+// ambient profile wins after all. Without it those credentials are
+// inescapable — the SDK never reads AWS_CREDENTIAL_EXPIRATION, so it sees
+// static keys with CanExpire false, hands them to the signer, and the gateway
+// rejects every request. No profile in config.toml can help, because the dead
+// keys outrank it, and bmcp would report a healthy credential source while
+// every call 401s.
+//
+// The bypass is not total, and is not meant to be. resolveCredsFromProfile
+// still falls through to AWS_CONTAINER_CREDENTIALS_* and IMDS beneath the
+// profile, and a profile carrying credential_source = Environment reads the
+// very keys just demoted. Those are the profile's own fallbacks, which this
+// function has never had an opinion about.
+//
+// demotedAt is the instant those credentials expired, and the zero time when no
+// demotion happened. It exists because the demoted case and the no-credentials
+// case both return (cfg.Profile, ""), so without it nothing downstream can tell
+// "the profile won because the environment was empty" from "the profile won
+// because the environment was dead" — and the second is the one the operator
+// has to be told about, since it is bmcp departing from the documented order.
+func (a *app) sharedProfileFor(cfg effectiveConfig) (profile, outrankedBy string, demotedAt time.Time) {
 	if cfg.Profile == "" {
-		return "", ""
+		return "", "", time.Time{}
 	}
 	if cfg.ProfileSource.namedForThisInvocation() {
-		return cfg.Profile, ""
+		return cfg.Profile, "", time.Time{}
 	}
 	if source := envCredentialSource(); source != "" {
-		return "", source
+		// The demotion is withheld when the environment also carries a web identity
+		// token, and that exception is the difference between a recovery and a
+		// wrong identity. WithSharedConfigProfile does not remove the expired keys
+		// from the chain, it steps over the SDK's *entire* environment tier — the
+		// web identity arm included — so on an IRSA pod that also happens to carry
+		// stale static keys, demoting would authenticate as whatever profile
+		// config.toml names instead of as the pod's own role. That is a different
+		// account, silently, on a path whose whole purpose is to be less
+		// surprising.
+		//
+		// Withholding it leaves that population exactly where it is today: the SDK
+		// resolves the dead static keys, the request is rejected, and the operator
+		// gets the same 401 as before — no worse, and no new identity. Healing it
+		// properly would mean unsetting the keys out of the process environment,
+		// which is a far larger claim than this change is making.
+		if expired := a.envCredentialsExpiredAt(); !expired.IsZero() && !envCarriesWebIdentity() {
+			return cfg.Profile, "", expired
+		}
+		return "", source, time.Time{}
 	}
-	return cfg.Profile, ""
+	return cfg.Profile, "", time.Time{}
+}
+
+// envCarriesWebIdentity reports whether the environment names a web identity
+// token file — the one other credential source resolveCredentialChain places
+// above every profile, and therefore the one a demotion would step over.
+//
+// The token file alone, matching the SDK's own arm and envCredentialSource's
+// reasoning above it: a half-injected IRSA setup missing AWS_ROLE_ARN must fail
+// closed rather than quietly resolve as an ambient profile.
+func envCarriesWebIdentity() bool {
+	env, err := awsconfig.NewEnvConfig()
+	return err == nil && env.WebIdentityTokenFilePath != ""
+}
+
+// envCredentialsExpiredAt reports when the environment's static credentials
+// expired, or the zero time when it carries none, when they name no expiry, or
+// when that expiry has not been reached.
+//
+// AWS_CREDENTIAL_EXPIRATION is what aws-vault and most credential wrappers
+// stamp alongside the keys they inject, and it is the only local evidence that
+// exists: aws-sdk-go-v2/config does not read the variable, so the credentials
+// it builds report CanExpire false and Expired() is permanently false for them.
+// Reading it here is therefore not duplicating an SDK check, it is supplying
+// one the SDK does not make.
+//
+// Static keys only, tested through the SDK's own parser rather than by reading
+// AWS_ACCESS_KEY_ID directly, so which variables count cannot drift from the
+// fields the SDK tests. A web identity token file carries its own expiry inside
+// the token and is refreshed by the provider that reads it, so there is nothing
+// here to demote and nothing this variable would be describing.
+//
+// Three deliberate non-answers, all of which return the zero time:
+//
+//   - An unparseable value. It is evidence of a wrapper bmcp does not
+//     understand, not evidence that credentials are dead, and treating it as an
+//     expiry would demote working credentials on the strength of a typo.
+//   - A future instant. Credentials that have not expired are simply
+//     credentials.
+//   - Bare static keys with no expiration at all. A long-lived IAM user key is
+//     the ordinary case and must keep outranking a profile exactly as before.
+//
+// a.now rather than time.Now, because the demotion is a comparison against the
+// clock and a test has to be able to sit on both sides of it.
+func (a *app) envCredentialsExpiredAt() time.Time {
+	env, err := awsconfig.NewEnvConfig()
+	if err != nil || !env.Credentials.HasKeys() {
+		return time.Time{}
+	}
+	raw := os.Getenv("AWS_CREDENTIAL_EXPIRATION")
+	if raw == "" {
+		return time.Time{}
+	}
+	at, err := time.Parse(time.RFC3339, raw)
+	if err != nil || !at.Before(a.now()) {
+		return time.Time{}
+	}
+	return at
 }
 
 // envCredentialSource names the credentials the environment carries that
@@ -176,20 +275,55 @@ func sharedConfigProfile(ctx context.Context, profile string) (awsconfig.SharedC
 // Nothing bmcp printed said which of the several possible credential sources
 // was in play, so an operator whose environment credentials were being
 // discarded had no way to see that from the outside.
-func describeCredentialSource(cfg effectiveConfig) string {
-	profile, outrankedBy := sharedProfileFor(cfg)
+func (a *app) describeCredentialSource(cfg effectiveConfig) string {
+	profile, outrankedBy, demotedAt := a.sharedProfileFor(cfg)
 	switch {
 	case profile != "":
-		return "AWS profile " + profile + profileOrigin(cfg.ProfileSource)
+		// The expiry clause belongs here and not at the call site, so that every
+		// message built from this function carries it: doctor's `credentials` row,
+		// authFailure's "(using %s)", and the credential_process refusal. An
+		// operator meeting a demotion for the first time meets it in whichever of
+		// those they happen to hit.
+		//
+		// demotedAt is zero unless sharedProfileFor departed from the documented
+		// order, which is exactly when this needs saying — and in particular it is
+		// zero for a profile named with --profile or BMCP_PROFILE, where the
+		// environment's expiry had no bearing on what resolved. Announcing it there
+		// would be a fresh instance of the dishonesty this change exists to remove.
+		return "AWS profile " + profile + profileOrigin(cfg.ProfileSource) + demotionClause(demotedAt)
 	case outrankedBy != "":
 		return outrankedBy + ", which outrank AWS profile " + cfg.Profile + profileOrigin(cfg.ProfileSource)
 	}
 	// No profile to report. Naming what the SDK's default chain will actually
 	// pick still beats naming the chain.
 	if source := envCredentialSource(); source != "" {
+		// Expired here too, but with nothing to demote to: sharedProfileFor returned
+		// at its first line, so these dead credentials are what the SDK will sign
+		// with. Saying so is the only help available — the remedy is a fresh
+		// `aws-vault exec`, or an aws_profile in config.toml for bmcp to fall back
+		// on.
+		if expired := a.envCredentialsExpiredAt(); !expired.IsZero() {
+			return source + ", which expired at " + formatExpiry(expired)
+		}
 		return source
 	}
 	return "the default AWS credential chain"
+}
+
+// demotionClause names the expired environment credentials a profile was
+// preferred over, or nothing when none were.
+func demotionClause(demotedAt time.Time) string {
+	if demotedAt.IsZero() {
+		return ""
+	}
+	return ", after the credentials in the environment were passed over as expired at " + formatExpiry(demotedAt)
+}
+
+// formatExpiry renders an expiry the way every other instant bmcp prints is
+// rendered: RFC 3339 in UTC, so a message read in a CI log and one read on a
+// laptop name the same moment.
+func formatExpiry(at time.Time) string {
+	return at.UTC().Format(time.RFC3339)
 }
 
 // profileOrigin renders " from <source>", or nothing when the source is
@@ -201,6 +335,25 @@ func profileOrigin(source profileSource) string {
 		return ""
 	}
 	return " from " + string(source)
+}
+
+// ssoLoginBudget is the time an interactive device flow needs to be worth
+// starting. Not a measurement of how long a login takes — it is the line below
+// which starting one means arranging for it to be killed half-finished, which
+// is worse than declining and printing the command the operator can run
+// themselves.
+const ssoLoginBudget = 3 * time.Minute
+
+// deviceFlowFits reports whether the context leaves room for an interactive
+// login to complete.
+//
+// time.Until, deliberately, rather than the injectable a.now: the clock that
+// decides whether the subprocess is killed is the runtime's, so a test clock
+// that disagreed with it would be measuring the wrong thing. An unbounded
+// context fits by definition, though no production path supplies one.
+func deviceFlowFits(ctx context.Context) bool {
+	deadline, bounded := ctx.Deadline()
+	return !bounded || time.Until(deadline) >= ssoLoginBudget
 }
 
 func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Credentials, string, error) {
@@ -222,7 +375,7 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 	// read cfg.Profile was really asking "did this attempt resolve credentials
 	// through a profile", and once an ambient profile can be outranked those two
 	// questions have different answers.
-	profile, outrankedBy := sharedProfileFor(cfg)
+	profile, outrankedBy, _ := a.sharedProfileFor(cfg)
 	switch {
 	case profile != "":
 		opts = append(opts, awsconfig.WithSharedConfigProfile(profile))
@@ -258,7 +411,32 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 	// subprocess would write its own prose straight to the inherited stderr —
 	// which is the one thing a machine format guarantees will not happen. Refusing
 	// here falls through to the actionable "run aws sso login" error below.
-	if usesSSO && !cfg.NonInteractive && !a.machine && a.isInteractive() {
+	//
+	// Too little time left is the third refusal, and the newest. An SSO device
+	// flow is a human reading a code, switching to a browser, authenticating and
+	// approving, and exec.CommandContext kills the subprocess the moment the
+	// deadline lands — so started under a budget it cannot finish in, the login
+	// is arranged to be destroyed part-way: the operator approves in the browser,
+	// the token is never written, and bmcp reports `signal: killed` for a login
+	// that from the outside succeeded.
+	//
+	// The test is how much budget is left, not whether there is one. Every
+	// production path now carries a deadline — awsCredentials is reached only
+	// through newMCPClient, and both of its callers wrap the context — so asking
+	// merely whether one exists refuses every login bmcp can ever be asked to
+	// make, including the ones with ten minutes in hand. That is a capability
+	// deleted by accident rather than the narrow protection intended here.
+	//
+	// So the two budgets separate, which is what they were always meant to do: a
+	// tool call's CallTimeout is ten minutes and comfortably fits a device flow,
+	// while SyncTimeout is sixty seconds and does not. `bmcp sync` and
+	// `bmcp doctor` therefore stop asking — and for doctor that is a second
+	// endorsement of the audited failures in cmdDoctor's own docstring, where an
+	// expired SSO session met a sandbox that could not reach device
+	// authorization and a diagnostic command hung on work it had no business
+	// doing. The silent mint from ~/.aws/sso/cache needs no browser and is
+	// untouched on every path.
+	if usesSSO && deviceFlowFits(ctx) && !cfg.NonInteractive && !a.machine && a.isInteractive() {
 		fmt.Fprintf(a.prose(), "AWS SSO credentials for profile %s are expired or missing. Running aws sso login --profile %s\n", profile, profile)
 		cmd := exec.CommandContext(ctx, "aws", "sso", "login", "--profile", profile)
 		// The pinned descriptor, not os.Stderr: a retrieval abandoned earlier in
@@ -502,7 +680,7 @@ func (a *app) authFailure(cfg effectiveConfig, err error) error {
 	if withheld := a.credentialProcessFailure(cfg, err); withheld != nil {
 		return withheld
 	}
-	return fmt.Errorf("%w (using %s)", err, describeCredentialSource(cfg))
+	return fmt.Errorf("%w (using %s)", err, a.describeCredentialSource(cfg))
 }
 
 // credentialProcessFailure replaces the SDK's own text when the failure came
@@ -564,7 +742,7 @@ func (a *app) credentialProcessFailure(cfg effectiveConfig, err error) error {
 	if a.helperStderrDiscarded {
 		discarded = ", and anything it wrote to stderr was discarded rather than shown here, for the same reason"
 	}
-	return fmt.Errorf("credential_process helper %s (using %s). Run the helper yourself to see what it printed — its output is withheld here because it can contain live credentials%s", cause, describeCredentialSource(cfg), discarded)
+	return fmt.Errorf("credential_process helper %s (using %s). Run the helper yourself to see what it printed — its output is withheld here because it can contain live credentials%s", cause, a.describeCredentialSource(cfg), discarded)
 }
 
 // profileUsesSSO reports whether profile resolves through AWS SSO, following

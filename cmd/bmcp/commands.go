@@ -465,7 +465,7 @@ func (a *app) cmdSyncWithRefresh(flags globalFlags, refreshInstructions, report 
 	cache, err := a.syncTools(context.Background(), cfg)
 	if err != nil {
 		code := exitSync
-		if isAuthErr(err) {
+		if isCredentialFailure(err) {
 			code = exitAuth
 		}
 		return a.fail(flags, code, errorName(err), err.Error())
@@ -549,7 +549,7 @@ func (a *app) cmdList(flags globalFlags, args []string) int {
 	}
 	cache, err := a.cacheForCatalog(flags, cfg, true)
 	if err != nil {
-		return a.fail(flags, exitSync, "sync_failed", err.Error())
+		return a.fail(flags, catalogFailure(err), errorName(err), err.Error())
 	}
 	stamp := ""
 	if !cache.LastSync.IsZero() {
@@ -611,7 +611,7 @@ func (a *app) cmdDescribe(flags globalFlags, args []string) int {
 	}
 	cache, err := a.cacheForCatalog(flags, cfg, true)
 	if err != nil {
-		return a.fail(flags, exitSync, "sync_failed", err.Error())
+		return a.fail(flags, catalogFailure(err), errorName(err), err.Error())
 	}
 	t, err := resolveTool(cache, args[0])
 	if err != nil {
@@ -710,7 +710,7 @@ func (a *app) runCall(flags globalFlags, name string, payload string, readStdin 
 	result, err := a.callTool(context.Background(), cfg, t.Name, input)
 	if err != nil {
 		code := exitSync
-		if isAuthErr(err) {
+		if isCredentialFailure(err) {
 			code = exitAuth
 		}
 		if errors.Is(err, errUpstream) {
@@ -792,7 +792,7 @@ func (a *app) cmdDynamic(flags globalFlags, name string, args []string) int {
 	}
 	cache, err := a.cacheForCatalog(flags, cfg, true)
 	if err != nil {
-		return a.fail(flags, exitSync, "sync_failed", err.Error())
+		return a.fail(flags, catalogFailure(err), errorName(err), err.Error())
 	}
 	t, err := resolveTool(cache, name)
 	if err != nil {
@@ -880,22 +880,81 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 		// describeCredentialSource reads the environment and the resolved config
 		// and authenticates nothing, so it has nothing to fail at. That is also
 		// what lets it run while the catalog is fresh, where the promise
-		// BORIS.md makes is that doctor reaches neither AWS nor the server. The
-		// `auth` row below is the one that says whether these credentials work,
-		// and it still only appears once something has asked to go remote.
-		add("credentials", true, describeCredentialSource(cfg))
+		// BORIS.md makes is that doctor reaches neither AWS nor the server.
+		//
+		// The suffix is the whole of #66's second symptom. A row reading
+		// `credentials  ok  AWS profile x` was read as a verdict on that profile by
+		// every operator and every agent who met it, and it is not one — nothing
+		// was contacted. Saying so at the row rather than inside
+		// describeCredentialSource is the rule: that function answers *which*
+		// credentials, so a fact about the credentials themselves goes inside it,
+		// and a fact about what a particular row tested goes here. Unified "for
+		// consistency" it would produce `(using AWS profile x — found, not
+		// verified)` on every auth failure, which is nonsense on an error path.
+		source := a.describeCredentialSource(cfg)
+		add("credentials", true, source+" — found, not verified")
 		disk, diskErr := readCache(cfg.ToolsPath)
 		deep = flags.doctorDeep || !a.catalogIsFresh(cfg, disk, diskErr)
 		if deep {
-			_, _, authErr := a.loadCredentials(context.Background(), cfg)
-			add("auth", authErr == nil, messageOrOK(authErr))
-			if authErr == nil {
-				synced, syncErr := a.syncTools(context.Background(), cfg)
+			// One attempt, classified — not a credential load followed by a sync.
+			//
+			// #66's filed symptom was `auth ok` sitting above a `remote` row that had
+			// failed on HTTP 401, which is the most misleading pair doctor can print:
+			// the operator is told their credentials are fine and the server is down,
+			// when the server is up and rejecting them. It was structural rather than
+			// a wording slip. `auth` came from loadCredentials, which answers
+			// "credentials were retrieved" and can answer nothing else — no local
+			// check knows whether a gateway will accept an identity — while `remote`
+			// came from a later request that did know. Two sources, so they could
+			// disagree.
+			//
+			// Deriving both rows from one syncTools makes the contradiction
+			// unconstructible rather than merely unlikely, and it removes a second
+			// defect on the way: doctor used to resolve credentials twice per deep
+			// run, once here and once inside syncTools, because loadCredentials
+			// caches nothing — so a credential_process profile ran its helper twice.
+			synced, syncErr := a.syncTools(context.Background(), cfg)
+			switch {
+			case isAuthErr(syncErr):
+				// Credentials never produced a signed request: resolution failed, or
+				// SigV4 signing did. Not "never produced credentials" — signing runs
+				// after retrieval succeeds, and both are bmcp's own failures, decided
+				// before anything left the machine.
+				add("auth", false, messageOrOK(syncErr))
+			case isGatewayAuthRejection(syncErr):
+				// The gateway saw a signed request and refused the identity in it. Both
+				// rows fail, together, from the same fact — which is the pairing #66
+				// asked for.
+				add("auth", false, "credentials from "+source+", and the BORIS gateway rejected them")
+				add("remote", false, messageOrOK(syncErr))
+			default:
+				// Everything else: success, a connection that never arrived, a 5xx, an
+				// empty catalog refusal. `auth` claims only what it can support —
+				// credentials were retrieved — and hands the verdict to the row that
+				// earned it.
+				//
+				// Deliberately not "and signed something". This arm is also where a
+				// failure that never reached the signer lands: newMCPClient returns a
+				// plain error when no region can be inferred, and writeCache returns a
+				// local disk error, both of which are reported here as a failing
+				// `remote` row over a passing `auth` one. That is narrower than #66's
+				// complaint — the row no longer claims the credentials are valid — but
+				// it is the same shape, and it is the residue this design accepts
+				// rather than a property it establishes.
+				//
+				// "the remote row", not "the row below". Nothing pins the order of
+				// `checks`, so prose must not be the thing that depends on it.
+				add("auth", true, "credentials retrieved from "+source+"; the remote row is what tests them")
 				add("remote", syncErr == nil, messageOrOK(syncErr))
-				if syncErr == nil {
-					add("tools", true, fmt.Sprintf("%d tools synced", len(synced.Tools)))
-					disk, diskErr = synced, nil
-				}
+			}
+			if syncErr == nil {
+				add("tools", true, fmt.Sprintf("%d tools synced", len(synced.Tools)))
+				// Both halves are load-bearing. Without the reassignment the `cache` row
+				// below reports the state this run started in, a machine that just
+				// rebuilt a missing catalog exits 1 having fixed its own complaint, and
+				// refreshInstructions rewrites every agent instruction file from the
+				// stale catalog.
+				disk, diskErr = synced, nil
 			}
 		}
 		// Reported last, and from the state this run ends in rather than the one it
@@ -1254,6 +1313,21 @@ func shouldReadPayloadFromStdin(r io.Reader) bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice == 0
+}
+
+// catalogFailure is the exit code for a catalog that could not be obtained.
+//
+// `list` and `describe` used to report every such failure as exitSync /
+// sync_failed, including a gateway rejection — so an agent whose credentials
+// had been refused was told the sync had failed, and the three other commands
+// that can meet the same 401 said auth_failure. The name now comes from the
+// error like everywhere else; only the code needs deciding here, because a
+// catalog failure that is not about credentials is still a sync failure.
+func catalogFailure(err error) int {
+	if isCredentialFailure(err) {
+		return exitAuth
+	}
+	return exitSync
 }
 
 func messageOrOK(err error) string {
