@@ -469,7 +469,8 @@ Called as a CLI, the same two tools write the drawing to
 path. The filename is stable so a viewer left open on it follows along.
 
 Either way the picture is a decoration: if drawing it fails the tool still
-answers, and `BMCP_RENDER=off` stops asking for one.
+answers, and `BMCP_RENDER` turns it off — `off`, `false`, `0` or `no`, the
+same spellings every other switch here accepts.
 
 ## Use
 

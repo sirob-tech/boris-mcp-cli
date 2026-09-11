@@ -25,14 +25,23 @@ func TestWantsPictureOnlyForTheFinders(t *testing.T) {
 	}
 }
 
-func TestBMCPRenderOffSuppressesTheRequest(t *testing.T) {
-	t.Setenv("BMCP_RENDER", "off")
-	if wantsPicture("tools___search_infrastructure_by_description") {
-		t.Fatal("BMCP_RENDER=off must leave the request byte-identical")
+func TestBMCPRenderAcceptsEverySpellingTheRestOfTheCLIDoes(t *testing.T) {
+	// This was the one switch that matched "off" alone, so an operator turning
+	// it off the way BMCP_NON_INTERACTIVE is turned off got pictures anyway,
+	// silently.
+	finder := "tools___search_infrastructure_by_description"
+
+	for _, value := range []string{"off", "OFF", " off ", "false", "0", "no", "NO"} {
+		t.Setenv("BMCP_RENDER", value)
+		if wantsPicture(finder) {
+			t.Errorf("BMCP_RENDER=%q must disable rendering", value)
+		}
 	}
-	t.Setenv("BMCP_RENDER", "OFF")
-	if wantsPicture("tools___search_infrastructure_relationships") {
-		t.Fatal("BMCP_RENDER must be matched case-insensitively")
+	for _, value := range []string{"", "on", "true", "1", "yes", "nonsense"} {
+		t.Setenv("BMCP_RENDER", value)
+		if !wantsPicture(finder) {
+			t.Errorf("BMCP_RENDER=%q must leave rendering on", value)
+		}
 	}
 }
 
