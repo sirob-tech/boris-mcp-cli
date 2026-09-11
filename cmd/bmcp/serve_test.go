@@ -151,13 +151,38 @@ func resultOf(t *testing.T, reply map[string]any) map[string]any {
 
 // assertNoMarkup checks the bytes the server actually wrote, in both the plain
 // and the JSON-escaped spelling.
+// assertNoMarkup checks the bytes a model would see: everything the server
+// wrote except the result's _meta, which a host hands to the widget and keeps
+// out of the model's request.
 func assertNoMarkup(t *testing.T, what, line string) {
 	t.Helper()
+	var reply map[string]any
+	if err := json.Unmarshal([]byte(line), &reply); err == nil {
+		if result, ok := reply["result"].(map[string]any); ok {
+			delete(result, "_meta")
+		}
+		encoded, err := json.Marshal(reply)
+		if err != nil {
+			t.Fatalf("%s: could not re-encode the reply: %v", what, err)
+		}
+		line = string(encoded)
+	}
 	for _, needle := range []string{renderField, "<svg", `u003csvg`} {
 		if strings.Contains(line, needle) {
 			t.Fatalf("%s: %q reached the model:\n%s", what, needle, line)
 		}
 	}
+}
+
+// pictureOf returns the markup a reply carries on the app-only channel.
+func pictureOf(t *testing.T, reply map[string]any) string {
+	t.Helper()
+	meta, ok := resultOf(t, reply)["_meta"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	svg, _ := meta[pictureField].(string)
+	return svg
 }
 
 func callFrame(id int, name, args string) string {
@@ -201,33 +226,40 @@ func TestServeMarksOnlyTheFindersWithTheWidget(t *testing.T) {
 	if widget[plainTool] {
 		t.Error("a tool that draws no picture must not mount the widget")
 	}
-	if visibility[pictureToolName] != `["app"]` {
-		t.Errorf("picture tool visibility = %s, want [\"app\"]", visibility[pictureToolName])
+	if len(visibility) != 0 {
+		t.Errorf("no tool declares app-only visibility any more: %v", visibility)
 	}
 }
 
 func TestServeOffersNoPictureWithoutMCPApps(t *testing.T) {
-	doer := &callRecorder{fakeMCP: &fakeMCP{tools: finderCatalog()}}
+	doer := &callRecorder{fakeMCP: &fakeMCP{
+		tools: finderCatalog(),
+		callResult: upstreamAnswer(map[string]any{
+			"status": "success",
+			"_svg":   "<svg>the picture</svg>",
+		}),
+	}}
 	serveConfiguredHome(t, doer)
-	// A client that never advertised the extension cannot mount a widget, so
-	// the tool would only be a way for a model to fetch the markup itself.
+	// A client that never advertised the extension can mount no widget, so
+	// nothing is there to receive a picture and none is asked for or attached.
 	lines := serveLines(t, doer, initPlainRPC,
 		`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`,
-		callFrame(2, pictureToolName, "{}"),
+		callFrame(2, finderTool, `{"query":"x"}`),
 	)
-	if strings.Contains(lines[1], pictureToolName) {
-		t.Errorf("the picture tool must not be advertised:\n%s", lines[1])
-	}
 	if strings.Contains(lines[1], widgetURI) {
 		t.Errorf("the widget must not be advertised:\n%s", lines[1])
+	}
+	if doer.lastArgs[renderMarker] == true {
+		t.Errorf("no picture may be asked for on such a client: %v", doer.lastArgs)
 	}
 	var reply map[string]any
 	if err := json.Unmarshal([]byte(lines[2]), &reply); err != nil {
 		t.Fatal(err)
 	}
-	if _, bad := reply["error"]; !bad {
-		t.Errorf("calling the picture tool must fail on such a client: %s", lines[2])
+	if _, ok := reply["result"].(map[string]any)["_meta"]; ok {
+		t.Errorf("a picture was attached with no widget to receive it: %s", lines[2])
 	}
+	assertNoMarkup(t, "plain client", lines[2])
 }
 
 func TestServeDoesNotListTheWidgetResource(t *testing.T) {
@@ -250,11 +282,10 @@ func TestServeKeepsTheMarkupOutOfTheToolResult(t *testing.T) {
 	}}
 	replies, lines := serveFrames(t, doer,
 		callFrame(1, finderTool, `{"query":"the shared vpc"}`),
-		callFrame(2, pictureToolName, "{}"),
-		`{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"`+widgetURI+`"}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"`+widgetURI+`"}}`,
 	)
-	if len(replies) != 3 {
-		t.Fatalf("expected 3 replies, got %d", len(replies))
+	if len(replies) != 2 {
+		t.Fatalf("expected 2 replies, got %d", len(replies))
 	}
 
 	assertNoMarkup(t, "finder answer", lines[0])
@@ -268,16 +299,12 @@ func TestServeKeepsTheMarkupOutOfTheToolResult(t *testing.T) {
 		t.Errorf("declared arguments must survive: %v", doer.lastArgs)
 	}
 
-	meta, ok := resultOf(t, replies[1])["_meta"].(map[string]any)
-	if !ok {
-		t.Fatalf("the picture tool returned no _meta: %v", replies[1])
-	}
-	svg, _ := meta["svg"].(string)
-	if !strings.Contains(svg, "the picture") {
-		t.Errorf("picture tool returned %q", svg)
+	// The picture belongs to the call that drew it, and rides that call's reply.
+	if svg := pictureOf(t, replies[0]); !strings.Contains(svg, "the picture") {
+		t.Errorf("the call carried no picture of its own: %q", svg)
 	}
 
-	contents, _ := resultOf(t, replies[2])["contents"].([]any)
+	contents, _ := resultOf(t, replies[1])["contents"].([]any)
 	if len(contents) != 1 {
 		t.Fatalf("expected one resource content, got %v", contents)
 	}
@@ -285,8 +312,10 @@ func TestServeKeepsTheMarkupOutOfTheToolResult(t *testing.T) {
 	if content["mimeType"] != widgetMIME {
 		t.Errorf("resource mimeType = %v", content["mimeType"])
 	}
-	if !strings.Contains(content["text"].(string), "the picture") {
-		t.Error("the widget must carry the picture the resource was read for")
+	// The read lands before the call it was mounted for, so anything drawn into
+	// the shell could only be the previous call's.
+	if strings.Contains(content["text"].(string), "the picture") {
+		t.Error("the widget shell must carry no drawing")
 	}
 }
 
@@ -494,13 +523,25 @@ func TestFitWithinPanelReturnsMarkupItCannotRead(t *testing.T) {
 	}
 }
 
-func TestWidgetHTMLSaysSoWhenThereIsNoPictureYet(t *testing.T) {
-	out := widgetHTML("")
+func TestWidgetShellCarriesNoDrawingAndWaitsForItsOwnCall(t *testing.T) {
+	out := widgetHTML()
+	// The shell is read before the call it belongs to has run, so a drawing in
+	// it could only be the previous call's.
 	if strings.Contains(out, "<svg") {
-		t.Errorf("no picture should mean no drawing: %s", out)
+		t.Errorf("the shell must carry no drawing: %s", out)
 	}
-	if !strings.Contains(out, "No graph has been drawn yet") {
-		t.Errorf("the widget must say why it is empty: %s", out)
+	if !strings.Contains(out, "ui/notifications/tool-result") {
+		t.Errorf("the shell must wait for its own call's result: %s", out)
+	}
+	// Both ends of the wait are spelled out, so neither leaves a widget blank.
+	for _, said := range []string{"Drawing the neighbourhood", "No graph for this answer"} {
+		if !strings.Contains(out, said) {
+			t.Errorf("the shell never says %q: %s", said, out)
+		}
+	}
+	// The field the picture arrives under has to match what serve attaches.
+	if !strings.Contains(out, `_meta["`+pictureField+`"]`) {
+		t.Errorf("the shell reads a different _meta field: %s", out)
 	}
 }
 
