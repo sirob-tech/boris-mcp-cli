@@ -2763,8 +2763,12 @@ func TestToolCallNamesAGatewayRejectionAsAnAuthFailure(t *testing.T) {
 		now: time.Now, credentials: staticCreds(),
 		httpClient: &fakeMCP{tools: fresh, statusByMethod: map[string]int{"tools/call": http.StatusUnauthorized}},
 	}
-	if code := a.run([]string{"--format", "json", "tools___search_aws"}); code == 0 {
-		t.Fatalf("a rejected tool call should not exit 0, stdout:\n%s", stdout.String())
+	// exitAuth, not exitSync. The error name and the exit code are derived from
+	// one predicate now, so a document saying auth_failure cannot exit with the
+	// code for a sync problem — a caller branching on either field lands in the
+	// same place.
+	if code := a.run([]string{"--format", "json", "tools___search_aws"}); code != exitAuth {
+		t.Fatalf("a rejected tool call exited %d, want %d, stdout:\n%s", code, exitAuth, stdout.String())
 	}
 	var doc struct {
 		Error   string `json:"error"`
@@ -2778,6 +2782,89 @@ func TestToolCallNamesAGatewayRejectionAsAnAuthFailure(t *testing.T) {
 	}
 	if !strings.Contains(doc.Message, "rejected the signed request") {
 		t.Fatalf("message %q should explain the rejection", doc.Message)
+	}
+}
+
+// A gateway that rejects the fire-and-forget notification, then serves the rest
+// of the handshake normally, must not produce a wholly successful sync.
+//
+// `initialize` sends notifications/initialized and discards its error, which is
+// right for every failure except this one: a 401 there is a rejection this
+// client has already been handed, and swallowing it lets tools/list succeed on
+// top of it — doctor reporting `auth ok`, `remote ok`, `tools ok`, exit 0, over
+// a server that refused these credentials a moment earlier.
+func TestARejectedNotificationFailsTheSync(t *testing.T) {
+	isolateAWSEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	fresh := []tool{{Name: "tools___search_aws", Description: "Search."}}
+	setupInstallCatalog(t, home, fresh)
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, credentials: staticCreds(),
+		httpClient: &fakeMCP{
+			tools:          fresh,
+			statusByMethod: map[string]int{"notifications/initialized": http.StatusUnauthorized},
+		},
+	}
+	if code := a.run([]string{"doctor", "--deep"}); code != exitGeneric {
+		t.Fatalf("doctor exit %d, want %d, stdout:\n%s", code, exitGeneric, stdout.String())
+	}
+	rows := doctorRows(t, stdout.String())
+	if rows["auth"] != "fail" || rows["remote"] != "fail" {
+		t.Fatalf("auth=%q remote=%q, want both fail, in:\n%s", rows["auth"], rows["remote"], stdout.String())
+	}
+	if _, ok := rows["tools"]; ok {
+		t.Fatalf("a rejected handshake must not report a synced catalog, got:\n%s", stdout.String())
+	}
+}
+
+// Every command that can meet a 401 names it the same way. `list` and
+// `describe` used to file one under sync_failed with exitSync, so an agent whose
+// credentials had been refused was told the catalog sync had failed — and the
+// remedy for those two is not the same.
+func TestEveryCatalogCommandNamesARejectionTheSameWay(t *testing.T) {
+	fresh := []tool{{Name: "tools___search_aws", Description: "Search."}}
+	for _, args := range [][]string{
+		{"--format", "json", "list"},
+		{"--format", "json", "describe", "tools___search_aws"},
+		{"--format", "json", "sync"},
+	} {
+		t.Run(args[2], func(t *testing.T) {
+			isolateAWSEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Chdir(t.TempDir())
+			borisHome := setupInstallCatalog(t, home, fresh)
+			// No catalog at all, not merely a stale one. cacheForCatalog downgrades a
+			// failed sync to a warning and serves whatever is on disk when there is
+			// something to serve, so a stale cache would make these commands exit 0
+			// with a warning — the pre-existing divergence from doctor. A missing
+			// catalog is the case where the rejection is the answer.
+			if err := os.Remove(filepath.Join(borisHome, "tools.json")); err != nil {
+				t.Fatalf("remove cache: %v", err)
+			}
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+				now: time.Now, credentials: staticCreds(),
+				httpClient: &fakeMCP{tools: fresh, statusByMethod: map[string]int{"initialize": http.StatusUnauthorized}},
+			}
+			if code := a.run(args); code != exitAuth {
+				t.Fatalf("%v exited %d, want %d, stderr: %s", args, code, exitAuth, stderr.String())
+			}
+			var doc struct {
+				Error string `json:"error"`
+			}
+			if err := json.Unmarshal(stderr.Bytes(), &doc); err != nil {
+				t.Fatalf("failure document is not JSON (%v): %s", err, stderr.String())
+			}
+			if doc.Error != "auth_failure" {
+				t.Fatalf("error name %q, want auth_failure, in: %s", doc.Error, stderr.String())
+			}
+		})
 	}
 }
 

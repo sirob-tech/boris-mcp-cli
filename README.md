@@ -280,6 +280,15 @@ when the environment carries `AWS_WEB_IDENTITY_TOKEN_FILE`, because handing the
 SDK a profile steps over its whole environment tier and would authenticate an
 IRSA pod as the profile instead of as its own role.
 
+One caveat, because it decides an identity: nothing binds `AWS_CREDENTIAL_EXPIRATION`
+to the keys beside it. A shell where the keys were refreshed but that variable
+was left behind, or a CI step that replaces the credential variables without
+replacing it, will have working credentials passed over in favour of the
+profile — a different account, quietly. Every message `bmcp` prints in that case
+says so, naming the expiry it acted on, and `--profile <name>` overrides the
+choice for one call. If a wrapper leaves a stale stamp behind, unset the
+variable or drop `aws_profile` from `config.toml`.
+
 Every `bmcp doctor` reports a `credentials` row naming the source a call would
 use, and an authentication failure names the one it tried — so a failure never
 sends you to repair a profile the call never consulted. That row ends in
@@ -541,7 +550,11 @@ Under `--format json` or `--format ndjson`, three rules hold for every command:
 
   Read `ok` to tell success from failure on a merged stream. `exit_code`
   repeats bmcp's own exit status, which is worth reading when a pipeline has
-  replaced it with its own. The document is always a **single line**, in both
+  replaced it with its own. `error` and `exit_code` always agree about the same
+  cause: credentials that never produced a signed request and a request the
+  BORIS gateway refused both report `auth_failure` with exit 3, on every command
+  that can meet them — `sync`, `list`, `describe`, `serve` and a tool call
+  alike. The document is always a **single line**, in both
   machine formats — the one place the output does not follow `--format` — so
   `tail -1` and `read -r line` keep working on it.
 

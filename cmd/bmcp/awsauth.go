@@ -337,6 +337,25 @@ func profileOrigin(source profileSource) string {
 	return " from " + string(source)
 }
 
+// ssoLoginBudget is the time an interactive device flow needs to be worth
+// starting. Not a measurement of how long a login takes — it is the line below
+// which starting one means arranging for it to be killed half-finished, which
+// is worse than declining and printing the command the operator can run
+// themselves.
+const ssoLoginBudget = 3 * time.Minute
+
+// deviceFlowFits reports whether the context leaves room for an interactive
+// login to complete.
+//
+// time.Until, deliberately, rather than the injectable a.now: the clock that
+// decides whether the subprocess is killed is the runtime's, so a test clock
+// that disagreed with it would be measuring the wrong thing. An unbounded
+// context fits by definition, though no production path supplies one.
+func deviceFlowFits(ctx context.Context) bool {
+	deadline, bounded := ctx.Deadline()
+	return !bounded || time.Until(deadline) >= ssoLoginBudget
+}
+
 func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Credentials, string, error) {
 	// The SDK builds its default logger from os.Stderr when the config loads and
 	// keeps that writer (config's resolveDefaultAWSConfig, smithy logging). Two
@@ -393,21 +412,31 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 	// which is the one thing a machine format guarantees will not happen. Refusing
 	// here falls through to the actionable "run aws sso login" error below.
 	//
-	// A bounded context is the third refusal, and the newest. An SSO device flow
-	// is a human walking to a browser, and exec.CommandContext kills the
-	// subprocess the moment the deadline lands — so under a budget the login does
-	// not merely risk being slow, it is arranged to be destroyed part-way: the
-	// operator approves in the browser, the token is never written, and bmcp
-	// reports `signal: killed` for a login that from the outside succeeded. That
-	// is already what `bmcp sync` does today, whose credential load runs inside
-	// the same SyncTimeout, and doctor joins it once doctor stops resolving
-	// credentials outside the sync. Refusing is not a capability lost: the silent
-	// mint from ~/.aws/sso/cache, which is the heal that matters and needs no
-	// browser, happens inside retrieveCredentials above and is untouched. What is
-	// lost is a login that could not have completed anyway, replaced by the
-	// `aws sso login --profile X` remedy the branch below already prints.
-	_, bounded := ctx.Deadline()
-	if usesSSO && !bounded && !cfg.NonInteractive && !a.machine && a.isInteractive() {
+	// Too little time left is the third refusal, and the newest. An SSO device
+	// flow is a human reading a code, switching to a browser, authenticating and
+	// approving, and exec.CommandContext kills the subprocess the moment the
+	// deadline lands — so started under a budget it cannot finish in, the login
+	// is arranged to be destroyed part-way: the operator approves in the browser,
+	// the token is never written, and bmcp reports `signal: killed` for a login
+	// that from the outside succeeded.
+	//
+	// The test is how much budget is left, not whether there is one. Every
+	// production path now carries a deadline — awsCredentials is reached only
+	// through newMCPClient, and both of its callers wrap the context — so asking
+	// merely whether one exists refuses every login bmcp can ever be asked to
+	// make, including the ones with ten minutes in hand. That is a capability
+	// deleted by accident rather than the narrow protection intended here.
+	//
+	// So the two budgets separate, which is what they were always meant to do: a
+	// tool call's CallTimeout is ten minutes and comfortably fits a device flow,
+	// while SyncTimeout is sixty seconds and does not. `bmcp sync` and
+	// `bmcp doctor` therefore stop asking — and for doctor that is a second
+	// endorsement of the audited failures in cmdDoctor's own docstring, where an
+	// expired SSO session met a sandbox that could not reach device
+	// authorization and a diagnostic command hung on work it had no business
+	// doing. The silent mint from ~/.aws/sso/cache needs no browser and is
+	// untouched on every path.
+	if usesSSO && deviceFlowFits(ctx) && !cfg.NonInteractive && !a.machine && a.isInteractive() {
 		fmt.Fprintf(a.prose(), "AWS SSO credentials for profile %s are expired or missing. Running aws sso login --profile %s\n", profile, profile)
 		cmd := exec.CommandContext(ctx, "aws", "sso", "login", "--profile", profile)
 		// The pinned descriptor, not os.Stderr: a retrieval abandoned earlier in

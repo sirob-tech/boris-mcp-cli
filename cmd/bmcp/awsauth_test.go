@@ -497,45 +497,74 @@ func TestExpiredEnvironmentCredentialsYieldToTheConfiguredProfile(t *testing.T) 
 	})
 }
 
-// A bounded context must not start an `aws sso login` device flow.
+// The device-flow budget, from both sides.
 //
-// exec.CommandContext kills the subprocess when the deadline lands, so under a
-// budget the flow is arranged to be destroyed part-way: the operator approves in
-// the browser and the token is never written. Nothing else in the suite pins
-// this — the one test that reaches the login branch had to be given an unbounded
-// context to keep reaching it, so a reverted gate would go unnoticed there.
+// exec.CommandContext kills the login subprocess when the deadline lands, so a
+// flow started under a budget it cannot finish in is arranged to be destroyed
+// part-way: the operator approves in the browser and the token is never
+// written. But every production path carries *some* deadline — awsCredentials
+// is reached only through newMCPClient, and both callers wrap the context — so
+// a gate that asked merely whether a deadline existed would refuse every login
+// bmcp could ever make, including a tool call's ten-minute one. Both halves are
+// pinned here because each without the other is a bug that ships.
 //
 // The fake `aws` on PATH is the observation: it exists to record that it ran.
-func TestABoundedContextDoesNotStartADeviceFlow(t *testing.T) {
-	isolateAWSEnv(t)
-	binDir := t.TempDir()
-	marker := filepath.Join(t.TempDir(), "aws-was-run")
-	script := "#!/bin/sh\ntouch '" + marker + "'\nexit 1\n"
-	if err := os.WriteFile(filepath.Join(binDir, "aws"), []byte(script), 0o700); err != nil {
-		t.Fatalf("write fake aws: %v", err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+func TestADeviceFlowStartsOnlyWhenItCouldFinish(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		budget    time.Duration
+		wantLogin bool
+		// wantMessage separates the two outcomes by what the operator is told, not
+		// only by whether the subprocess ran: a refusal has to hand over the command
+		// to run by hand, and an attempt has to report that the login itself failed
+		// rather than quietly reporting only the credential error underneath it.
+		wantMessage string
+	}{
+		// SyncTimeout's sixty seconds — what `bmcp sync` and `bmcp doctor` carry.
+		{name: "a sync budget is too short", budget: 60 * time.Second, wantMessage: "aws sso login --profile sso-only"},
+		{name: "just under the budget", budget: ssoLoginBudget - time.Second, wantMessage: "aws sso login --profile sso-only"},
+		// CallTimeout's ten minutes — what `bmcp <tool>` carries, and ample.
+		{name: "a call budget is ample", budget: 10 * time.Minute, wantLogin: true, wantMessage: "aws sso login failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateAWSEnv(t)
+			binDir := t.TempDir()
+			marker := filepath.Join(t.TempDir(), "aws-was-run")
+			script := "#!/bin/sh\ntouch '" + marker + "'\nexit 1\n"
+			if err := os.WriteFile(filepath.Join(binDir, "aws"), []byte(script), 0o700); err != nil {
+				t.Fatalf("write fake aws: %v", err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	a := authTestApp()
-	// Everything the login branch needs except an unbounded context, so the
-	// deadline is the only thing standing between this run and a device flow.
-	a.machine = false
-	a.interactive = func() bool { return true }
-	_, _, err := a.awsCredentials(authTestContext(t), effectiveConfig{
-		Profile:       "sso-only",
-		ProfileSource: profileSourceFile,
-		Region:        "us-east-1",
-	})
-	if err == nil {
-		t.Fatal("an sso-only profile should not have resolved in a test")
-	}
-	if _, statErr := os.Stat(marker); statErr == nil {
-		t.Fatalf("aws sso login ran under a deadline; error was: %v", err)
-	}
-	// And the remedy still reaches the operator, which is what makes the refusal
-	// a redirection rather than a dead end.
-	if !strings.Contains(err.Error(), "aws sso login --profile sso-only") {
-		t.Fatalf("message %q should still carry the login remedy", err.Error())
+			a := authTestApp()
+			// Everything the login branch needs except the budget, so the remaining
+			// time is the only thing that decides this.
+			a.machine = false
+			a.interactive = func() bool { return true }
+			ctx, cancel := context.WithTimeout(context.Background(), tc.budget)
+			defer cancel()
+			_, _, err := a.awsCredentials(ctx, effectiveConfig{
+				Profile:       "sso-only",
+				ProfileSource: profileSourceFile,
+				Region:        "us-east-1",
+			})
+			if err == nil {
+				t.Fatal("an sso-only profile should not have resolved in a test")
+			}
+			_, statErr := os.Stat(marker)
+			if ran := statErr == nil; ran != tc.wantLogin {
+				t.Fatalf("aws sso login ran=%v, want %v, with %v of budget; error was: %v",
+					ran, tc.wantLogin, tc.budget, err)
+			}
+			if !strings.Contains(err.Error(), tc.wantMessage) {
+				t.Fatalf("message %q should contain %q", err.Error(), tc.wantMessage)
+			}
+			// Either way the cause underneath survives, so a failure no login could
+			// have fixed is never replaced by advice about logging in.
+			if !strings.Contains(err.Error(), "AWS profile sso-only from aws_profile in config.toml") {
+				t.Fatalf("message %q should still name the credential source", err.Error())
+			}
+		})
 	}
 }
 
@@ -2457,14 +2486,15 @@ func TestSSOLoginAfterAnAbandonedRetrievalStillReachesTheOperator(t *testing.T) 
 		// Now an SSO profile, whose retrieval cannot succeed here, so the login
 		// branch runs. Its subprocess must reach fd 2, not the sink.
 		//
-		// context.Background(), not authTestContext: awsCredentials declines to
-		// shell out to a device flow under a deadline, because the flow is a human
-		// walking to a browser and exec.CommandContext would kill it part-way. A
-		// bounded context here would skip the branch this case exists to observe.
-		// Safe without the helper's deadline because isolateAWSEnv above disables
-		// IMDS and clears the container variables, so nothing in this resolution
-		// has a link-local endpoint left to block on.
-		_, _, err := a.awsCredentials(context.Background(), effectiveConfig{
+		// A generous deadline rather than authTestContext's ten seconds:
+		// awsCredentials declines to start a device flow that cannot finish inside
+		// the budget left, and ten seconds cannot. This mirrors a real `bmcp <tool>`
+		// call, whose CallTimeout is ten minutes, so the branch is reached the same
+		// way production reaches it. Still bounded, so a resolution that went to a
+		// link-local endpoint would not hang the suite indefinitely.
+		loginCtx, cancelLogin := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancelLogin()
+		_, _, err := a.awsCredentials(loginCtx, effectiveConfig{
 			Profile:       "sso-only",
 			ProfileSource: profileSourceFile,
 			Region:        "us-east-1",

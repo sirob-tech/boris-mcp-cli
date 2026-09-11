@@ -211,8 +211,17 @@ func isGatewayAuthRejection(err error) bool {
 	return errors.As(err, &status) && status.rejectedCredentials()
 }
 
+// isCredentialFailure is the union every caller means by "this failed on the
+// credentials": bmcp never produced a signed request, or the gateway refused
+// the one it did. The error name and the exit code are both derived from it, so
+// a machine document cannot say auth_failure while exiting with the code for
+// something else.
+func isCredentialFailure(err error) bool {
+	return isAuthErr(err) || isGatewayAuthRejection(err)
+}
+
 func errorName(err error) string {
-	if isAuthErr(err) || isGatewayAuthRejection(err) {
+	if isCredentialFailure(err) {
 		return "auth_failure"
 	}
 	if errors.Is(err, errUpstream) {
@@ -320,7 +329,19 @@ func (c *mcpClient) initialize(ctx context.Context) (serverInfo, error) {
 		Instructions string `json:"instructions"`
 	}
 	_ = json.Unmarshal(body, &result)
-	_, _ = c.rpc(ctx, jsonRPCRequest{JSONRPC: "2.0", Method: "notifications/initialized"}, false)
+	// A notification is fire-and-forget and its transport error is ignored — with
+	// one exception. A gateway that answers it with 401 has refused these
+	// credentials, and discarding that lets the handshake continue to tools/list:
+	// a server that then answered normally would produce a wholly successful sync
+	// on top of a rejection this client had already been handed, which is the
+	// contradiction doctor's classification exists to make unreachable.
+	//
+	// Only the credential rejection propagates. Every other notification failure
+	// stays ignored, because a server is free to answer a notification in ways
+	// this client has no business failing on.
+	if _, notifyErr := c.rpc(ctx, jsonRPCRequest{JSONRPC: "2.0", Method: "notifications/initialized"}, false); isGatewayAuthRejection(notifyErr) {
+		return serverInfo{}, notifyErr
+	}
 	return serverInfo{Name: result.ServerInfo.Name, ProtocolVersion: result.ProtocolVersion, Instructions: result.Instructions}, nil
 }
 

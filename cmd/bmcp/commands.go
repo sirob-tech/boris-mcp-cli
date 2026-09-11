@@ -465,7 +465,7 @@ func (a *app) cmdSyncWithRefresh(flags globalFlags, refreshInstructions, report 
 	cache, err := a.syncTools(context.Background(), cfg)
 	if err != nil {
 		code := exitSync
-		if isAuthErr(err) {
+		if isCredentialFailure(err) {
 			code = exitAuth
 		}
 		return a.fail(flags, code, errorName(err), err.Error())
@@ -549,7 +549,7 @@ func (a *app) cmdList(flags globalFlags, args []string) int {
 	}
 	cache, err := a.cacheForCatalog(flags, cfg, true)
 	if err != nil {
-		return a.fail(flags, exitSync, "sync_failed", err.Error())
+		return a.fail(flags, catalogFailure(err), errorName(err), err.Error())
 	}
 	stamp := ""
 	if !cache.LastSync.IsZero() {
@@ -611,7 +611,7 @@ func (a *app) cmdDescribe(flags globalFlags, args []string) int {
 	}
 	cache, err := a.cacheForCatalog(flags, cfg, true)
 	if err != nil {
-		return a.fail(flags, exitSync, "sync_failed", err.Error())
+		return a.fail(flags, catalogFailure(err), errorName(err), err.Error())
 	}
 	t, err := resolveTool(cache, args[0])
 	if err != nil {
@@ -710,7 +710,7 @@ func (a *app) runCall(flags globalFlags, name string, payload string, readStdin 
 	result, err := a.callTool(context.Background(), cfg, t.Name, input)
 	if err != nil {
 		code := exitSync
-		if isAuthErr(err) {
+		if isCredentialFailure(err) {
 			code = exitAuth
 		}
 		if errors.Is(err, errUpstream) {
@@ -792,7 +792,7 @@ func (a *app) cmdDynamic(flags globalFlags, name string, args []string) int {
 	}
 	cache, err := a.cacheForCatalog(flags, cfg, true)
 	if err != nil {
-		return a.fail(flags, exitSync, "sync_failed", err.Error())
+		return a.fail(flags, catalogFailure(err), errorName(err), err.Error())
 	}
 	t, err := resolveTool(cache, name)
 	if err != nil {
@@ -1313,6 +1313,21 @@ func shouldReadPayloadFromStdin(r io.Reader) bool {
 		return false
 	}
 	return info.Mode()&os.ModeCharDevice == 0
+}
+
+// catalogFailure is the exit code for a catalog that could not be obtained.
+//
+// `list` and `describe` used to report every such failure as exitSync /
+// sync_failed, including a gateway rejection — so an agent whose credentials
+// had been refused was told the sync had failed, and the three other commands
+// that can meet the same 401 said auth_failure. The name now comes from the
+// error like everywhere else; only the code needs deciding here, because a
+// catalog failure that is not about credentials is still a sync failure.
+func catalogFailure(err error) int {
+	if isCredentialFailure(err) {
+		return exitAuth
+	}
+	return exitSync
 }
 
 func messageOrOK(err error) string {
