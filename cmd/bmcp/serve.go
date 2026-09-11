@@ -8,13 +8,13 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 )
 
 // bmcp as an MCP server: it re-exports the remote catalog over stdio so an IDE
 // can call BORIS directly, and serves the rendered graph as an MCP Apps UI
-// resource so a person sees the picture inline. The markup reaches the widget
-// through the resource, never through a tool result, so no model carries it.
+// resource so a person sees the picture inline. The markup rides the result's
+// own _meta, which a host forwards to the widget and the CLI keeps out of the
+// model's request, so no model carries it.
 const (
 	widgetURI  = "ui://boris/graph.html"
 	widgetMIME = "text/html;profile=mcp-app"
@@ -22,11 +22,7 @@ const (
 	// one gets its own back: the methods below are common to every revision the
 	// client half of this binary speaks.
 	serveProtocolVersion = "2025-06-18"
-	// Called by the widget, never by a model. It is advertised only to a client
-	// that negotiated MCP Apps, because on a client without one the tool is not
-	// a widget channel at all — only a way for a model to fetch the markup.
-	pictureToolName = "graph_picture"
-	uiExtensionID   = "io.modelcontextprotocol/ui"
+	uiExtensionID        = "io.modelcontextprotocol/ui"
 )
 
 type serveRequest struct {
@@ -49,11 +45,6 @@ type server struct {
 	cfg   effectiveConfig
 	cache *toolCache
 
-	// picture holds the most recent render. It stays in memory rather than
-	// going to disk: the CLI's file is a stable path a person can watch, but a
-	// server handling concurrent calls would have them overwrite each other.
-	mu      sync.Mutex
-	picture string
 	// apps records whether the client negotiated MCP Apps at initialize. Nothing
 	// about the picture is offered without it, since no widget can mount to
 	// receive it.
@@ -208,14 +199,6 @@ func (s *server) tools() []serveTool {
 		}
 		out = append(out, entry)
 	}
-	if s.apps {
-		out = append(out, serveTool{
-			Name:        pictureToolName,
-			Description: "Return the most recent graph picture to the app that asked for it.",
-			InputSchema: objectSchema(nil),
-			Meta:        map[string]any{"ui": map[string]any{"visibility": []string{"app"}}},
-		})
-	}
 	return out
 }
 
@@ -234,12 +217,6 @@ func (s *server) callTool(raw json.RawMessage) (any, *rpcError) {
 	if err := json.Unmarshal(raw, &params); err != nil {
 		return nil, &rpcError{Code: -32602, Message: "invalid params: " + err.Error()}
 	}
-	if params.Name == pictureToolName {
-		if !s.apps {
-			return nil, &rpcError{Code: -32602, Message: "unknown tool: " + params.Name}
-		}
-		return s.servePicture(), nil
-	}
 
 	t, err := resolveTool(s.cache, params.Name)
 	if err != nil {
@@ -254,7 +231,8 @@ func (s *server) callTool(raw json.RawMessage) (any, *rpcError) {
 	}
 	// Asked for after Validate, which runs against the advertised schema and
 	// does not declare the marker.
-	if s.apps && wantsPicture(t.Name) {
+	drawing := s.apps && wantsPicture(t.Name)
+	if drawing {
 		input = withPictureRequest(input)
 	}
 	result, err := s.a.callTool(context.Background(), s.cfg, t.Name, input)
@@ -267,36 +245,21 @@ func (s *server) callTool(raw json.RawMessage) (any, *rpcError) {
 	// Stripped unconditionally, not only for the tools this build expects to
 	// render: the field is the gateway's to send, and the list here is a guess.
 	stripped, svg := stripPicture(result)
-	if svg != "" {
-		s.mu.Lock()
-		s.picture = svg
-		s.mu.Unlock()
-	}
 	if stripped == nil {
 		return toolFailure("the answer carried a graph picture that could not be separated from it"), nil
 	}
-	return map[string]any{
+	answer := map[string]any{
 		"content": []any{map[string]any{"type": "text", "text": string(stripped)}},
-	}, nil
-}
-
-func (s *server) servePicture() any {
-	s.mu.Lock()
-	svg := s.picture
-	s.mu.Unlock()
-	if svg == "" {
-		return map[string]any{
-			"content": []any{map[string]any{"type": "text", "text": "no picture has been drawn yet"}},
-		}
 	}
-	// Carried in _meta rather than structuredContent: hosts forward structured
-	// output to the model, and _meta is the field the app extension reserves for
-	// data meant only for the app. Scaled here too — the widget replaces its
-	// own markup with this, and unscaled it would paint at its intrinsic size.
-	return map[string]any{
-		"content": []any{map[string]any{"type": "text", "text": "picture delivered to the app"}},
-		"_meta":   map[string]any{"svg": fitWithinPanel(svg)},
+	// A host reads the ui:// resource before this call is dispatched, so a
+	// drawing inlined there is always the previous call's; the result's own
+	// _meta arrives with the call it belongs to and is kept out of the model's
+	// request. The result's _meta, never a content block's — that one does
+	// reach the model.
+	if drawing && svg != "" {
+		answer["_meta"] = map[string]any{pictureField: fitWithinPanel(svg)}
 	}
+	return answer, nil
 }
 
 func toolFailure(msg string) any {
@@ -314,13 +277,10 @@ func (s *server) readResource(raw json.RawMessage) (any, *rpcError) {
 	if !s.apps || (params.URI != "" && params.URI != widgetURI) {
 		return nil, &rpcError{Code: -32602, Message: "unknown resource: " + params.URI}
 	}
-	s.mu.Lock()
-	svg := s.picture
-	s.mu.Unlock()
 	return map[string]any{"contents": []any{map[string]any{
 		"uri":      widgetURI,
 		"mimeType": widgetMIME,
-		"text":     widgetHTML(svg),
+		"text":     widgetHTML(),
 		// csp and permissions belong on the resource; a host is told to ignore
 		// them on the tool.
 		"_meta": map[string]any{"ui": map[string]any{
