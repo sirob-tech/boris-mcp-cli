@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.9.1...v0.10.0) (2026-09-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* values on the machine-output contract changed, and no version number can carry that signal while bump-minor-pre-major holds. A gateway 401 now reports "error":"auth_failure" with exit 3 where it reported "failure" with exit 4; `bmcp list` and `bmcp describe` report auth_failure/3 for a credential rejection and failure/4 for other catalog failures, where both were sync_failed/4. In `bmcp doctor`, the `auth` row's message is no longer the literal `ok`, and the `credentials` row's message gains a `— found, not verified` suffix. Every checks[].ok boolean is unchanged, so a consumer reading the booleans rather than the prose needs no change.
+
+### Bug Fixes
+
+* keep a credential_process helper's stderr off a captured fd 2 ([#64](https://github.com/sirob-tech/boris-mcp-cli/issues/64)) ([0a16db8](https://github.com/sirob-tech/boris-mcp-cli/commit/0a16db886f5b4f7e486d5baf79da53244db41b6d))
+* stop doctor reporting healthy credentials the gateway is refusing ([#77](https://github.com/sirob-tech/boris-mcp-cli/issues/77)) ([acfb70d](https://github.com/sirob-tech/boris-mcp-cli/commit/acfb70d50ae1f417d0a777d181eaf9cf54a9f33f))
+
 ## [0.9.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.9.0...v0.9.1) (2026-09-11)
 
 
