@@ -250,7 +250,12 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 	if usesSSO && !cfg.NonInteractive && !a.machine && isInteractive() {
 		fmt.Fprintf(a.prose(), "AWS SSO credentials for profile %s are expired or missing. Running aws sso login --profile %s\n", profile, profile)
 		cmd := exec.CommandContext(ctx, "aws", "sso", "login", "--profile", profile)
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stderr, os.Stderr
+		// The pinned descriptor, not os.Stderr: a retrieval abandoned earlier in
+		// this run may have left the variable pointing at /dev/null on purpose, and
+		// this subprocess is not the one that sink exists to contain. Handing it the
+		// global destroyed the verification URL and user code, leaving bmcp blocked
+		// on a device flow with nothing on screen to answer.
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, a.subprocessStderr(), a.subprocessStderr()
 		if runErr := cmd.Run(); runErr != nil {
 			// Carrying the failure the login was trying to repair, because the branch
 			// is chosen from configuration now and fires for causes a login cannot
@@ -320,15 +325,33 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 // rejected: it would mean reimplementing source_profile and assume-role
 // chaining inside the credential path, which is where subtle breakage lives.
 //
-// The swap is safe here for two reasons. bmcp is synchronous — nothing under
-// cmd/bmcp starts a goroutine — so there is no other reader to race. And
-// a.stderr holds os.Stderr's *value* from startup, so bmcp's own output keeps
-// going to the original descriptor whatever this does to the variable.
+// Two things make the swap containable rather than merely brief. a.stderr and
+// a.realStderr hold os.Stderr's *value* from startup, so bmcp's own output and
+// every subprocess bmcp spawns itself keep reaching the original descriptor
+// whatever this does to the variable. And the only reader that races it is the
+// SDK's — bmcp starts no goroutines of its own — which is the whole subject of
+// the restore rule below: that reader outlives a cancelled call, so the variable
+// is not always safe to put back.
 //
 // It wraps Retrieve and nothing else on purpose: the `aws sso login` branch
 // above deliberately hands its subprocess os.Stderr, and that is a browser
 // prompt an operator needs to see.
 func (a *app) retrieveCredentials(ctx context.Context, cfg effectiveConfig, provider aws.CredentialsProvider) (aws.Credentials, error) {
+	// An earlier retrieval was abandoned with the sink still installed, and the
+	// goroutine that outlived it may still read os.Stderr to build its command.
+	// So the variable is left exactly as it is: no second sink, no restore. It
+	// already points at /dev/null, which is the containment this function exists
+	// for, so there is nothing to do but retrieve.
+	//
+	// Returning here also declines to re-run the policy, which would answer on a
+	// descriptor that is now /dev/null rather than on fd 2. That costs an operator
+	// at a terminal the MFA prompt for the rest of a run in which a retrieval was
+	// already abandoned — the conservative direction, and the same one the sink
+	// itself takes.
+	if a.stderrSunk {
+		a.helperStderrDiscarded = true
+		return provider.Retrieve(ctx)
+	}
 	// The MFA prompt the SDK's comment protects is worth keeping only where all
 	// three of these hold: someone is watching fd 2, bmcp has not promised to keep
 	// that stream free of prose, and this invocation has not declared that nothing
@@ -362,7 +385,11 @@ func (a *app) retrieveCredentials(ctx context.Context, cfg effectiveConfig, prov
 		return provider.Retrieve(ctx)
 	}
 	a.helperStderrDiscarded = true
-	restore := os.Stderr
+	// The pinned startup descriptor, not os.Stderr. Reading the global here meant
+	// that a second call after an abandoned one saved the *first* call's sink as
+	// the thing to restore, installed /dev/null permanently, and closed the
+	// descriptor the live retrieval was using rather than the stale one.
+	restore := a.subprocessStderr()
 	os.Stderr = sink
 	// Put back only when the retrieval actually finished — and left in place,
 	// still open, when it did not.
@@ -383,10 +410,13 @@ func (a *app) retrieveCredentials(ctx context.Context, cfg effectiveConfig, prov
 	// Closing the sink instead is no better: exec starts the child anyway, with
 	// fd 2 closed, so the first file the helper opens becomes its stderr.
 	//
-	// So the sink stays, and the fd is leaked on purpose. bmcp is a short-lived
-	// CLI that is now failing; a.stderr still holds the original descriptor from
-	// startup, so its own output is unaffected, and the `aws sso login` branch
-	// cannot be reached with a dead context anyway.
+	// So the sink stays, the fd is leaked on purpose, and stderrSunk records it.
+	// The latch is what the first version of this rule lacked: the run does not
+	// necessarily end here — a failed sync is downgraded to a warning and the run
+	// continues (see cacheForCatalog), resolving credentials again on a fresh
+	// context — and without the latch that second call reassigned os.Stderr
+	// underneath a goroutine still reading it, which could hand a helper a closed
+	// descriptor and made the write a data race besides.
 	//
 	// ctx.Err() == nil is the conservative side of the test: it can only be nil
 	// if Retrieve returned through the channel, which happens after the
@@ -396,6 +426,7 @@ func (a *app) retrieveCredentials(ctx context.Context, cfg effectiveConfig, prov
 	// re-checking on an SDK bump.
 	defer func() {
 		if ctx.Err() != nil {
+			a.stderrSunk = true
 			return
 		}
 		os.Stderr = restore
@@ -416,9 +447,16 @@ func (a *app) retrieveCredentials(ctx context.Context, cfg effectiveConfig, prov
 // credential_process profile reports it, an assume-role chain over one reports
 // it, and static keys, an sso_session profile and a legacy SSO profile do not.
 //
-// A provider that does not implement the interface answers yes. That is the
-// safe direction: unknown means "assume a subprocess", so a chain the SDK stops
-// describing fails closed rather than quietly running a helper uncontained.
+// A provider that does not implement the interface answers yes — but that arm
+// describes an unwrapped provider, which is not what the call site hands in.
+// LoadDefaultConfig always returns an *aws.CredentialsCache, which does
+// implement the interface and returns an empty slice when the provider *it*
+// wraps does not (aws/credential_cache.go). So an undescribed chain under the
+// cache reaches the loop with nothing to match and answers no. Fail-open, not
+// fail-closed, for the one shape the comment was written about. Left as it is
+// rather than quietly changed: every provider this SDK ships reports its
+// sources, so no measured chain answers differently, and making len == 0 mean
+// yes would start refusing on a future provider that legitimately reports none.
 //
 // Both process constants are tested although no measured shape reports one
 // without the other — dropping either arm changes no answer today. Cheap

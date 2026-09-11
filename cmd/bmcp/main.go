@@ -60,6 +60,20 @@ type app struct {
 	// device, and the branch it selects — keeping a credential_process helper's
 	// stderr visible — exists only for a terminal. See retrieveCredentials.
 	stderrTTY func() bool
+	// realStderr is os.Stderr's value from startup: the descriptor a child
+	// process would have inherited as fd 2 before anything reassigned the
+	// variable. retrieveCredentials points os.Stderr at /dev/null and, on a
+	// cancelled retrieval, deliberately leaves it there — so the variable is not
+	// a reliable answer to "what is fd 2" for the rest of the run. Everything
+	// that needs the real answer reads this instead: the terminal test, and every
+	// subprocess bmcp spawns itself.
+	realStderr *os.File
+	// stderrSunk latches when a retrieval was abandoned with the /dev/null sink
+	// still installed. An SDK goroutine outliving that call can still read
+	// os.Stderr to build its command, so from then on nothing may write the
+	// variable — not to install a second sink, and not to put the original back.
+	// See retrieveCredentials.
+	stderrSunk bool
 	// helperStderrDiscarded records that retrieveCredentials sent a
 	// credential_process helper's stderr to /dev/null, so a failure message can
 	// say so. Without it an operator reads an empty CI log as "the helper printed
@@ -97,7 +111,7 @@ type app struct {
 }
 
 func main() {
-	a := &app{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr, now: time.Now}
+	a := &app{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr, realStderr: os.Stderr, now: time.Now}
 	os.Exit(a.run(os.Args[1:]))
 }
 
@@ -159,20 +173,41 @@ func isInteractive() bool {
 	return info.Mode()&os.ModeCharDevice != 0
 }
 
+// subprocessStderr is the descriptor a child of bmcp should be given for fd 2:
+// the value os.Stderr held at startup, never whatever retrieveCredentials may
+// have left in the variable since. Handing a subprocess the live global is how a
+// sink installed for a *helper* ends up swallowing the output of an unrelated
+// command — `aws sso login`'s verification URL, for one.
+//
+// The fallback exists for tests, which build an app directly. Production always
+// pins it in main().
+func (a *app) subprocessStderr() *os.File {
+	if a.realStderr != nil {
+		return a.realStderr
+	}
+	return os.Stderr
+}
+
 func (a *app) stderrIsTerminal() bool {
 	if a.stderrTTY != nil {
 		return a.stderrTTY()
 	}
-	return stderrIsTerminal()
+	return stderrIsTerminal(a.subprocessStderr())
 }
 
 // stderrIsTerminal asks the question "is anything capturing what a subprocess
 // writes to fd 2" — a pipe, a file, a CI log or an agent transcript all answer
-// yes, and only a terminal answers no. It reads os.Stderr rather than a.stderr
-// because the fd, not bmcp's own writer, is what a child process inherits, so it
-// must be consulted before anything reassigns that variable.
-func stderrIsTerminal() bool {
-	info, err := os.Stderr.Stat()
+// yes. What answers no is any character device, which is a terminal in every
+// shape bmcp meets but is not the same question: /dev/null answers no too, and
+// so do /dev/console and /dev/kmsg, which do persist what is written. That
+// imprecision is why the policy in retrieveCredentials does not rest on this
+// alone.
+//
+// It takes the descriptor rather than reading os.Stderr so that a caller cannot
+// be handed the answer for a sink retrieveCredentials installed — see
+// subprocessStderr.
+func stderrIsTerminal(f *os.File) bool {
+	info, err := f.Stat()
 	if err != nil {
 		return false
 	}
