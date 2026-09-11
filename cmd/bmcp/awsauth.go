@@ -47,8 +47,9 @@ func (a *app) loadCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cre
 // takes once the environment carries no credentials of its own.
 //
 // One exception to the yielding, and it is the whole of #66's third symptom:
-// environment credentials that have provably expired are treated as absent, so
-// the configured profile wins after all. Without it those credentials are
+// environment credentials that have provably expired are treated as absent —
+// unless the environment also carries a web identity token, see below — so the
+// ambient profile wins after all. Without it those credentials are
 // inescapable — the SDK never reads AWS_CREDENTIAL_EXPIRATION, so it sees
 // static keys with CanExpire false, hands them to the signer, and the gateway
 // rejects every request. No profile in config.toml can help, because the dead
@@ -75,12 +76,39 @@ func (a *app) sharedProfileFor(cfg effectiveConfig) (profile, outrankedBy string
 		return cfg.Profile, "", time.Time{}
 	}
 	if source := envCredentialSource(); source != "" {
-		if expired := a.envCredentialsExpiredAt(); !expired.IsZero() {
+		// The demotion is withheld when the environment also carries a web identity
+		// token, and that exception is the difference between a recovery and a
+		// wrong identity. WithSharedConfigProfile does not remove the expired keys
+		// from the chain, it steps over the SDK's *entire* environment tier — the
+		// web identity arm included — so on an IRSA pod that also happens to carry
+		// stale static keys, demoting would authenticate as whatever profile
+		// config.toml names instead of as the pod's own role. That is a different
+		// account, silently, on a path whose whole purpose is to be less
+		// surprising.
+		//
+		// Withholding it leaves that population exactly where it is today: the SDK
+		// resolves the dead static keys, the request is rejected, and the operator
+		// gets the same 401 as before — no worse, and no new identity. Healing it
+		// properly would mean unsetting the keys out of the process environment,
+		// which is a far larger claim than this change is making.
+		if expired := a.envCredentialsExpiredAt(); !expired.IsZero() && !envCarriesWebIdentity() {
 			return cfg.Profile, "", expired
 		}
 		return "", source, time.Time{}
 	}
 	return cfg.Profile, "", time.Time{}
+}
+
+// envCarriesWebIdentity reports whether the environment names a web identity
+// token file — the one other credential source resolveCredentialChain places
+// above every profile, and therefore the one a demotion would step over.
+//
+// The token file alone, matching the SDK's own arm and envCredentialSource's
+// reasoning above it: a half-injected IRSA setup missing AWS_ROLE_ARN must fail
+// closed rather than quietly resolve as an ambient profile.
+func envCarriesWebIdentity() bool {
+	env, err := awsconfig.NewEnvConfig()
+	return err == nil && env.WebIdentityTokenFilePath != ""
 }
 
 // envCredentialsExpiredAt reports when the environment's static credentials

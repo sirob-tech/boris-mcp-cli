@@ -431,6 +431,22 @@ func TestExpiredEnvironmentCredentialsYieldToTheConfiguredProfile(t *testing.T) 
 			wantSource: "environment credentials (AWS_ACCESS_KEY_ID), which outrank AWS profile has-static from aws_profile in config.toml",
 		},
 		{
+			// Expired static keys alongside a web identity token: demoting would hand
+			// the SDK a profile, which steps over its whole environment tier and
+			// authenticates an IRSA pod as that profile instead of as its own role.
+			// A different account, silently — so the demotion is withheld and this
+			// population stays exactly where it was before #66.
+			name: "a web identity token is never stepped over",
+			env: func(t *testing.T) {
+				setEnvCredentials(t)
+				t.Setenv("AWS_CREDENTIAL_EXPIRATION", past)
+				t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", filepath.Join(t.TempDir(), "token"))
+				t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/Example")
+			},
+			cfg:        fileProfile,
+			wantSource: "environment credentials (AWS_ACCESS_KEY_ID), which outrank AWS profile has-static from aws_profile in config.toml",
+		},
+		{
 			// --profile already beat the environment, expired or not, so the expiry
 			// had no bearing on what resolved. Announcing it here would be a fresh
 			// instance of the dishonesty this change exists to remove.
@@ -479,6 +495,48 @@ func TestExpiredEnvironmentCredentialsYieldToTheConfiguredProfile(t *testing.T) 
 			t.Fatalf("resolved %q, want the profile's %q", creds.AccessKeyID, profileKey)
 		}
 	})
+}
+
+// A bounded context must not start an `aws sso login` device flow.
+//
+// exec.CommandContext kills the subprocess when the deadline lands, so under a
+// budget the flow is arranged to be destroyed part-way: the operator approves in
+// the browser and the token is never written. Nothing else in the suite pins
+// this — the one test that reaches the login branch had to be given an unbounded
+// context to keep reaching it, so a reverted gate would go unnoticed there.
+//
+// The fake `aws` on PATH is the observation: it exists to record that it ran.
+func TestABoundedContextDoesNotStartADeviceFlow(t *testing.T) {
+	isolateAWSEnv(t)
+	binDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "aws-was-run")
+	script := "#!/bin/sh\ntouch '" + marker + "'\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "aws"), []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake aws: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	a := authTestApp()
+	// Everything the login branch needs except an unbounded context, so the
+	// deadline is the only thing standing between this run and a device flow.
+	a.machine = false
+	a.interactive = func() bool { return true }
+	_, _, err := a.awsCredentials(authTestContext(t), effectiveConfig{
+		Profile:       "sso-only",
+		ProfileSource: profileSourceFile,
+		Region:        "us-east-1",
+	})
+	if err == nil {
+		t.Fatal("an sso-only profile should not have resolved in a test")
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatalf("aws sso login ran under a deadline; error was: %v", err)
+	}
+	// And the remedy still reaches the operator, which is what makes the refusal
+	// a redirection rather than a dead end.
+	if !strings.Contains(err.Error(), "aws sso login --profile sso-only") {
+		t.Fatalf("message %q should still carry the login remedy", err.Error())
+	}
 }
 
 // The expiry is read against the injected clock, not the wall clock, so the

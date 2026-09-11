@@ -192,15 +192,23 @@ type httpStatusError struct {
 // the operator's credentials would be a misdiagnosis.
 func (e *httpStatusError) Error() string {
 	msg := fmt.Sprintf("remote MCP HTTP %d: %s", e.status, e.body)
-	if e.status == http.StatusUnauthorized {
+	if e.rejectedCredentials() {
 		msg += " (the BORIS gateway rejected the signed request, so the credentials it was signed with are not valid for it)"
 	}
 	return msg
 }
 
+// rejectedCredentials is the single home for the status decision the comment
+// above argues. Error() and the doctor classifier both ask it, so a later
+// change of mind about which statuses count cannot move the prose hint and the
+// `auth` row apart.
+func (e *httpStatusError) rejectedCredentials() bool {
+	return e.status == http.StatusUnauthorized
+}
+
 func isGatewayAuthRejection(err error) bool {
 	var status *httpStatusError
-	return errors.As(err, &status) && status.status == http.StatusUnauthorized
+	return errors.As(err, &status) && status.rejectedCredentials()
 }
 
 func errorName(err error) string {
@@ -435,12 +443,26 @@ func (c *mcpClient) rpc(ctx context.Context, rpcReq jsonRPCRequest, expectRespon
 	if sid := resp.Header.Get("Mcp-Session-Id"); sid != "" {
 		c.sessionID = sid
 	}
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
+	respBody, readErr := io.ReadAll(resp.Body)
+	// Status before body error, and that order is the point. A 401 whose body
+	// arrives truncated — an overstated Content-Length, a connection closed
+	// mid-body — used to be reported as "unexpected EOF" with the status thrown
+	// away, so a rejection this client had already received was classified as an
+	// ordinary transport failure and doctor printed `auth ok` over it. That is
+	// the exact pairing this type exists to prevent. What the server said about
+	// the request outranks how completely it managed to say it.
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &httpStatusError{status: resp.StatusCode, body: strings.TrimSpace(string(respBody))}
+		body := strings.TrimSpace(string(respBody))
+		if readErr != nil {
+			// Named rather than swallowed: a truncated body is itself a symptom, and
+			// an operator comparing this against a clean 401 should be able to see
+			// that the two are not the same event.
+			body = strings.TrimSpace(body + " (body could not be read in full: " + readErr.Error() + ")")
+		}
+		return nil, &httpStatusError{status: resp.StatusCode, body: body}
+	}
+	if readErr != nil {
+		return nil, readErr
 	}
 	if !expectResponse {
 		return nil, nil

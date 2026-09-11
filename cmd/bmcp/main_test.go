@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -2608,8 +2609,9 @@ func TestDoctorClassifiesOneRemoteAttempt(t *testing.T) {
 			if rows["auth"] != tc.auth {
 				t.Fatalf("auth row %q, want %q, in:\n%s", rows["auth"], tc.auth, stdout.String())
 			}
-			if got, ok := rows["remote"]; got != tc.remote || (tc.remote == "") == ok {
-				t.Fatalf("remote row %q (present=%v), want %q, in:\n%s", got, ok, tc.remote, stdout.String())
+			got, present := rows["remote"]
+			if present != (tc.remote != "") || got != tc.remote {
+				t.Fatalf("remote row %q (present=%v), want %q, in:\n%s", got, present, tc.remote, stdout.String())
 			}
 			if _, ok := rows["tools"]; ok != tc.wantTools {
 				t.Fatalf("tools row present=%v, want %v, in:\n%s", ok, tc.wantTools, stdout.String())
@@ -2634,6 +2636,93 @@ func TestDoctorClassifiesOneRemoteAttempt(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The other half of "one attempt", which the row states above cannot see: doctor
+// must resolve credentials once per deep run, not twice.
+//
+// Before #66 it called loadCredentials for the `auth` row and then syncTools,
+// which resolves again — and loadCredentials caches nothing, so a profile backed
+// by a credential_process helper ran that helper twice per run, with whatever
+// prompt or hardware touch it involves. Asserted with a counter rather than
+// through the row output because both shapes print identical rows; the count is
+// the only externally visible difference.
+func TestDoctorResolvesCredentialsOncePerDeepRun(t *testing.T) {
+	isolateAWSEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	fresh := []tool{{Name: "tools___search_aws", Description: "Search."}}
+	setupInstallCatalog(t, home, fresh)
+	loads := 0
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: &fakeMCP{tools: fresh}, credentials: countingCreds(&loads),
+	}
+	if code := a.run([]string{"doctor", "--deep"}); code != 0 {
+		t.Fatalf("doctor exit %d, stdout:\n%s", code, stdout.String())
+	}
+	if loads != 1 {
+		t.Fatalf("doctor resolved credentials %d times, want exactly 1, stdout:\n%s", loads, stdout.String())
+	}
+}
+
+// countingCreds is staticCreds with a tally, so a test can assert how many times
+// a command resolved credentials rather than only that it succeeded.
+func countingCreds(loads *int) credentialsFunc {
+	inner := staticCreds()
+	return func(ctx context.Context, cfg effectiveConfig) (aws.Credentials, string, error) {
+		*loads++
+		return inner(ctx, cfg)
+	}
+}
+
+// A rejection this client already received must not be downgraded to a
+// transport failure because the server failed to finish sending its body.
+//
+// The gateway answers 401 with a JSON-RPC body; a connection dropped mid-body,
+// or an overstated Content-Length, makes io.ReadAll fail. Reading the body
+// before the status meant the 401 was discarded and doctor printed `auth ok`
+// over it — the precise pairing #66 exists to make unconstructible, reachable
+// again through a server that merely misbehaves while rejecting.
+func TestATruncatedRejectionKeepsItsStatus(t *testing.T) {
+	isolateAWSEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	fresh := []tool{{Name: "tools___search_aws", Description: "Search."}}
+	setupInstallCatalog(t, home, fresh)
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, httpClient: truncatingDoer{status: http.StatusUnauthorized}, credentials: staticCreds(),
+	}
+	if code := a.run([]string{"doctor", "--deep"}); code != exitGeneric {
+		t.Fatalf("doctor exit %d, want %d, stdout:\n%s", code, exitGeneric, stdout.String())
+	}
+	rows := doctorRows(t, stdout.String())
+	if rows["auth"] != "fail" || rows["remote"] != "fail" {
+		t.Fatalf("auth=%q remote=%q, want both fail, in:\n%s", rows["auth"], rows["remote"], stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "the BORIS gateway rejected them") {
+		t.Fatalf("the 401 was lost to the body read, got:\n%s", stdout.String())
+	}
+}
+
+// truncatingDoer answers with a status and a body that dies part-way through,
+// which is what an overstated Content-Length looks like to io.ReadAll.
+type truncatingDoer struct{ status int }
+
+func (d truncatingDoer) Do(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		_, _ = io.ReadAll(req.Body)
+	}
+	return &http.Response{
+		StatusCode: d.status,
+		Header:     http.Header{"Content-Type": {"application/json"}},
+		Body:       io.NopCloser(iotest.TimeoutReader(strings.NewReader(`{"jsonrpc":"2.0",`))),
+	}, nil
 }
 
 // The credentials row states what it found; it must not be read as a verdict on

@@ -930,8 +930,17 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 			default:
 				// Everything else: success, a connection that never arrived, a 5xx, an
 				// empty catalog refusal. `auth` claims only what it can support —
-				// credentials were retrieved and signed something — and hands the
-				// verdict to the row that earned it.
+				// credentials were retrieved — and hands the verdict to the row that
+				// earned it.
+				//
+				// Deliberately not "and signed something". This arm is also where a
+				// failure that never reached the signer lands: newMCPClient returns a
+				// plain error when no region can be inferred, and writeCache returns a
+				// local disk error, both of which are reported here as a failing
+				// `remote` row over a passing `auth` one. That is narrower than #66's
+				// complaint — the row no longer claims the credentials are valid — but
+				// it is the same shape, and it is the residue this design accepts
+				// rather than a property it establishes.
 				//
 				// "the remote row", not "the row below". Nothing pins the order of
 				// `checks`, so prose must not be the thing that depends on it.
