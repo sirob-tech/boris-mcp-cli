@@ -5,6 +5,7 @@
 
 ### Bug Fixes
 
+* draw the picture for the call that asked, not the one before it ([#74](https://github.com/sirob-tech/boris-mcp-cli/issues/74)) ([743e778](https://github.com/sirob-tech/boris-mcp-cli/commit/743e778a52ce44d75f8899547fdb5a98171f3548))
 * let BMCP_RENDER be turned off the way every other switch is ([#73](https://github.com/sirob-tech/boris-mcp-cli/issues/73)) ([c48f721](https://github.com/sirob-tech/boris-mcp-cli/commit/c48f7212284b5ea96df6e613c44157154c1a0fa5))
 * size the graph picture to the panel without resizing what is in it ([#72](https://github.com/sirob-tech/boris-mcp-cli/issues/72)) ([4352789](https://github.com/sirob-tech/boris-mcp-cli/commit/43527893549bfc1415af49c998991895ea0696f2))
 
