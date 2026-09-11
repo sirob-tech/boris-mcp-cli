@@ -8,6 +8,8 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/term"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 )
 
@@ -111,7 +113,7 @@ type app struct {
 }
 
 func main() {
-	a := &app{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr, realStderr: os.Stderr, now: time.Now}
+	a := &app{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr, now: time.Now}
 	os.Exit(a.run(os.Args[1:]))
 }
 
@@ -195,21 +197,26 @@ func (a *app) stderrIsTerminal() bool {
 	return stderrIsTerminal(a.subprocessStderr())
 }
 
-// stderrIsTerminal asks the question "is anything capturing what a subprocess
-// writes to fd 2" — a pipe, a file, a CI log or an agent transcript all answer
-// yes. What answers no is any character device, which is a terminal in every
-// shape bmcp meets but is not the same question: /dev/null answers no too, and
-// so do /dev/console and /dev/kmsg, which do persist what is written. That
-// imprecision is why the policy in retrieveCredentials does not rest on this
-// alone.
+// stderrIsTerminal asks "could a person read what a subprocess writes to fd 2,
+// right now" — a pipe, a file, a CI log and an agent transcript all answer no.
+//
+// It is a real terminal test, not a character-device test. Those are not the
+// same question and the difference is a disclosure: /dev/console and /dev/kmsg
+// are character devices that persist what is written to them — kmsg into the
+// kernel log, console into a serial console a cloud provider will hand back
+// through its API — so `bmcp <tool> 2>/dev/kmsg` from an init script would have
+// passed a ModeCharDevice test and put a credential_process helper's trace into
+// a durable log. term.IsTerminal issues the terminal ioctl, which those devices
+// fail and a tty passes.
+//
+// A pty still answers yes, and nothing here can separate an operator's own
+// terminal from one a recorder is driving (`script`, `docker run -t`, a logging
+// tmux pane). That residual is why the policy in retrieveCredentials has two
+// more conjuncts.
 //
 // It takes the descriptor rather than reading os.Stderr so that a caller cannot
 // be handed the answer for a sink retrieveCredentials installed — see
 // subprocessStderr.
 func stderrIsTerminal(f *os.File) bool {
-	info, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
+	return term.IsTerminal(int(f.Fd()))
 }

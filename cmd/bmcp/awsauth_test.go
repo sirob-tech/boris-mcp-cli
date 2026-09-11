@@ -1566,24 +1566,36 @@ func TestStderrIsTerminalIsFalseForACapturedDescriptor(t *testing.T) {
 	if throughApp {
 		t.Fatal("an app with no injected stderrTTY did not fall through to the real check")
 	}
-	// And the other answer, which nothing else pins: a detector stuck on "captured"
-	// would kill the MFA prompt for every operator at a terminal with the whole
-	// suite still green. A terminal cannot be conjured here, but /dev/null is a
-	// character device, so it takes the same branch a tty does — which is also the
-	// measured reason the policy needs a.machine and cfg.NonInteractive rather
-	// than this test alone.
+	// A character device that is not a terminal must answer no. This is the
+	// distinction a ModeCharDevice test cannot draw, and the one that matters:
+	// /dev/kmsg and /dev/console are character devices whose contents persist,
+	// so treating every character device as "a person is watching" put a
+	// helper's trace into a kernel or serial-console log. /dev/null stands in
+	// for them here because it is the one such device every machine has.
 	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatalf("open %s: %v", os.DevNull, err)
 	}
 	defer devNull.Close()
-	if !stderrIsTerminal(devNull) {
-		t.Fatalf("%s is a character device and must take the same branch a terminal does", os.DevNull)
+	if stderrIsTerminal(devNull) {
+		t.Fatalf("%s is a character device but not a terminal, and must not take the visible branch", os.DevNull)
 	}
-	// Which is exactly why the decision may not be taken on the live global. An
-	// app whose realStderr is pinned answers for fd 2 even while os.Stderr holds
-	// a sink — without that, an abandoned retrieval's /dev/null made every later
-	// policy decision in the process answer "terminal".
+	// The answer in the other direction, which nothing else pins: a detector
+	// stuck on "captured" would take the MFA prompt away from every operator at
+	// a terminal with the whole suite still green. Needs a real tty, so it is
+	// skipped where the test host has no controlling terminal — CI, mostly.
+	if tty, err := os.OpenFile("/dev/tty", os.O_WRONLY, 0); err == nil {
+		defer tty.Close()
+		if !stderrIsTerminal(tty) {
+			t.Fatal("a controlling terminal was not recognised as one, which would discard every MFA prompt")
+		}
+	} else {
+		t.Logf("no controlling terminal here, so the positive case is unasserted: %v", err)
+	}
+	// And the reason the decision may not be taken on the live global: an app
+	// whose realStderr is pinned answers for fd 2 even while os.Stderr holds a
+	// sink. Without that, an abandoned retrieval's /dev/null decided every later
+	// policy question in the process.
 	captured, err := os.CreateTemp(t.TempDir(), "fd2")
 	if err != nil {
 		t.Fatalf("create temp: %v", err)
@@ -1634,6 +1646,13 @@ func TestFormatJSONDispatchSetsTheMachineGateBeforeCredentialsResolve(t *testing
 		// the one thing it exists to catch.
 		code = a.run([]string{"--format", "json", "tools___search_aws"})
 	})
+	// The pin has to have happened, and run() is the only place it can: every
+	// subprocess descriptor and the terminal test read it, so an app that reached
+	// a credential path without it would be one abandoned retrieval away from
+	// handing `aws sso login` a /dev/null.
+	if a.realStderr == nil {
+		t.Fatal("run() did not pin the startup stderr, so nothing can tell what fd 2 is")
+	}
 	// exitSync rather than "non-zero", because that is what says the helper ran.
 	// The catalog is cached and localhost:8787 is not listening, so a run that
 	// resolved credentials fails on the call; one that never got that far fails
@@ -1685,10 +1704,17 @@ func TestCredentialProcessStderrSurvivesACancelledRetrieval(t *testing.T) {
 		t.Fatalf("write helper: %v", err)
 	}
 	retrieved := make(chan struct{})
-	cache := aws.NewCredentialsCache(&signallingProvider{
-		inner: processcreds.NewProvider(helper),
-		done:  retrieved,
-	})
+	// Held until the cancelled retrieval has returned, so the helper command is
+	// built — and os.Stderr read — strictly afterwards. That is the ordering the
+	// restore rule has to survive, and without the gate the worker is free to do
+	// its reading first, which would let an unconditional restore pass here.
+	release := make(chan struct{})
+	worker := &signallingProvider{
+		inner:   processcreds.NewProvider(helper),
+		release: release,
+		done:    retrieved,
+	}
+	cache := aws.NewCredentialsCache(worker)
 	a := authTestApp()
 	// Both inert, and kept only to say so. cfg.NonInteractive below already sends
 	// this case down the discard branch, which is the branch it needs: the visible
@@ -1709,33 +1735,85 @@ func TestCredentialProcessStderrSurvivesACancelledRetrieval(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		_, err = a.retrieveCredentials(ctx, cfg, cache)
+		// Only now may the worker proceed, which is what puts its read of
+		// os.Stderr after the retrieval returned.
+		close(release)
 		// Receiving here is what makes restoring os.Stderr afterwards safe: the
 		// send happens after the abandoned goroutine has finished reading it.
 		select {
 		case <-retrieved:
 		case <-time.After(30 * time.Second):
-			t.Error("the abandoned helper never ran, so this case asserted nothing")
+			t.Error("the abandoned helper never finished, so this case asserted nothing")
 		}
 	})
 	if err == nil {
 		t.Fatal("a cancelled retrieval should have failed")
 	}
+	// Before any absence: the helper has to have actually run, or an empty capture
+	// would satisfy every check below.
+	assertAbandonedHelperRan(t, worker)
 	assertNoLeak(t, captured)
 	assertNoLeak(t, err.Error())
 }
 
-// signallingProvider reports when the provider beneath it has finished, giving a
-// test a real happens-before edge to work the singleflight goroutine
-// aws.CredentialsCache abandons on cancellation. ProviderSources is forwarded so
-// the chain still describes itself the way the real one does.
+// signallingProvider drives the singleflight goroutine aws.CredentialsCache
+// abandons on cancellation, so a test can order it rather than hope.
+//
+// Two channels, and both are load-bearing. release holds the provider before it
+// runs, which is what forces the helper command to be *built* — the moment
+// processcreds reads os.Stderr — after the cancelled retrieval has already
+// returned. Without it the worker may do its reading first, and a test meant to
+// catch an unconditional restore passes on the wrong schedule. done closes once
+// the inner provider is finished, and result() then says whether it actually
+// produced credentials: the SDK returns command-start failures the same way it
+// returns a cancelled retrieval, so a test that only waited for the signal could
+// accept a run where the helper never executed and assert absences against an
+// empty capture.
+//
+// ProviderSources is forwarded so the chain still describes itself the way the
+// real one does.
 type signallingProvider struct {
-	inner aws.CredentialsProvider
-	done  chan struct{}
+	inner   aws.CredentialsProvider
+	release <-chan struct{}
+	done    chan struct{}
+
+	mu    sync.Mutex
+	creds aws.Credentials
+	err   error
 }
 
 func (p *signallingProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
-	defer close(p.done)
-	return p.inner.Retrieve(ctx)
+	if p.release != nil {
+		<-p.release
+	}
+	creds, err := p.inner.Retrieve(ctx)
+	p.mu.Lock()
+	p.creds, p.err = creds, err
+	p.mu.Unlock()
+	close(p.done)
+	return creds, err
+}
+
+// result reports what the abandoned retrieval produced. Safe to call once done
+// is closed.
+func (p *signallingProvider) result() (aws.Credentials, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.creds, p.err
+}
+
+// assertAbandonedHelperRan fails unless the goroutine the cache walked away from
+// actually executed the helper and got its credentials. Every absence a
+// cancellation test asserts is vacuous without it.
+func assertAbandonedHelperRan(t *testing.T, p *signallingProvider) {
+	t.Helper()
+	creds, err := p.result()
+	if err != nil {
+		t.Fatalf("the abandoned retrieval never produced credentials, so the case asserted nothing: %v", err)
+	}
+	if creds.AccessKeyID != leakedKeyID {
+		t.Fatalf("the abandoned retrieval returned %q, want the helper's %q", creds.AccessKeyID, leakedKeyID)
+	}
 }
 
 func (p *signallingProvider) ProviderSources() []aws.CredentialSource {
@@ -1943,17 +2021,23 @@ func TestASecondRetrievalDoesNotReassignStderrUnderAnAbandonedOne(t *testing.T) 
 	isolateAWSEnv(t)
 	helper := tracingCredentialHelper(t)
 	abandoned := make(chan struct{})
-	first := aws.NewCredentialsCache(&signallingProvider{
-		inner: processcreds.NewProvider(helper),
-		done:  abandoned,
-	})
+	// Held until *both* retrievals have returned. That is the worst ordering for
+	// the bug under test: the abandoned worker reads os.Stderr after a second
+	// call has had every chance to reassign it.
+	release := make(chan struct{})
+	worker := &signallingProvider{
+		inner:   processcreds.NewProvider(helper),
+		release: release,
+		done:    abandoned,
+	}
+	first := aws.NewCredentialsCache(worker)
 	recorder := &stderrRecordingProvider{inner: processcreds.NewProvider(helper)}
 	second := aws.NewCredentialsCache(recorder)
 
 	a := authTestApp()
-	// A terminal and a human format, so a policy re-run on the second call would
-	// take the visible branch. The latch is what must stop the question being
-	// asked again on a descriptor that is now the sink.
+	// Inert, and kept to say so: cfg.NonInteractive below sends both calls down
+	// the discard branch on its own, which is the branch this case needs. The
+	// visible branch installs no sink, and there would be nothing to reassign.
 	a.machine = false
 	a.stderrTTY = func() bool { return true }
 	cfg := effectiveConfig{
@@ -1986,10 +2070,12 @@ func TestASecondRetrievalDoesNotReassignStderrUnderAnAbandonedOne(t *testing.T) 
 		}
 		ranUnder = recorder.saw()
 
+		// Only now, so the abandoned worker builds its command after both calls.
+		close(release)
 		select {
 		case <-abandoned:
 		case <-time.After(30 * time.Second):
-			t.Error("the abandoned helper never ran, so this case asserted nothing")
+			t.Error("the abandoned helper never finished, so this case asserted nothing")
 		}
 	})
 
@@ -1998,6 +2084,9 @@ func TestASecondRetrievalDoesNotReassignStderrUnderAnAbandonedOne(t *testing.T) 
 	if creds.AccessKeyID != leakedKeyID {
 		t.Fatalf("second retrieval returned %q, want the helper's %q", creds.AccessKeyID, leakedKeyID)
 	}
+	// The abandoned helper has to have actually executed, or "no leak" below holds
+	// for the trivial reason that nothing ever wrote.
+	assertAbandonedHelperRan(t, worker)
 	if installed == nil || ranUnder == nil {
 		t.Fatal("the retrievals did not record the descriptor they ran under")
 	}
@@ -2032,4 +2121,88 @@ func (p *stderrRecordingProvider) saw() *os.File {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.seen
+}
+
+// The consequence that made the leaked sink worse than an untidy global, pinned
+// through the subprocess that suffers it.
+//
+// After a retrieval is abandoned, os.Stderr stays pointed at /dev/null on
+// purpose. `aws sso login` is not what that sink exists to contain — it is
+// bmcp's own subprocess, and an operator has to read the verification URL and
+// user code it prints. Handing it the global destroyed both and left bmcp
+// blocking on a device flow with nothing on screen.
+//
+// The fake `aws` on PATH is how the shell-out is observed without a real login.
+func TestSSOLoginAfterAnAbandonedRetrievalStillReachesTheOperator(t *testing.T) {
+	const verification = "bmcp-verification-url-and-user-code"
+	isolateAWSEnv(t)
+
+	// A fake `aws` that prints where a real one prints its device code, and fails
+	// so the caller still reports the original credential problem.
+	binDir := t.TempDir()
+	fake := filepath.Join(binDir, "aws")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho '"+verification+"' >&2\nexit 1\n"), 0o700); err != nil {
+		t.Fatalf("write fake aws: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	helper := tracingCredentialHelper(t)
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	worker := &signallingProvider{
+		inner:   processcreds.NewProvider(helper),
+		release: release,
+		done:    finished,
+	}
+
+	a := authTestApp()
+	// The shape that reaches the login: a human format, nothing saying the run is
+	// non-interactive, and a stdin someone could answer at.
+	a.machine = false
+	a.interactive = func() bool { return true }
+	a.stderrTTY = func() bool { return false }
+
+	captured := captureStderrFd(t, func() {
+		a.realStderr = os.Stderr
+
+		// Abandon a retrieval, which is what installs the sink and latches it.
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := a.retrieveCredentials(ctx, effectiveConfig{
+			Profile:        "racy",
+			ProfileSource:  profileSourceFile,
+			Region:         "us-east-1",
+			NonInteractive: true,
+		}, aws.NewCredentialsCache(worker)); err == nil {
+			t.Error("a cancelled retrieval should have failed")
+		}
+		if !a.stderrSunk {
+			t.Fatal("the retrieval did not latch, so the rest of this case proves nothing")
+		}
+
+		// Now an SSO profile, whose retrieval cannot succeed here, so the login
+		// branch runs. Its subprocess must reach fd 2, not the sink.
+		_, _, err := a.awsCredentials(authTestContext(t), effectiveConfig{
+			Profile:       "sso-only",
+			ProfileSource: profileSourceFile,
+			Region:        "us-east-1",
+		})
+		if err == nil {
+			t.Error("an sso-only profile should not have resolved in a test")
+		}
+
+		close(release)
+		select {
+		case <-finished:
+		case <-time.After(30 * time.Second):
+			t.Error("the abandoned helper never finished")
+		}
+	})
+
+	assertAbandonedHelperRan(t, worker)
+	if !strings.Contains(captured, verification) {
+		t.Fatalf("aws sso login was handed the sink, so its device code never reached the operator; captured:\n%s", captured)
+	}
+	// And the sink still did its job for the thing it was installed for.
+	assertNoLeak(t, captured)
 }

@@ -146,6 +146,14 @@ func commandsWithPrefix(name string) []string {
 }
 
 func (a *app) run(args []string) int {
+	// Pinned here rather than in main() so that every path which actually runs
+	// bmcp gets it, including the tests that build an app of their own — main()
+	// is one unexecuted line, and a pin it forgot would be an untested hole that
+	// only shows up as a silenced subprocess. Nil-checked so a caller that
+	// deliberately pinned something else keeps it. See app.realStderr.
+	if a.realStderr == nil {
+		a.realStderr = os.Stderr
+	}
 	flags, rest, err := parseGlobalFlags(args)
 	// Before the error check and before validation: parsing stops at the first
 	// unknown flag, so a --format later on the line was never seen, and the

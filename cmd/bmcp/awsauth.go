@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/processcreds"
+	"github.com/aws/smithy-go/logging"
 )
 
 func (a *app) loadCredentials(ctx context.Context, cfg effectiveConfig) (aws.Credentials, string, error) {
@@ -203,7 +204,17 @@ func profileOrigin(source profileSource) string {
 }
 
 func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Credentials, string, error) {
-	opts := []func(*awsconfig.LoadOptions) error{}
+	// The SDK builds its default logger from os.Stderr when the config loads and
+	// keeps that writer (config's resolveDefaultAWSConfig, smithy logging). Two
+	// problems with letting it: after retrieveCredentials latches a sink, a later
+	// load captures /dev/null and every SDK diagnostic for the rest of the run
+	// disappears — and on the other side, a raw fd 2 writer would put SDK prose on
+	// the stream a machine format promises carries one document and nothing else.
+	// a.prose() is the writer that already answers both: bmcp's own channel, and
+	// io.Discard under --format json.
+	opts := []func(*awsconfig.LoadOptions) error{
+		awsconfig.WithLogger(logging.NewStandardLogger(a.prose())),
+	}
 	if cfg.Region != "" {
 		opts = append(opts, awsconfig.WithRegion(cfg.Region))
 	}
@@ -247,7 +258,7 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 	// subprocess would write its own prose straight to the inherited stderr —
 	// which is the one thing a machine format guarantees will not happen. Refusing
 	// here falls through to the actionable "run aws sso login" error below.
-	if usesSSO && !cfg.NonInteractive && !a.machine && isInteractive() {
+	if usesSSO && !cfg.NonInteractive && !a.machine && a.isInteractive() {
 		fmt.Fprintf(a.prose(), "AWS SSO credentials for profile %s are expired or missing. Running aws sso login --profile %s\n", profile, profile)
 		cmd := exec.CommandContext(ctx, "aws", "sso", "login", "--profile", profile)
 		// The pinned descriptor, not os.Stderr: a retrieval abandoned earlier in
@@ -359,8 +370,16 @@ func (a *app) retrieveCredentials(ctx context.Context, cfg effectiveConfig, prov
 	//
 	// cfg.NonInteractive is in the conjunction because a prompt nobody will answer
 	// buys nothing, so keeping it is pure exposure. That matters because of the
-	// residual case below, and it is the same triple the `aws sso login` branch
-	// above already applies.
+	// residual case below.
+	//
+	// Note what this does *not* establish. The SSO branch above asks
+	// a.isInteractive(), which tests stdin; this asks about stderr, and
+	// cfg.NonInteractive is only a flag or an environment variable. So a run with
+	// stdin redirected and the flag unset keeps the helper's stderr visible even
+	// though nothing can type an MFA code at it. Narrowing that means adding the
+	// stdin test here too, which would take the prompt away from helpers that read
+	// /dev/tty or a hardware token rather than stdin — a live question, not an
+	// oversight.
 	//
 	// The residual case, measured rather than assumed: a *pty* is a character
 	// device, so `script -q log bmcp <tool>`, `docker run -t`, `ssh -t` and a
