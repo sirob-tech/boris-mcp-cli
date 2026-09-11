@@ -50,6 +50,11 @@ type fakeMCP struct {
 	// that needs to see what a command does with a rejected tools/call could
 	// never reach one. Each test names the hop it is about.
 	statusByMethod map[string]int
+	// lastCallArgs records the arguments object of the most recent tools/call, so
+	// a test can assert what the tool was actually asked — which is the only place
+	// #65's harm is visible. serve_test.go's callRecorder decodes it into a map
+	// rather than matching tools/call a second time of its own.
+	lastCallArgs json.RawMessage
 }
 
 // What the BORIS gateway actually answers a request it will not authenticate,
@@ -138,6 +143,11 @@ func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
 		env, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "result": json.RawMessage(payload)})
 		return respond(string(env))
 	case "tools/call":
+		var params struct {
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		_ = json.Unmarshal(rpc.Params, &params)
+		m.lastCallArgs = params.Arguments
 		env, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": rpc.ID, "result": json.RawMessage(m.callResult)})
 		return respond(string(env))
 	}
@@ -6328,5 +6338,195 @@ func TestSchemasFlagIsScopedToList(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "unknown flag for command: --schemas") {
 		t.Fatalf("expected a flag error naming --schemas, got: %s", stderr.String())
+	}
+}
+
+// #65 end to end, which is the only place the actual harm is visible.
+//
+// Every other test in this repo about the helper's stdin asserts on a
+// descriptor. This one asserts on the answer: what arguments did the tool
+// receive. That is the whole bug — not a leak, not a hang, but `bmcp call`
+// reporting ok:true and exit 0 for a call it made with no arguments at all,
+// which nothing downstream has any reason to distrust.
+//
+// The catalog is deliberately stale. Fresh, runCall reads the payload before
+// anything needs credentials and the collision never happens; stale,
+// cacheForCatalog syncs first, the helper runs, and the payload is gone by the
+// time commands.go reaches io.ReadAll. That ordering is why the bug is
+// intermittent in the field and why a test that forgot this line would pass
+// against the unfixed binary.
+func TestPipedPayloadSurvivesAStaleCatalogSync(t *testing.T) {
+	isolateAWSEnv(t)
+	profile, stolen := stdinEatingCredentialProcessProfile(t, "greedy")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tools := []tool{{
+		Name:        "tools___search_aws",
+		Description: "Search.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+	}}
+	borisHome := setupInstallCatalog(t, home, tools)
+	// The profile whose helper eats stdin, so the real credential path runs —
+	// a.credentials is left nil below for the same reason.
+	cfg := configFile{URL: "http://localhost:8787/mcp", AWSProfile: profile}
+	applyDefaults(&cfg)
+	if err := writeConfig(filepath.Join(borisHome, "config.toml"), cfg); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	// Older than the sync_ttl, so cacheForCatalog resolves credentials before the
+	// payload is read. This is the line the bug depends on — with a fresh catalog
+	// the payload is read first and the test would pass against the unfixed
+	// binary — so the TTL is set here rather than inherited. isolateAWSEnv clears
+	// only AWS_* and BMCP_PROFILE, and a maintainer with BMCP_SYNC_TTL exported
+	// would otherwise run this against a catalog it believes is stale and is not.
+	t.Setenv("BMCP_SYNC_TTL", "1h")
+	stale := &toolCache{Version: 1, URL: cfg.URL, LastSync: time.Now().Add(-30 * 24 * time.Hour), Tools: tools}
+	if err := writeCache(filepath.Join(borisHome, "tools.json"), stale); err != nil {
+		t.Fatalf("write stale cache: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	server := &fakeMCP{tools: tools, callResult: []byte(`{"content":[{"type":"text","text":"{\"hits\":1}"}]}`)}
+	a := &app{
+		stdout:     &stdout,
+		stderr:     &stderr,
+		now:        time.Now,
+		httpClient: server,
+		// Nothing injected: the point is to run awsCredentials for real, so the
+		// SDK actually spawns the helper.
+	}
+	// Not a terminal on either descriptor, which is a CI run and the shape where
+	// both streams are discarded.
+	a.stderrTTY = func() bool { return false }
+
+	var code int
+	survived := withStdinFd(t, a, callPayload, func() {
+		a.stdin = os.Stdin
+		// Cleared so run() does the pinning, which is where production does it.
+		// Leaving the fixture's pin in place made those lines dead in every test
+		// that reaches run(), and deleting them kept the suite green.
+		a.realStdin = nil
+		code = a.run([]string{"call", "search_aws"})
+	})
+
+	if code != 0 {
+		t.Fatalf("exit code %d\nstdout: %s\nstderr: %s", code, stdout.String(), stderr.String())
+	}
+	// The precondition the rest of this test rests on: a sync actually happened,
+	// so credentials really were resolved before the payload was read. Without
+	// this the test goes green while proving nothing if the catalog is ever fresh.
+	if server.listCalls == 0 {
+		t.Fatal("no tools/list round trip, so the catalog was fresh and this test asserted nothing")
+	}
+	// The assertion the issue is about. Before the fix this was `{}` — with
+	// exit 0 and an ok result, which is what makes it worse than a crash.
+	var args struct {
+		Query string `json:"query"`
+	}
+	if len(server.lastCallArgs) == 0 {
+		t.Fatal("the fake server never recorded a tools/call")
+	}
+	if err := json.Unmarshal(server.lastCallArgs, &args); err != nil {
+		t.Fatalf("arguments are not an object: %v\n%s", err, server.lastCallArgs)
+	}
+	if args.Query != "BMCP-65-CALLER-PAYLOAD-SENTINEL" {
+		t.Fatalf("the tool was called with %s, so the piped payload never reached it", server.lastCallArgs)
+	}
+	// The helper ran — otherwise the line above holds for the trivial reason that
+	// nothing was ever in a position to eat the payload, and this test would go on
+	// passing if the whole credential path were removed.
+	if _, err := os.Stat(stolen); err != nil {
+		t.Fatalf("the credential_process helper never ran, so this test asserted nothing: %v", err)
+	}
+	if eaten, err := os.ReadFile(stolen); err == nil && len(eaten) > 0 {
+		t.Fatalf("the helper read %q from bmcp's stdin", eaten)
+	}
+	// Read to the end by runCall itself, which is the correct outcome: the payload
+	// reached the tool rather than sitting unread behind a helper that skipped it.
+	if survived != "" {
+		t.Fatalf("runCall did not consume the payload it was given: %q", survived)
+	}
+}
+
+// The other end of #65's fix, and the row a terminal test would have got wrong.
+//
+// `printf %s "$MFA_CODE" | bmcp call <tool> '{"query":"x"}'` puts the payload in
+// argv and the pipe there for the credential_process helper. bmcp never reads
+// fd 0 on this path — shouldReadPayloadFromStdin is not even consulted, because
+// payload != "" — so there is nothing of bmcp's to protect and the helper must
+// still get what the operator piped it.
+//
+// A "is fd 0 a terminal" gate answers this identically to the test above, which
+// is why the policy asks who *reads* the descriptor instead. saml2aws hands
+// os.Stdin to its prompter, gimme-aws-creds reads it with input(), and a
+// `vault login token=-` shim needs it; this test is those setups.
+func TestPipedInputStillReachesTheHelperWhenThePayloadCameFromArgv(t *testing.T) {
+	isolateAWSEnv(t)
+	profile, stolen := stdinEatingCredentialProcessProfile(t, "greedy")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	tools := []tool{{
+		Name:        "tools___search_aws",
+		Description: "Search.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}}}`),
+	}}
+	borisHome := setupInstallCatalog(t, home, tools)
+	cfg := configFile{URL: "http://localhost:8787/mcp", AWSProfile: profile}
+	applyDefaults(&cfg)
+	if err := writeConfig(filepath.Join(borisHome, "config.toml"), cfg); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	// Stale for the same reason as the sibling test: it is what makes credentials
+	// resolve, and therefore the helper run, at all.
+	t.Setenv("BMCP_SYNC_TTL", "1h")
+	stale := &toolCache{Version: 1, URL: cfg.URL, LastSync: time.Now().Add(-30 * 24 * time.Hour), Tools: tools}
+	if err := writeCache(filepath.Join(borisHome, "tools.json"), stale); err != nil {
+		t.Fatalf("write stale cache: %v", err)
+	}
+
+	const mfaCode = "BMCP-65-OPERATOR-PIPED-THIS-FOR-THE-HELPER"
+	var stdout, stderr bytes.Buffer
+	server := &fakeMCP{tools: tools, callResult: []byte(`{"content":[{"type":"text","text":"{\"hits\":1}"}]}`)}
+	a := &app{
+		stdout:     &stdout,
+		stderr:     &stderr,
+		now:        time.Now,
+		httpClient: server,
+	}
+	a.stderrTTY = func() bool { return false }
+
+	var code int
+	withStdinFd(t, a, mfaCode, func() {
+		a.stdin = os.Stdin
+		a.realStdin = nil
+		code = a.run([]string{"call", "search_aws", `{"query":"from-argv"}`})
+	})
+
+	if code != 0 {
+		t.Fatalf("exit code %d\nstdout: %s\nstderr: %s", code, stdout.String(), stderr.String())
+	}
+	if server.listCalls == 0 {
+		t.Fatal("no tools/list round trip, so no credentials were resolved and this test asserted nothing")
+	}
+	// The argv payload is untouched by any of this, and asserted so that a fix
+	// which "preserved" the pipe by never reading argv would not pass.
+	var args struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal(server.lastCallArgs, &args); err != nil || args.Query != "from-argv" {
+		t.Fatalf("the argv payload did not reach the tool: %s", server.lastCallArgs)
+	}
+	// The point: the helper got what was piped to it.
+	got, err := os.ReadFile(stolen)
+	if err != nil {
+		t.Fatalf("the helper never ran, so this test asserted nothing: %v", err)
+	}
+	if string(got) != mfaCode {
+		t.Fatalf("the helper read %q from fd 0, want the piped %q — bmcp took a descriptor it never reads", got, mfaCode)
+	}
+	if a.helperStdinDiscarded {
+		t.Fatal("bmcp recorded a stdin discard on a call whose payload came from argv")
 	}
 }

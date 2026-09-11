@@ -154,6 +154,12 @@ func (a *app) run(args []string) int {
 	if a.realStderr == nil {
 		a.realStderr = os.Stderr
 	}
+	// And fd 0, for the same reason and with one more consequence: a missing pin
+	// here leaves isInteractive() reading a /dev/null that answers yes. See
+	// app.realStdin.
+	if a.realStdin == nil {
+		a.realStdin = os.Stdin
+	}
 	flags, rest, err := parseGlobalFlags(args)
 	// Before the error check and before validation: parsing stops at the first
 	// unknown flag, so a --format later on the line was never seen, and the
@@ -658,6 +664,29 @@ func (a *app) cmdCall(flags globalFlags, args []string) int {
 }
 
 func (a *app) runCall(flags globalFlags, name string, payload string, readStdin bool) int {
+	// First, before anything at all: this has to precede every line below that
+	// can resolve credentials, because resolving them is what spawns a
+	// credential_process helper, and the helper inherits fd 0 and would consume
+	// the payload before bmcp ever reached the read. That ordering is #65 —
+	// whether it happened depended only on whether the catalog was stale, which
+	// is what made it intermittent.
+	//
+	// cacheForCatalog below is the obvious such line, but requireConfig is one
+	// too: on an unconfigured interactive machine it runs the first-run wizard,
+	// which syncs. That path is unreachable with a payload on the pipe — the
+	// wizard needs a character device on fd 0 and shouldReadPayloadFromStdin
+	// needs the absence of one — but the safety of this declaration should not
+	// rest on two mode tests in different files happening to be complements, so
+	// it goes above the call rather than after it.
+	//
+	// It depends on nothing the lines below produce: both operands are
+	// parameters, and a.stdin is pinned in main().
+	fromStdin := payload == "" && readStdin && shouldReadPayloadFromStdin(a.stdin)
+	// Monotonic on principle rather than for a live caller: runCall is reached at
+	// most once per process, and no path sets this before it. What the invariant
+	// in retrieveCredentials actually needs is that the value is fixed before the
+	// first retrieval, which the placement above is what guarantees.
+	a.ownsStdin = a.ownsStdin || fromStdin
 	cfg, _, err := a.requireConfig(flags)
 	if err != nil {
 		return a.fail(flags, exitConfig, "not_configured", err.Error())
@@ -682,7 +711,12 @@ func (a *app) runCall(flags globalFlags, name string, payload string, readStdin 
 			}
 		}
 	}
-	if payload == "" && readStdin && shouldReadPayloadFromStdin(a.stdin) {
+	// The condition decided at the top of the function, not re-tested. Re-testing
+	// would in fact give the same answer — a.stdin holds the *value* os.Stdin had
+	// at startup and the sink reassigns the variable, not the field — but the
+	// declaration above and this read must be the same decision by construction,
+	// not by two evaluations that agree.
+	if fromStdin {
 		data, err := io.ReadAll(a.stdin)
 		if err != nil {
 			return a.fail(flags, exitValidation, "stdin_read_failed", err.Error())
@@ -1303,6 +1337,14 @@ func (a *app) failSchemaChanged(flags globalFlags, oldTool, newTool tool) int {
 	})
 }
 
+// shouldReadPayloadFromStdin reports whether a payload should be read from fd 0:
+// something was redirected there, so it is not a terminal.
+//
+// Not the negation of isInteractive, although it looks like it and the two do
+// answer opposite questions about the same mode bit. Both return false when Stat
+// fails, which is deliberate on each side — no wizard and no stdin payload from a
+// descriptor neither can describe — and rewriting either as `!` the other would
+// turn a Stat failure on a `bmcp call` into an attempt to read it.
 func shouldReadPayloadFromStdin(r io.Reader) bool {
 	f, ok := r.(*os.File)
 	if !ok {

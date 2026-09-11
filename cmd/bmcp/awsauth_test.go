@@ -1810,6 +1810,29 @@ func tracingCredentialHelper(t *testing.T) string {
 	return helper
 }
 
+// guardStdFds restores os.Stdin and os.Stderr to their current values when the
+// test ends.
+//
+// A retrieval that is abandoned leaves its sink installed on purpose and latches
+// so nothing puts it back — which is correct in production, where the process is
+// about to exit, and a leak across tests here: every test that runs afterwards
+// in the same binary would see /dev/null on the global. For stderr that is only
+// noise, since later tests write to their own buffers. For stdin it changes an
+// answer: /dev/null is a character device, so an unrestored sink makes
+// isInteractive() report a terminal for the rest of the run.
+//
+// captureStderrFd restores stderr wherever it wraps a case, and withStdinFd
+// restores stdin wherever it supplies one, so most cases need nothing. This is
+// for the two that install a sink through production code with one of those
+// wrappers missing.
+func guardStdFds(t *testing.T) {
+	t.Helper()
+	in, err := os.Stdin, os.Stderr
+	t.Cleanup(func() {
+		os.Stdin, os.Stderr = in, err
+	})
+}
+
 // captureStderrFd points os.Stderr at a file for the duration of fn and returns
 // what was written to it.
 //
@@ -2130,18 +2153,41 @@ func (p *signallingProvider) ProviderSources() []aws.CredentialSource {
 // helper printed nothing". The message has to name the discard, and only when
 // there was one.
 func TestCredentialProcessFailureSaysWhenItDiscardedTheHelpersStderr(t *testing.T) {
+	// The one case in this file that installs a stdin sink through production code
+	// with nothing wrapping fd 0: the ownsStdin rows below go through
+	// retrieveCredentials, and captureStderrFd restores only stderr. A retrieval
+	// that timed out would latch and skip the restore, leaving /dev/null on
+	// os.Stdin for every test after this one.
+	guardStdFds(t)
 	const clause = "discarded rather than shown"
+	const stdinClause = "Its stdin was /dev/null"
 	for _, tc := range []struct {
 		name string
 		tty  bool
 		// interactive drives cfg.NonInteractive, inverted, exactly as in the policy
 		// table above: the clause has to track the gate, not a stand-in for it.
 		interactive bool
-		says        bool
+		// ownsStdin drives the stdin half of the same policy, independently — the
+		// two clauses must track their own gates, not each other.
+		ownsStdin bool
+		says      bool
+		saysStdin bool
 	}{
 		{name: "stderr captured", says: true},
 		{name: "non-interactive on a terminal", tty: true, says: true},
 		{name: "stderr is a terminal", tty: true, interactive: true, says: false},
+		{
+			// #65's headline shape, and the one combination no test read before:
+			// stderr kept, stdin discarded, so the message must name the second and
+			// not the first. An edit that merged the two clauses fails here.
+			name: "piped payload at a terminal", tty: true, interactive: true,
+			ownsStdin: true, says: false, saysStdin: true,
+		},
+		{
+			// Both discarded, which is CI. The two clauses have to compose into one
+			// readable sentence rather than one overwriting the other.
+			name: "both discarded", ownsStdin: true, says: true, saysStdin: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			isolateAWSEnv(t)
@@ -2162,6 +2208,7 @@ func TestCredentialProcessFailureSaysWhenItDiscardedTheHelpersStderr(t *testing.
 			a := authTestApp()
 			a.machine = false
 			a.stderrTTY = func() bool { return tc.tty }
+			a.ownsStdin = tc.ownsStdin
 			var err error
 			captureStderrFd(t, func() {
 				_, _, err = a.awsCredentials(authTestContext(t), cfg)
@@ -2170,7 +2217,10 @@ func TestCredentialProcessFailureSaysWhenItDiscardedTheHelpersStderr(t *testing.
 				t.Fatal("expected an auth failure")
 			}
 			if got := strings.Contains(err.Error(), clause); got != tc.says {
-				t.Fatalf("message names the discard = %v, want %v: %q", got, tc.says, err.Error())
+				t.Fatalf("message names the stderr discard = %v, want %v: %q", got, tc.says, err.Error())
+			}
+			if got := strings.Contains(err.Error(), stdinClause); got != tc.saysStdin {
+				t.Fatalf("message names the stdin discard = %v, want %v: %q", got, tc.saysStdin, err.Error())
 			}
 			// Whichever way that went, the helper's own words are still withheld —
 			// the clause explains the silence, it does not lift the rule.
@@ -2440,11 +2490,21 @@ func TestSSOLoginAfterAnAbandonedRetrievalStillReachesTheOperator(t *testing.T) 
 	const verification = "bmcp-verification-url-and-user-code"
 	isolateAWSEnv(t)
 
-	// A fake `aws` that prints where a real one prints its device code, and fails
-	// so the caller still reports the original credential problem.
+	// A fake `aws` that prints where a real one prints its device code, copies
+	// whatever it is given on fd 0, and fails so the caller still reports the
+	// original credential problem.
+	//
+	// The copy is the stdin half of the same rule. A real `aws sso login` reads
+	// fd 0 — for the browser-or-code choice, and for anything a profile's own
+	// prompts need — and the abandoned retrieval above has left /dev/null on the
+	// os.Stdin global on purpose. Handing the subprocess the global rather than
+	// the pinned descriptor gives the login end-of-file for the one prompt it may
+	// still need, which is exactly the failure the sink is not supposed to cause.
 	binDir := t.TempDir()
+	answered := filepath.Join(t.TempDir(), "answered")
 	fake := filepath.Join(binDir, "aws")
-	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho '"+verification+"' >&2\nexit 1\n"), 0o700); err != nil {
+	script := "#!/bin/sh\nhead -c 512 >> '" + answered + "'\necho '" + verification + "' >&2\nexit 1\n"
+	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
 		t.Fatalf("write fake aws: %v", err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -2464,57 +2524,523 @@ func TestSSOLoginAfterAnAbandonedRetrievalStillReachesTheOperator(t *testing.T) 
 	a.machine = false
 	a.interactive = func() bool { return true }
 	a.stderrTTY = func() bool { return false }
+	// And a command that reads fd 0 itself, so the abandoned retrieval below
+	// installs the stdin sink as well as the stderr one. Without it there is no
+	// sink for the login to be wrongly handed, and the stdin assertion is vacuous.
+	a.ownsStdin = true
 
+	const loginAnswer = "bmcp-operator-typed-this-at-the-login"
 	captured := captureStderrFd(t, func() {
 		a.realStderr = os.Stderr
+		withStdinFd(t, a, loginAnswer, func() {
 
-		// Abandon a retrieval, which is what installs the sink and latches it.
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		if _, err := a.retrieveCredentials(ctx, effectiveConfig{
-			Profile:        "racy",
-			ProfileSource:  profileSourceFile,
-			Region:         "us-east-1",
-			NonInteractive: true,
-		}, aws.NewCredentialsCache(worker)); err == nil {
-			t.Error("a cancelled retrieval should have failed")
-		}
-		if !a.stderrSunk {
-			t.Fatal("the retrieval did not latch, so the rest of this case proves nothing")
-		}
+			// Abandon a retrieval, which is what installs the sink and latches it.
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if _, err := a.retrieveCredentials(ctx, effectiveConfig{
+				Profile:        "racy",
+				ProfileSource:  profileSourceFile,
+				Region:         "us-east-1",
+				NonInteractive: true,
+			}, aws.NewCredentialsCache(worker)); err == nil {
+				t.Error("a cancelled retrieval should have failed")
+			}
+			if !a.stderrSunk {
+				t.Fatal("the retrieval did not latch, so the rest of this case proves nothing")
+			}
+			// The same guard for fd 0, and it is load-bearing in the same way: without
+			// a latched stdin sink os.Stdin is still the fixture, subprocessStdin()
+			// returns the same descriptor either way, and the `answered` assertion at
+			// the end passes whichever one the login is handed. Dropping a.ownsStdin
+			// from the setup above used to leave this test green.
+			if !a.stdinSunk {
+				t.Fatal("no stdin sink was latched, so the login has nothing to be wrongly handed")
+			}
 
-		// Now an SSO profile, whose retrieval cannot succeed here, so the login
-		// branch runs. Its subprocess must reach fd 2, not the sink.
-		//
-		// A generous deadline rather than authTestContext's ten seconds:
-		// awsCredentials declines to start a device flow that cannot finish inside
-		// the budget left, and ten seconds cannot. This mirrors a real `bmcp <tool>`
-		// call, whose CallTimeout is ten minutes, so the branch is reached the same
-		// way production reaches it. Still bounded, so a resolution that went to a
-		// link-local endpoint would not hang the suite indefinitely.
-		loginCtx, cancelLogin := context.WithTimeout(context.Background(), 10*time.Minute)
-		defer cancelLogin()
-		_, _, err := a.awsCredentials(loginCtx, effectiveConfig{
-			Profile:       "sso-only",
-			ProfileSource: profileSourceFile,
-			Region:        "us-east-1",
+			// Now an SSO profile, whose retrieval cannot succeed here, so the login
+			// branch runs. Its subprocess must reach fd 2, not the sink.
+			//
+			// A generous deadline rather than authTestContext's ten seconds:
+			// awsCredentials declines to start a device flow that cannot finish inside
+			// the budget left, and ten seconds cannot. This mirrors a real `bmcp <tool>`
+			// call, whose CallTimeout is ten minutes, so the branch is reached the same
+			// way production reaches it. Still bounded, so a resolution that went to a
+			// link-local endpoint would not hang the suite indefinitely.
+			loginCtx, cancelLogin := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancelLogin()
+			_, _, err := a.awsCredentials(loginCtx, effectiveConfig{
+				Profile:       "sso-only",
+				ProfileSource: profileSourceFile,
+				Region:        "us-east-1",
+			})
+			if err == nil {
+				t.Error("an sso-only profile should not have resolved in a test")
+			}
+
+			close(release)
+			select {
+			case <-finished:
+			case <-time.After(30 * time.Second):
+				t.Error("the abandoned helper never finished")
+			}
 		})
-		if err == nil {
-			t.Error("an sso-only profile should not have resolved in a test")
-		}
-
-		close(release)
-		select {
-		case <-finished:
-		case <-time.After(30 * time.Second):
-			t.Error("the abandoned helper never finished")
-		}
 	})
 
 	assertAbandonedHelperRan(t, worker)
 	if !strings.Contains(captured, verification) {
 		t.Fatalf("aws sso login was handed the sink, so its device code never reached the operator; captured:\n%s", captured)
 	}
+	// The other direction, on the descriptor the credential_process helper was
+	// just denied. Reverting cmd.Stdin to the os.Stdin global leaves this empty.
+	got, err := os.ReadFile(answered)
+	if err != nil {
+		t.Fatalf("aws sso login recorded nothing from fd 0: %v", err)
+	}
+	if string(got) != loginAnswer {
+		t.Fatalf("aws sso login read %q from fd 0, want the operator's %q — it was handed the sink", got, loginAnswer)
+	}
 	// And the sink still did its job for the thing it was installed for.
 	assertNoLeak(t, captured)
+}
+
+// The payload standing in for what `echo '{...}' | bmcp call <tool>` puts on fd
+// 0. Distinct from every fixture credential in this file so an assertion that
+// the helper ate it cannot be satisfied by something else, and long enough that
+// a helper reading a fixed number of bytes takes all of it.
+const callPayload = `{"query":"BMCP-65-CALLER-PAYLOAD-SENTINEL"}`
+
+// stdinEatingCredentialHelper writes #65's reproduction and returns the helper's
+// path alongside the file it copies stdin into.
+//
+// `head -c 512` stands in for the `read -r code` an MFA wrapper does by
+// accident: the SDK hands the helper bmcp's own fd 0, the child shares the file
+// description and therefore the offset, and whatever it takes is gone from the
+// payload runCall has not read yet. Against /dev/null the same line reads zero
+// bytes and returns at once, which is what the fix is asserted to produce.
+//
+// It emits valid credential JSON and exits 0, so every assertion below is about
+// a *successful* retrieval — the shape that makes #65 silent.
+func stdinEatingCredentialHelper(t *testing.T) (helper, stolen string) {
+	t.Helper()
+	dir := t.TempDir()
+	stolen = filepath.Join(dir, "stolen")
+	helper = filepath.Join(dir, "helper.sh")
+	// Appended, not truncated. Two of the tests below run the helper twice — a
+	// second retrieval, or an abandoned goroutine finishing last — and with `>` the
+	// final run's empty read erased the evidence of an earlier one that had eaten
+	// the payload, leaving the assertion to pass on a wiped file.
+	//
+	// The `||` arm distinguishes the two ways this file ends up empty. Containment
+	// means a *readable* /dev/null answering end-of-file; a descriptor the helper
+	// cannot read at all — fd 0 opened write-only, say — also writes nothing, and
+	// every "the helper ate nothing" assertion below would hold for that too. A
+	// marker turns it into a failure instead.
+	script := "#!/bin/sh\nhead -c 512 >> '" + stolen + "' || echo UNREADABLE-STDIN >> '" + stolen + "'\n" +
+		"echo '" + mfaPrompt + "' >&2\n" +
+		`echo '{"Version":1,"AccessKeyId":"` + leakedKeyID + `","SecretAccessKey":"` + leakedSecret + `"}'` + "\n"
+	if err := os.WriteFile(helper, []byte(script), 0o700); err != nil {
+		t.Fatalf("write helper: %v", err)
+	}
+	return helper, stolen
+}
+
+// stdinEatingCredentialProcessProfile appends a profile backed by that helper
+// and returns its name and the file the helper copies stdin into.
+func stdinEatingCredentialProcessProfile(t *testing.T, name string) (profile, stolen string) {
+	t.Helper()
+	helper, stolen := stdinEatingCredentialHelper(t)
+	appendSharedConfig(t, "\n[profile "+name+"]\nregion = us-east-1\ncredential_process = "+helper+"\n")
+	return name, stolen
+}
+
+// withStdinFd points os.Stdin at a file holding content for the duration of fn,
+// pins it on a as the startup descriptor the way run() does, and returns
+// whatever is left unread afterwards.
+//
+// A regular file rather than a pipe, and that is not a weakening: both answer
+// "not a character device", which is the only thing either policy asks, and an
+// inherited regular fd shares its offset with the child exactly as a pipe shares
+// its unread bytes. It also lets the test read back what survived, which a
+// consumed pipe cannot be asked.
+func withStdinFd(t *testing.T, a *app, content string, fn func()) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "stdin")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write stdin fixture: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open stdin fixture: %v", err)
+	}
+	restore := os.Stdin
+	// Deferred as well as done below, because a t.Fatalf inside fn unwinds through
+	// runtime.Goexit rather than returning.
+	defer func() {
+		os.Stdin = restore
+		f.Close()
+	}()
+	os.Stdin = f
+	a.realStdin = f
+	fn()
+	os.Stdin = restore
+	rest, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatalf("read back what survived on stdin: %v", err)
+	}
+	return string(rest)
+}
+
+// #65, at the one shape its own issue text would not have fixed.
+//
+// The issue proposed putting os.Stdin behind the three-way stderr gate. That
+// gate is an early return leaving both descriptors alone, and `echo '{...}' |
+// bmcp call <tool>` run at a terminal satisfies it: fd 2 is the tty, the format
+// is human, no --non-interactive. So the shared gate answers "keep", the helper
+// is handed the pipe, and the payload is gone — the fix would have shipped
+// green and changed nothing about the bug it was written for.
+//
+// Everything here is therefore asserted with stderr *kept*: the helper's MFA
+// prompt must still reach fd 2 in the same run where its stdin is /dev/null.
+// Collapsing the two gates back into one fails this test in both directions.
+func TestCredentialProcessHelperCannotEatTheCallPayload(t *testing.T) {
+	isolateAWSEnv(t)
+	profile, stolen := stdinEatingCredentialProcessProfile(t, "greedy")
+	cfg := effectiveConfig{
+		Profile:       profile,
+		ProfileSource: profileSourceFile,
+		Region:        "us-east-1",
+	}
+	a := authTestApp()
+	// A human format at a terminal, which is what makes this the shape the shared
+	// gate keeps. Both are load-bearing: either one alone sinks stderr too and the
+	// split stops being what the test proves.
+	a.machine = false
+	a.stderrTTY = func() bool { return true }
+	// What `bmcp call <tool>` sets when its payload is arriving on stdin. The
+	// production wiring for this is asserted end to end by
+	// TestPipedPayloadSurvivesAStaleCatalogSync, which goes through run().
+	a.ownsStdin = true
+
+	var creds aws.Credentials
+	var err error
+	var survived string
+	var fixture, afterRetrieve *os.File
+	captured := captureStderrFd(t, func() {
+		a.realStderr = os.Stderr
+		survived = withStdinFd(t, a, callPayload, func() {
+			fixture = os.Stdin
+			creds, _, err = a.awsCredentials(authTestContext(t), cfg)
+			// Read here, not after withStdinFd returns — it restores the descriptor
+			// itself, so outside the closure the variable says nothing about what
+			// the retrieval left behind. Deleting the restore in retrieveCredentials
+			// used to keep the whole suite green; this is the assertion that notices.
+			afterRetrieve = os.Stdin
+		})
+	})
+
+	// Asserted first: a helper that failed would have read nothing either, and
+	// every assertion below would pass for the wrong reason. #65 is a bug on the
+	// success path, so the success has to be real.
+	if err != nil {
+		t.Fatalf("retrieval should have succeeded, got: %v", err)
+	}
+	if creds.AccessKeyID != leakedKeyID {
+		t.Fatalf("credentials came from %q, want the helper's %q", creds.AccessKeyID, leakedKeyID)
+	}
+
+	if survived != callPayload {
+		t.Fatalf("the payload on fd 0 did not survive the helper.\n got: %q\nwant: %q", survived, callPayload)
+	}
+	if eaten, readErr := os.ReadFile(stolen); readErr == nil && len(eaten) > 0 {
+		t.Fatalf("the helper read %q from bmcp's stdin", eaten)
+	}
+	if !a.helperStdinDiscarded {
+		t.Fatal("the helper's stdin was replaced but nothing recorded it, so a failure message cannot say so")
+	}
+	// Put back on a retrieval that finished. In production today this is hygiene
+	// rather than a live fix — runCall reads a.stdin, which holds the descriptor's
+	// *value* and is immune to the swap — but the variable is what the AWS SDK
+	// reads to build its next command, and that is not ours to reason about
+	// forever. Deleting the restore used to keep the whole suite green.
+	if afterRetrieve != fixture {
+		t.Fatal("os.Stdin was left pointing at the sink after a retrieval that completed")
+	}
+
+	// The other half of the split: stderr was never the problem here, and taking
+	// the MFA prompt away to fix stdin would be a regression of #61's kept case.
+	if !strings.Contains(captured, mfaPrompt) {
+		t.Fatalf("fixing stdin took the helper's MFA prompt off fd 2; captured:\n%s", captured)
+	}
+	if a.helperStderrDiscarded {
+		t.Fatal("stderr was discarded in a run whose policy keeps it")
+	}
+}
+
+// The two policies are separate, and this is the table that says so. Each row
+// asserts the observable rather than bmcp's own bookkeeping: stderr is kept iff
+// the helper's prompt reached fd 2, stdin is kept iff the helper ate what was on
+// it.
+//
+// The pairs matter more than the rows. Rows 1 and 2 hold everything constant
+// except who the bytes on fd 0 belong to, and get opposite answers for stdin
+// with the same answer for stderr; rows 5 and 6 do the same under a machine
+// format. Putting stdin back behind any of the three stderr conjuncts collapses
+// one of those pairs.
+func TestHelperStreamPolicyDecidesStdinAndStderrSeparately(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		machine        bool
+		nonInteractive bool
+		stderrTTY      bool
+		// ownsStdin is the gate under test: bmcp reads fd 0 itself this
+		// invocation, so no subprocess may.
+		ownsStdin  bool
+		keepStderr bool
+		keepStdin  bool
+	}{
+		{
+			// #65's shape: `echo '{...}' | bmcp call <tool>` at a terminal. The two
+			// streams disagree, and the answer differs per stream.
+			name:       "piped payload at a terminal",
+			stderrTTY:  true,
+			ownsStdin:  true,
+			keepStderr: true,
+			keepStdin:  false,
+		},
+		{
+			// The row that says the gate is not a terminal test. Same terminal, same
+			// non-terminal stdin — but the payload came from argv, so the pipe was
+			// put there for the helper. `printf %s "$CODE" | bmcp call <tool> '{...}'`
+			// must still reach it. A terminal test answers this row "sink" and takes
+			// a working setup away.
+			name:       "piped MFA code, payload from argv",
+			stderrTTY:  true,
+			ownsStdin:  false,
+			keepStderr: true,
+			keepStdin:  true,
+		},
+		{
+			// CI, and bmcp owns the descriptor. Both sunk.
+			name:      "neither stream is a terminal, bmcp reads stdin",
+			stderrTTY: false,
+			ownsStdin: true,
+		},
+		{
+			// The same CI run of a command that never reads stdin — sync, doctor,
+			// list. #61's disclosure is live, and there is nothing on fd 0 to
+			// protect, so the helper keeps it.
+			name:      "neither stream is a terminal, bmcp does not read stdin",
+			stderrTTY: false,
+			ownsStdin: false,
+			keepStdin: true,
+		},
+		{
+			// A machine format overrides stderr the way it overrides the SSO login
+			// branch. Only a.machine can carry this row.
+			name:      "machine format on a terminal, bmcp reads stdin",
+			machine:   true,
+			stderrTTY: true,
+			ownsStdin: true,
+		},
+		{
+			// And the pair that proves a.machine does *not* reach stdin. Same machine
+			// format, same terminal — the helper keeps fd 0 because nothing of bmcp's
+			// is on it.
+			name:      "machine format on a terminal, bmcp does not read stdin",
+			machine:   true,
+			stderrTTY: true,
+			ownsStdin: false,
+			keepStdin: true,
+		},
+		{
+			// The flag that says nothing will answer a prompt. Only cfg.NonInteractive
+			// can carry this row, and it too stops at stderr.
+			name:           "non-interactive on a terminal, bmcp does not read stdin",
+			nonInteractive: true,
+			stderrTTY:      true,
+			ownsStdin:      false,
+			keepStdin:      true,
+		},
+		{
+			// Its partner, so the table is self-sufficient about the third conjunct
+			// as well. Without this row, adding cfg.NonInteractive to the stdin gate
+			// leaves all the others green — the pair is what says the flag decides
+			// stderr and not stdin.
+			name:           "non-interactive on a terminal, bmcp reads stdin",
+			nonInteractive: true,
+			stderrTTY:      true,
+			ownsStdin:      true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateAWSEnv(t)
+			profile, stolen := stdinEatingCredentialProcessProfile(t, "greedy")
+			cfg := effectiveConfig{
+				Profile:        profile,
+				ProfileSource:  profileSourceFile,
+				Region:         "us-east-1",
+				NonInteractive: tc.nonInteractive,
+			}
+			a := authTestApp()
+			a.machine = tc.machine
+			a.stderrTTY = func() bool { return tc.stderrTTY }
+			a.ownsStdin = tc.ownsStdin
+
+			var creds aws.Credentials
+			var err error
+			var survived string
+			captured := captureStderrFd(t, func() {
+				a.realStderr = os.Stderr
+				survived = withStdinFd(t, a, callPayload, func() {
+					creds, _, err = a.awsCredentials(authTestContext(t), cfg)
+				})
+			})
+			if err != nil {
+				t.Fatalf("retrieval should have succeeded, got: %v", err)
+			}
+			if creds.AccessKeyID != leakedKeyID {
+				t.Fatalf("credentials came from %q, want the helper's %q", creds.AccessKeyID, leakedKeyID)
+			}
+
+			gotStderr := strings.Contains(captured, mfaPrompt)
+			if gotStderr != tc.keepStderr {
+				t.Errorf("helper stderr reached fd 2 = %v, want %v; captured:\n%s", gotStderr, tc.keepStderr, captured)
+			}
+			eaten, _ := os.ReadFile(stolen)
+			gotStdin := len(eaten) > 0
+			if gotStdin != tc.keepStdin {
+				t.Errorf("helper read bmcp's stdin = %v, want %v; it got %q and %q survived", gotStdin, tc.keepStdin, eaten, survived)
+			}
+			// The bytes are either wholly intact or wholly gone; a partial read
+			// would be a third outcome neither policy describes.
+			if !tc.keepStdin && survived != callPayload {
+				t.Errorf("what was on fd 0 did not survive intact: %q", survived)
+			}
+		})
+	}
+}
+
+// isInteractive has to answer for the descriptor bmcp started with, not for
+// whatever os.Stdin holds now — and the sink this package installs is the exact
+// case that separates them, because /dev/null *is* a character device.
+//
+// Without the pin, one abandoned retrieval makes every later isInteractive()
+// answer yes: `bmcp init` prompts into a void, and the SSO device flow is
+// started with nothing able to read the code or type the approval. That is a
+// worse failure than the one #65 set out to fix, arrived at by fixing it.
+func TestIsInteractiveAnswersForTheStartupDescriptorNotTheSink(t *testing.T) {
+	pinned, err := os.CreateTemp(t.TempDir(), "stdin")
+	if err != nil {
+		t.Fatalf("create pinned stdin: %v", err)
+	}
+	defer pinned.Close()
+	// A regular file: not a character device, so the honest answer is no.
+	a := &app{realStdin: pinned}
+	if a.isInteractive() {
+		t.Fatal("a regular file was reported as a terminal")
+	}
+
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", os.DevNull, err)
+	}
+	defer devNull.Close()
+	// Exactly what retrieveCredentials leaves behind on an abandoned retrieval.
+	restore := os.Stdin
+	defer func() { os.Stdin = restore }()
+	os.Stdin = devNull
+
+	// The control, and the reason this test is not vacuous: read through the
+	// global, /dev/null answers yes.
+	if !isInteractive(os.Stdin) {
+		t.Skip("this platform does not report /dev/null as a character device, so the pin cannot be distinguished here")
+	}
+	if a.isInteractive() {
+		t.Fatal("isInteractive answered for the /dev/null sink rather than for the startup descriptor")
+	}
+}
+
+// The restore rule, for fd 0. aws.CredentialsCache abandons its singleflight
+// goroutine on a cancelled context and that goroutine reads os.Stdin *later*,
+// when it reaches NewCommand — so a sink put back unconditionally hands the
+// helper the payload after bmcp has already returned. Later is not safer; it is
+// the same collision with the evidence further away.
+//
+// So the sink stays installed, the descriptor is leaked on purpose, and
+// stdinSunk latches to stop a second retrieval reassigning the variable
+// underneath a goroutine still reading it.
+func TestAnAbandonedRetrievalLeavesTheStdinSinkInstalled(t *testing.T) {
+	guardStdFds(t)
+	isolateAWSEnv(t)
+	helper, stolen := stdinEatingCredentialHelper(t)
+
+	abandoned := make(chan struct{})
+	release := make(chan struct{})
+	worker := &signallingProvider{
+		inner:   processcreds.NewProvider(helper),
+		release: release,
+		done:    abandoned,
+	}
+	first := aws.NewCredentialsCache(worker)
+	second := aws.NewCredentialsCache(processcreds.NewProvider(helper))
+
+	a := authTestApp()
+	// bmcp reads fd 0 this invocation, which sends both calls down the discard
+	// branch for stdin.
+	a.ownsStdin = true
+	cfg := effectiveConfig{Profile: "racy", ProfileSource: profileSourceFile, Region: "us-east-1"}
+
+	var installed, afterSecond *os.File
+	var creds aws.Credentials
+	survived := withStdinFd(t, a, callPayload, func() {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := a.retrieveCredentials(ctx, cfg, first); err == nil {
+			t.Error("a cancelled retrieval should have failed")
+		}
+		installed = os.Stdin
+
+		// Deliberately no wait on `abandoned`: a second retrieval racing the
+		// goroutine the first left behind is the situation under test.
+		var err error
+		creds, err = a.retrieveCredentials(authTestContext(t), cfg, second)
+		if err != nil {
+			t.Errorf("the second retrieval should have succeeded, got: %v", err)
+		}
+		// Read here rather than after withStdinFd returns: the helper restores the
+		// descriptor it installed, so outside fn the variable says nothing about
+		// what the second retrieval did to it.
+		afterSecond = os.Stdin
+
+		// Only now, so the abandoned worker builds its command after both calls —
+		// reading os.Stdin at the moment the restore would have put fd 0 back.
+		close(release)
+		select {
+		case <-abandoned:
+		case <-time.After(30 * time.Second):
+			t.Error("the abandoned helper never finished, so this case asserted nothing")
+		}
+	})
+
+	if creds.AccessKeyID != leakedKeyID {
+		t.Fatalf("second retrieval returned %q, want the helper's %q", creds.AccessKeyID, leakedKeyID)
+	}
+	assertAbandonedHelperRan(t, worker)
+	if !a.stdinSunk {
+		t.Fatal("an abandoned retrieval did not latch, so a later call is free to reassign os.Stdin under it")
+	}
+	if installed == nil || afterSecond == nil {
+		t.Fatal("the retrievals did not record the descriptor they left installed")
+	}
+	if afterSecond != installed {
+		t.Fatal("the second retrieval reassigned os.Stdin over the sink an abandoned goroutine may still be reading")
+	}
+	// The whole point: two helpers ran, one of them after bmcp had returned, and
+	// neither got a byte of the payload.
+	if eaten, err := os.ReadFile(stolen); err == nil && len(eaten) > 0 {
+		t.Fatalf("a helper read %q from bmcp's stdin", eaten)
+	}
+	if survived != callPayload {
+		t.Fatalf("the payload did not survive: %q", survived)
+	}
 }

@@ -70,17 +70,54 @@ type app struct {
 	// that needs the real answer reads this instead: the terminal test, and every
 	// subprocess bmcp spawns itself.
 	realStderr *os.File
+	// realStdin is the same pin for fd 0, and it is needed for the same reason
+	// twice over. retrieveCredentials points os.Stdin at /dev/null so a
+	// credential_process helper cannot eat the payload `bmcp call` is about to
+	// read — and /dev/null is itself a character device, so an isInteractive()
+	// that kept reading the global would answer "a person is typing at this"
+	// about the sink. That is the SSO device flow started with nothing able to
+	// answer it, and `aws sso login` handed /dev/null for its own stdin.
+	realStdin *os.File
 	// stderrSunk latches when a retrieval was abandoned with the /dev/null sink
 	// still installed. An SDK goroutine outliving that call can still read
 	// os.Stderr to build its command, so from then on nothing may write the
 	// variable — not to install a second sink, and not to put the original back.
 	// See retrieveCredentials.
 	stderrSunk bool
+	// stdinSunk is the same latch for fd 0. The two are separate because the two
+	// policies are: a piped payload at a terminal sinks stdin and keeps stderr,
+	// so a run can abandon a retrieval with one swapped and the other never
+	// touched.
+	stdinSunk bool
+	// ownsStdin says this invocation reads fd 0 itself, so no subprocess may have
+	// it. Two commands declare it: `bmcp call` when its payload is arriving on
+	// stdin rather than in argv, and `bmcp serve`, whose whole session is a
+	// framed conversation on that descriptor. The `bmcp init` wizard also reads
+	// fd 0 across a sync and deliberately does not declare — see the policy in
+	// retrieveCredentials for why.
+	//
+	// This is the gate on the stdin sink in retrieveCredentials, and it is
+	// deliberately narrower than "nobody is typing". A terminal test would also
+	// take fd 0 away from `printf %s "$MFA_CODE" | bmcp call <tool> '{"q":"x"}'`,
+	// where the payload came from argv and the pipe was meant for the helper all
+	// along — an operator's working setup broken to protect a payload that was
+	// never on that descriptor. Asking who reads it instead answers the only
+	// question the sink exists for.
+	//
+	// Set before anything can resolve credentials, because resolving them is what
+	// spawns the helper. Monotonic: once bmcp owns fd 0 it owns it for the run.
+	ownsStdin bool
 	// helperStderrDiscarded records that retrieveCredentials sent a
 	// credential_process helper's stderr to /dev/null, so a failure message can
 	// say so. Without it an operator reads an empty CI log as "the helper printed
 	// nothing" when bmcp is what threw it away.
 	helperStderrDiscarded bool
+	// helperStdinDiscarded is the same record for fd 0, and it explains a failure
+	// the discard itself causes: a helper that prompts reads end-of-file instead
+	// of the operator, and whatever it does about that — exit non-zero, return
+	// nothing — is reported as the helper's failure with no hint that bmcp closed
+	// the input.
+	helperStdinDiscarded bool
 	// executable and verifySignature are injectable so the swap can be tested.
 	// Without them a test exercising the update path resolves to, and would
 	// overwrite, the `go test` binary itself.
@@ -164,11 +201,24 @@ func (a *app) isInteractive() bool {
 	if a.interactive != nil {
 		return a.interactive()
 	}
-	return isInteractive()
+	return isInteractive(a.subprocessStdin())
 }
 
-func isInteractive() bool {
-	info, err := os.Stdin.Stat()
+// isInteractive asks "is a person typing at fd 0" — the question every prompt,
+// and the SSO device flow, is really asking.
+//
+// It takes the descriptor rather than reading os.Stdin for the reason
+// subprocessStdin exists: retrieveCredentials may have left the variable
+// pointing at /dev/null, which is a character device and would answer yes.
+//
+// A character-device test rather than term.IsTerminal, unlike its stderr
+// counterpart. The two are asking different things. stderrIsTerminal guards a
+// disclosure, so a /dev/console that persists what is written to it must answer
+// no; this guards a prompt, and the cost of a wrong yes is a prompt nobody
+// answers rather than a secret in a log. Changing it would also change who gets
+// asked at `bmcp init`, which is not this function's question to reopen.
+func isInteractive(f *os.File) bool {
+	info, err := f.Stat()
 	if err != nil {
 		return false
 	}
@@ -181,13 +231,28 @@ func isInteractive() bool {
 // sink installed for a *helper* ends up swallowing the output of an unrelated
 // command — `aws sso login`'s verification URL, for one.
 //
-// The fallback exists for tests, which build an app directly. Production always
-// pins it in main().
+// The fallback exists for tests, which build an app directly. Production pins it
+// in run().
 func (a *app) subprocessStderr() *os.File {
 	if a.realStderr != nil {
 		return a.realStderr
 	}
 	return os.Stderr
+}
+
+// subprocessStdin is subprocessStderr for fd 0: the descriptor a child of bmcp
+// should be given, which is os.Stdin's value from startup and never a sink
+// retrieveCredentials installed. `aws sso login` is the child that needs it —
+// handing it the global after a helper's stdin was sunk gives the login
+// /dev/null to read.
+//
+// The fallback exists for tests, which build an app directly. Production pins it
+// in run().
+func (a *app) subprocessStdin() *os.File {
+	if a.realStdin != nil {
+		return a.realStdin
+	}
+	return os.Stdin
 }
 
 func (a *app) stderrIsTerminal() bool {

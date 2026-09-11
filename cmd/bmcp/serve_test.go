@@ -4,34 +4,33 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
-	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-// callRecorder keeps the arguments of the last tools/call so a test can assert
-// what actually went upstream, which fakeMCP alone does not expose.
+// callRecorder reads back the arguments of the last tools/call as a map, which
+// is what every assertion in this file wants — `doer.lastArgs()["query"]`.
+//
+// It used to intercept Do to collect them, duplicating a body read and a
+// tools/call match that fakeMCP now does itself for fakeMCP.lastCallArgs. What
+// is left is the decode, so there is one place that looks inside a call and one
+// shape per caller.
 type callRecorder struct {
 	*fakeMCP
-	lastArgs map[string]any
 }
 
-func (r *callRecorder) Do(req *http.Request) (*http.Response, error) {
-	if req.Body != nil {
-		body, _ := io.ReadAll(req.Body)
-		req.Body = io.NopCloser(bytes.NewReader(body))
-		var rpc jsonRPCRequest
-		if json.Unmarshal(body, &rpc) == nil && rpc.Method == "tools/call" {
-			var params struct {
-				Arguments map[string]any `json:"arguments"`
-			}
-			_ = json.Unmarshal(rpc.Params, &params)
-			r.lastArgs = params.Arguments
-		}
+func (r *callRecorder) lastArgs() map[string]any {
+	if len(r.lastCallArgs) == 0 {
+		return nil
 	}
-	return r.fakeMCP.Do(req)
+	var args map[string]any
+	if err := json.Unmarshal(r.lastCallArgs, &args); err != nil {
+		return nil
+	}
+	return args
 }
 
 const (
@@ -249,8 +248,8 @@ func TestServeOffersNoPictureWithoutMCPApps(t *testing.T) {
 	if strings.Contains(lines[1], widgetURI) {
 		t.Errorf("the widget must not be advertised:\n%s", lines[1])
 	}
-	if doer.lastArgs[renderMarker] == true {
-		t.Errorf("no picture may be asked for on such a client: %v", doer.lastArgs)
+	if doer.lastArgs()[renderMarker] == true {
+		t.Errorf("no picture may be asked for on such a client: %v", doer.lastArgs())
 	}
 	var reply map[string]any
 	if err := json.Unmarshal([]byte(lines[2]), &reply); err != nil {
@@ -292,11 +291,11 @@ func TestServeKeepsTheMarkupOutOfTheToolResult(t *testing.T) {
 	if !strings.Contains(lines[0], "vpc-1") {
 		t.Errorf("the finder's own answer must survive: %s", lines[0])
 	}
-	if doer.lastArgs[renderMarker] != true {
-		t.Errorf("the render marker was not sent upstream: %v", doer.lastArgs)
+	if doer.lastArgs()[renderMarker] != true {
+		t.Errorf("the render marker was not sent upstream: %v", doer.lastArgs())
 	}
-	if doer.lastArgs["query"] != "the shared vpc" {
-		t.Errorf("declared arguments must survive: %v", doer.lastArgs)
+	if doer.lastArgs()["query"] != "the shared vpc" {
+		t.Errorf("declared arguments must survive: %v", doer.lastArgs())
 	}
 
 	// The picture belongs to the call that drew it, and rides that call's reply.
@@ -367,8 +366,8 @@ func TestServeReportsARejectedArgumentLocally(t *testing.T) {
 	if result["isError"] != true {
 		t.Fatalf("a rejected argument must come back as a tool error: %v", result)
 	}
-	if doer.lastArgs != nil {
-		t.Errorf("validation must fail before anything goes upstream: %v", doer.lastArgs)
+	if doer.lastArgs() != nil {
+		t.Errorf("validation must fail before anything goes upstream: %v", doer.lastArgs())
 	}
 }
 
@@ -609,5 +608,77 @@ func TestFitWithinPanelConstrainsWithoutResizingTheDrawing(t *testing.T) {
 	}
 	if !strings.Contains(out, "<title>x</title></svg>") {
 		t.Errorf("the drawing must survive: %s", out)
+	}
+}
+
+// `bmcp serve` resolves credentials per tools/call, so a credential_process
+// helper spawned mid-session inherits fd 0 — which for serve is the live MCP
+// protocol stream. A helper that reads it consumes frames the client has
+// already sent, and the client sees a request that is simply never answered.
+// Same defect as #65, on a descriptor carrying rather more.
+//
+// This is the only test that runs a serve session through the *real* credential
+// path: every other one injects staticCreds, so no subprocess is ever spawned
+// and the declaration at the top of cmdServe has nothing to do. Deleting that
+// line left the whole package green.
+//
+// What it pins is the wiring — a serve session reaches retrieveCredentials with
+// ownership declared, and the sink is installed through production code. That
+// the sink is what keeps the helper off the descriptor is pinned separately, by
+// the policy table in awsauth_test.go.
+func TestServeTakesStdinFromACredentialProcessHelper(t *testing.T) {
+	isolateAWSEnv(t)
+	guardStdFds(t)
+	profile, stolen := stdinEatingCredentialProcessProfile(t, "greedy")
+
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("BMCP_RENDER", "")
+	tools := finderCatalog()
+	borisHome := setupInstallCatalog(t, home, tools)
+	cfg := configFile{URL: "http://localhost:8787/mcp", AWSProfile: profile}
+	applyDefaults(&cfg)
+	if err := writeConfig(filepath.Join(borisHome, "config.toml"), cfg); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	frames := strings.Join([]string{
+		`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"` + plainTool + `","arguments":{"resource_type":"ec2:instance"}}}`,
+	}, "\n") + "\n"
+
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdout: &stdout, stderr: &stderr, now: time.Now,
+		// Deliberately no credentials func: the point is to run awsCredentials for
+		// real so the SDK actually spawns the helper.
+		httpClient: &fakeMCP{tools: tools, callResult: []byte(`{"content":[{"type":"text","text":"{}"}]}`)},
+		lookPath:   func(string) (string, error) { return "", os.ErrNotExist },
+	}
+
+	var code int
+	withStdinFd(t, a, frames, func() {
+		a.stdin = os.Stdin
+		a.realStdin = nil
+		code = a.run([]string{"serve"})
+	})
+	if code != 0 {
+		t.Fatalf("serve exit code %d, stderr: %s", code, stderr.String())
+	}
+
+	// Asserted first: if the tool call never reached the credential path there was
+	// no helper, and every check below holds for the wrong reason.
+	if _, err := os.Stat(stolen); err != nil {
+		t.Fatalf("the credential_process helper never ran, so this test asserted nothing: %v", err)
+	}
+	if !a.helperStdinDiscarded {
+		t.Fatal("a serve session reached retrieveCredentials without declaring ownership of fd 0")
+	}
+	if eaten, err := os.ReadFile(stolen); err == nil && len(eaten) > 0 {
+		t.Fatalf("the helper read %q from the MCP protocol stream", eaten)
+	}
+	// And the session still worked: the client got an answer to its call.
+	if !strings.Contains(stdout.String(), `"id":1`) {
+		t.Fatalf("the tools/call was never answered:\n%s", stdout.String())
 	}
 }

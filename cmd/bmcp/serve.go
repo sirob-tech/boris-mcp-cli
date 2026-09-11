@@ -57,13 +57,21 @@ func (a *app) cmdServe(flags globalFlags, args []string) int {
 		return a.fail(flags, exitValidation, "unexpected_argument",
 			fmt.Sprintf("serve takes no arguments, got %q", args[0]))
 	}
-	// stdin is the transport from here on. Both gates are needed: the first-run
-	// wizard is refused on a non-interactive app, and `aws sso login` on a
-	// machine one — neither flag covers the other, and either would read the
+	// stdin is the transport from here on. All three gates are needed: the
+	// first-run wizard is refused on a non-interactive app, `aws sso login` on a
+	// machine one, and a credential_process helper on one that owns stdin — no
+	// flag covers the others, and each of the three would otherwise read the
 	// frames the client is sending.
+	//
+	// The helper is the one that had no gate before. `serve` resolves credentials
+	// per tools/call, so a helper spawned mid-session inherited the live protocol
+	// stream and shared its offset: frames the client had already sent could be
+	// eaten by a subprocess, and the client would see a request simply never
+	// answered. Same defect as #65, on a descriptor carrying rather more.
 	a.interactive = func() bool { return false }
 	a.machine = true
 	a.quiet = true
+	a.ownsStdin = true
 
 	cfg, _, err := a.requireConfig(flags)
 	if err != nil {
