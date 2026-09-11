@@ -5,7 +5,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // The resource finders can return a rendered picture of their top hit for a
@@ -33,10 +32,15 @@ const (
 	pictureName = "last-graph.svg"
 )
 
-// wantsPicture reports whether this call should ask for one. BMCP_RENDER=off
-// leaves the request byte-identical to a build without this feature.
+// wantsPicture reports whether this call should ask for one. Any of the
+// spellings BMCP_NON_INTERACTIVE accepts turns it off, and the request is then
+// byte-identical to a build without this feature.
+//
+// It reads through parseStrictBool rather than matching "off" alone: this used
+// to be the only switch in the CLI that did not, so BMCP_RENDER=false and
+// BMCP_RENDER=0 left rendering on and said nothing about it.
 func wantsPicture(name string) bool {
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("BMCP_RENDER")), "off") {
+	if enabled, set := parseStrictBool(os.Getenv("BMCP_RENDER")); set && !enabled {
 		return false
 	}
 	return renderableTools[displayToolName(name)]
