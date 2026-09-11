@@ -69,15 +69,22 @@ const noPictureYet = `<p style="color:#6b7280">No graph has been drawn yet. ` +
 func widgetHTML(svg string) string {
 	body := noPictureYet
 	if svg != "" {
-		body = scaleToWidth(svg)
+		body = fitWithinPanel(svg)
 	}
 	return fmt.Sprintf(widgetTemplate, body, version, pictureToolName)
 }
 
-// scaleToWidth drops the fixed pixel size so the drawing fits the panel it is
-// mounted in, keeping the viewBox to preserve its aspect ratio. Markup it cannot
-// read comes back untouched: showing it unscaled beats showing nothing.
-func scaleToWidth(svg string) string {
+// fitWithinPanel makes the drawing responsive without resizing what is in it.
+//
+// The intrinsic width and height stay: measured in a browser, dropping them
+// makes a 926px drawing stretch to 1400 in a wide panel, blowing up 11px labels
+// and the raster mark past its source resolution. Keeping them and constraining
+// with max-width gives the right behaviour at every width — 400px panel draws
+// 400x329, 800px draws 800x658, and anything wider leaves it at 926x762
+// untouched. A max-height would only scale the whole drawing, shrinking the
+// labels with it, so there is none. Markup it cannot read comes back untouched:
+// showing it unscaled beats showing nothing.
+func fitWithinPanel(svg string) string {
 	start := strings.Index(svg, "<svg")
 	if start < 0 {
 		return svg
@@ -86,23 +93,6 @@ func scaleToWidth(svg string) string {
 	if end < 0 {
 		return svg
 	}
-	open := svg[start : start+end]
-	for _, attr := range []string{" width=", " height="} {
-		for {
-			at := strings.Index(open, attr)
-			if at < 0 {
-				break
-			}
-			rest := open[at+len(attr):]
-			if len(rest) == 0 || rest[0] != '"' {
-				break
-			}
-			close := strings.Index(rest[1:], `"`)
-			if close < 0 {
-				break
-			}
-			open = open[:at] + rest[close+2:]
-		}
-	}
-	return `<svg style="width:100%;height:auto"` + open[len("<svg"):] + svg[start+end:]
+	const fit = `max-width:100%;height:auto;display:block;margin:0 auto`
+	return `<svg style="` + fit + `"` + svg[start+len("<svg"):]
 }

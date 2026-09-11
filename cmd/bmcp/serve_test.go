@@ -486,27 +486,10 @@ func TestScrubMarkupCleansProseWrappedAroundABody(t *testing.T) {
 	}
 }
 
-func TestScaleToWidthDropsTheFixedSize(t *testing.T) {
-	svg := `<svg xmlns="http://www.w3.org/2000/svg" width="777.16" height="872.22" viewBox="0 0 777.16 872.22" role="img"><rect width="100%" height="100%"/><title>x</title></svg>`
-	out := scaleToWidth(svg)
-	if strings.Contains(out, `width="777.16"`) || strings.Contains(out, `height="872.22"`) {
-		t.Errorf("fixed size survived: %s", out)
-	}
-	if !strings.Contains(out, `viewBox="0 0 777.16 872.22"`) {
-		t.Errorf("viewBox must survive so the aspect ratio holds: %s", out)
-	}
-	if !strings.Contains(out, `<rect width="100%" height="100%"/>`) {
-		t.Errorf("only the root's size may be touched: %s", out)
-	}
-	if !strings.Contains(out, "<title>x</title></svg>") {
-		t.Errorf("the drawing must survive: %s", out)
-	}
-}
-
-func TestScaleToWidthReturnsMarkupItCannotRead(t *testing.T) {
+func TestFitWithinPanelReturnsMarkupItCannotRead(t *testing.T) {
 	for _, in := range []string{"not markup at all", "<svg without a close", ""} {
-		if out := scaleToWidth(in); out != in {
-			t.Errorf("scaleToWidth(%q) = %q, want it unchanged", in, out)
+		if out := fitWithinPanel(in); out != in {
+			t.Errorf("fitWithinPanel(%q) = %q, want it unchanged", in, out)
 		}
 	}
 }
@@ -562,5 +545,28 @@ func TestServeDeclaresResourcesOnlyAfterNegotiation(t *testing.T) {
 	caps, _ := handshake["result"].(map[string]any)["capabilities"].(map[string]any)
 	if _, declared := caps["resources"]; !declared {
 		t.Errorf("a client that negotiated MCP Apps needs the resources capability: %s", lines[0])
+	}
+}
+
+func TestFitWithinPanelConstrainsWithoutResizingTheDrawing(t *testing.T) {
+	// Measured in a browser: an svg with only a viewBox stretches to fill a wide
+	// panel — 926px of drawing blown up to 1400, taking 11px labels and a raster
+	// mark with it. Keeping the intrinsic size is what caps it at natural size.
+	svg := `<svg xmlns="http://www.w3.org/2000/svg" width="926" height="762" viewBox="0 0 926 762"><title>x</title></svg>`
+	out := fitWithinPanel(svg)
+
+	for _, want := range []string{`width="926"`, `height="762"`, `viewBox="0 0 926 762"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("intrinsic size must survive, missing %s: %s", want, out)
+		}
+	}
+	if !strings.Contains(out, "max-width:100%") || !strings.Contains(out, "height:auto") {
+		t.Errorf("missing the responsive constraint: %s", out)
+	}
+	if strings.Contains(out, "max-height") {
+		t.Error("a height cap scales the drawing, shrinking its labels with it")
+	}
+	if !strings.Contains(out, "<title>x</title></svg>") {
+		t.Errorf("the drawing must survive: %s", out)
 	}
 }

@@ -295,7 +295,7 @@ func (s *server) servePicture() any {
 	// own markup with this, and unscaled it would paint at its intrinsic size.
 	return map[string]any{
 		"content": []any{map[string]any{"type": "text", "text": "picture delivered to the app"}},
-		"_meta":   map[string]any{"svg": scaleToWidth(svg)},
+		"_meta":   map[string]any{"svg": fitWithinPanel(svg)},
 	}
 }
 
