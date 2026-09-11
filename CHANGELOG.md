@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.9.0...v0.9.1) (2026-09-11)
+
+
+### Bug Fixes
+
+* let BMCP_RENDER be turned off the way every other switch is ([#73](https://github.com/sirob-tech/boris-mcp-cli/issues/73)) ([c48f721](https://github.com/sirob-tech/boris-mcp-cli/commit/c48f7212284b5ea96df6e613c44157154c1a0fa5))
+* size the graph picture to the panel without resizing what is in it ([#72](https://github.com/sirob-tech/boris-mcp-cli/issues/72)) ([4352789](https://github.com/sirob-tech/boris-mcp-cli/commit/43527893549bfc1415af49c998991895ea0696f2))
+
 ## [0.9.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.8.1...v0.9.0) (2026-09-10)
 
 
