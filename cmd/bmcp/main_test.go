@@ -41,7 +41,21 @@ type fakeMCP struct {
 	// staleIDPageAt is the 1-based tools/list page that answers with the id of
 	// the request before it, as a server confusing two in-flight pages would.
 	staleIDPageAt int
+	// statusByMethod answers the named JSON-RPC method with an HTTP status and
+	// the gateway's own rejection body instead of a result.
+	//
+	// Keyed by method rather than applied to every request, because a blanket
+	// status rejects `initialize` and nothing gets past the handshake — so a test
+	// that needs to see what a command does with a rejected tools/call could
+	// never reach one. Each test names the hop it is about.
+	statusByMethod map[string]int
 }
+
+// What the BORIS gateway actually answers a request it will not authenticate,
+// measured against the live endpoint: HTTP 401 with a JSON-RPC error body. The
+// body is here so a test cannot pass on a status the code reached by some other
+// route, and so the message a user sees is the one the server sends.
+const gatewayAuthRejectionBody = `{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Authentication error - Invalid credentials"}}`
 
 func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
 	if req.URL != nil && (req.URL.Host == "github.com" || req.URL.Host == "api.github.com") {
@@ -61,6 +75,10 @@ func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
 	header := http.Header{"Content-Type": {"application/json"}}
 	respond := func(payload string) (*http.Response, error) {
 		return &http.Response{StatusCode: 200, Header: header, Body: io.NopCloser(strings.NewReader(payload))}, nil
+	}
+	if code := m.statusByMethod[rpc.Method]; code != 0 {
+		return &http.Response{StatusCode: code, Header: header,
+			Body: io.NopCloser(strings.NewReader(gatewayAuthRejectionBody))}, nil
 	}
 	switch rpc.Method {
 	case "initialize":
@@ -2490,6 +2508,196 @@ func TestDoctorGoesRemoteWhenLocalStateCannotAnswer(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// #66's filed symptom, and its whole neighbourhood: the pair of rows doctor
+// prints for each shape a remote attempt can fail in.
+//
+// The bug was `auth ok` above a `remote` row that had failed on HTTP 401 — the
+// most misleading pair the command can produce, because it tells the operator
+// their credentials are fine and the server is down when the server is up and
+// refusing them. So the first case is the reproduction, and the rest exist to
+// stop the fix from collapsing every failure into "auth". `auth` is allowed to
+// fail for exactly two reasons: bmcp never produced a signed request, or the
+// gateway refused the one it did produce. A connection that never arrives and a
+// server that answers with an empty catalog are neither, and both have to leave
+// it passing.
+//
+// Driven through one injected httpDoer per case rather than by stubbing the
+// classifier, because the property is that the two rows cannot disagree — and
+// they can only be shown not to disagree if one real attempt produces both.
+func TestDoctorClassifiesOneRemoteAttempt(t *testing.T) {
+	fresh := []tool{{Name: "tools___search_aws", Description: "Search."}}
+	for _, tc := range []struct {
+		name string
+		// client and creds shape how the single sync attempt fails, or does not.
+		client httpDoer
+		creds  credentialsFunc
+		// auth and remote are the row states; "" means the row must be absent.
+		auth, remote string
+		wantTools    bool
+		contains     []string
+	}{
+		{
+			// The reproduction. Both rows fail, from the same fact, and the auth row
+			// names the credentials the gateway refused so the operator knows which
+			// identity to go and fix.
+			name:     "the gateway rejects the signed request",
+			client:   &fakeMCP{tools: fresh, statusByMethod: map[string]int{"initialize": http.StatusUnauthorized}},
+			creds:    staticCreds(),
+			auth:     "fail",
+			remote:   "fail",
+			contains: []string{"the BORIS gateway rejected them", "rejected the signed request"},
+		},
+		{
+			// Nothing reached the gateway, so nothing tested the credentials. Calling
+			// this an auth failure would send an operator to re-authenticate over a
+			// network problem — which is the same misdiagnosis as the filed bug, in
+			// the other direction.
+			name:     "the request never arrives",
+			client:   failingDoer{},
+			creds:    staticCreds(),
+			auth:     "ok",
+			remote:   "fail",
+			contains: []string{"connection refused", "the remote row is what tests them"},
+		},
+		{
+			// A refusal bmcp itself raises after a successful, authenticated round
+			// trip. It belongs to the server's state, not the operator's identity.
+			name:   "the server answers with an empty catalog",
+			client: &fakeMCP{},
+			creds:  staticCreds(),
+			auth:   "ok",
+			remote: "fail",
+		},
+		{
+			// The other half of `auth fail`: credentials that never produced a
+			// signed request at all. No remote row, because nothing went remote.
+			name:     "credentials never resolve",
+			client:   &fakeMCP{tools: fresh},
+			creds:    failingCreds("no credentials anywhere"),
+			auth:     "fail",
+			remote:   "",
+			contains: []string{"no credentials anywhere"},
+		},
+		{
+			// The healthy run, kept in the table so the rows that must appear on
+			// success are pinned by the same case list as the ones that must not.
+			name:      "everything works",
+			client:    &fakeMCP{tools: fresh},
+			creds:     staticCreds(),
+			auth:      "ok",
+			remote:    "ok",
+			wantTools: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateAWSEnv(t)
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			t.Chdir(t.TempDir())
+			setupInstallCatalog(t, home, fresh)
+			var stdout, stderr bytes.Buffer
+			a := &app{
+				stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+				now: time.Now, httpClient: tc.client, credentials: tc.creds,
+			}
+			code := a.run([]string{"doctor", "--deep"})
+			rows := doctorRows(t, stdout.String())
+			if rows["auth"] != tc.auth {
+				t.Fatalf("auth row %q, want %q, in:\n%s", rows["auth"], tc.auth, stdout.String())
+			}
+			if got, ok := rows["remote"]; got != tc.remote || (tc.remote == "") == ok {
+				t.Fatalf("remote row %q (present=%v), want %q, in:\n%s", got, ok, tc.remote, stdout.String())
+			}
+			if _, ok := rows["tools"]; ok != tc.wantTools {
+				t.Fatalf("tools row present=%v, want %v, in:\n%s", ok, tc.wantTools, stdout.String())
+			}
+			// The cache row is reported from the state the run ends in, so a
+			// successful sync has to leave it passing — the regression that made a
+			// machine exit 1 having just rebuilt its own catalog.
+			if tc.wantTools && rows["cache"] != "ok" {
+				t.Fatalf("cache row %q, want ok, in:\n%s", rows["cache"], stdout.String())
+			}
+			wantCode := exitGeneric
+			if tc.auth == "ok" && tc.remote == "ok" {
+				wantCode = 0
+			}
+			if code != wantCode {
+				t.Fatalf("doctor exit %d, want %d, stdout:\n%s", code, wantCode, stdout.String())
+			}
+			for _, want := range tc.contains {
+				if !strings.Contains(stdout.String(), want) {
+					t.Fatalf("doctor should report %q, got:\n%s", want, stdout.String())
+				}
+			}
+		})
+	}
+}
+
+// The credentials row states what it found; it must not be read as a verdict on
+// what it found, because it contacted nothing to form one. #66's second
+// symptom, and the one most likely to be "tidied away" later by a maintainer
+// who finds the suffix wordy.
+func TestDoctorCredentialsRowDoesNotClaimToHaveVerifiedAnything(t *testing.T) {
+	isolateAWSEnv(t)
+	stdout, code := doctorCredentials(t, "has-static", refusingCreds(t))
+	if code != 0 {
+		t.Fatalf("doctor exit %d, stdout:\n%s", code, stdout)
+	}
+	want := "AWS profile has-static from aws_profile in config.toml — found, not verified"
+	if !strings.Contains(stdout, want) {
+		t.Fatalf("doctor should report %q, got:\n%s", want, stdout)
+	}
+}
+
+// A 401 has to survive into the machine document as a name a caller can branch
+// on, not only as prose. Asserted on a tool call rather than on doctor because
+// that is the command an agent runs when it is not expecting trouble, and
+// `"error": "failure"` is what it used to be told when its credentials had been
+// refused.
+//
+// The status lands on tools/call, not on the handshake: a fresh cache means the
+// call never needs a sync, so the first request that reaches the gateway is the
+// call itself.
+func TestToolCallNamesAGatewayRejectionAsAnAuthFailure(t *testing.T) {
+	isolateAWSEnv(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	fresh := []tool{{Name: "tools___search_aws", Description: "Search."}}
+	setupInstallCatalog(t, home, fresh)
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin: strings.NewReader(""), stdout: &stdout, stderr: &stderr,
+		now: time.Now, credentials: staticCreds(),
+		httpClient: &fakeMCP{tools: fresh, statusByMethod: map[string]int{"tools/call": http.StatusUnauthorized}},
+	}
+	if code := a.run([]string{"--format", "json", "tools___search_aws"}); code == 0 {
+		t.Fatalf("a rejected tool call should not exit 0, stdout:\n%s", stdout.String())
+	}
+	var doc struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(stderr.Bytes(), &doc); err != nil {
+		t.Fatalf("failure document is not JSON (%v): %s", err, stderr.String())
+	}
+	if doc.Error != "auth_failure" {
+		t.Fatalf("error name %q, want auth_failure, in: %s", doc.Error, stderr.String())
+	}
+	if !strings.Contains(doc.Message, "rejected the signed request") {
+		t.Fatalf("message %q should explain the rejection", doc.Message)
+	}
+}
+
+// failingCreds is a credential source that never produces a signed request,
+// which is the precise thing isAuthErr means and the first branch of doctor's
+// classification keys on.
+func failingCreds(msg string) credentialsFunc {
+	return func(context.Context, effectiveConfig) (aws.Credentials, string, error) {
+		return aws.Credentials{}, "", authError{errors.New(msg)}
 	}
 }
 

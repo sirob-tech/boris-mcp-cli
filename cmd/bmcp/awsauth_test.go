@@ -46,6 +46,14 @@ func isolateAWSEnv(t *testing.T) {
 		"AWS_PROFILE", "AWS_DEFAULT_PROFILE", "BMCP_PROFILE",
 		"AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY", "AWS_SECRET_KEY",
 		"AWS_SESSION_TOKEN", "AWS_ACCOUNT_ID",
+		// Cleared for the same reason as the keys it accompanies, and more
+		// urgently: aws-vault stamps it into every shell it opens, and a
+		// maintainer whose session has lapsed would otherwise run the suite with a
+		// *past* expiry in the environment — switching the demotion on underneath
+		// four #58 regression pins, which would then fail on a machine where
+		// nothing is wrong. A fixture that leaks this leaks a behaviour change,
+		// not just a value.
+		"AWS_CREDENTIAL_EXPIRATION",
 		"AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN", "AWS_ROLE_SESSION_NAME",
 		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
 		"AWS_CONTAINER_AUTHORIZATION_TOKEN",
@@ -333,6 +341,186 @@ func TestOutrankedProfileStillSuppliesItsRegion(t *testing.T) {
 	}
 }
 
+// #66's third symptom: environment credentials that have expired are
+// inescapable, and nothing says why.
+//
+// aws-sdk-go-v2/config does not read AWS_CREDENTIAL_EXPIRATION, so a lapsed
+// `aws-vault exec` shell hands the SDK static keys it believes can never
+// expire. They outrank the profile in config.toml, the SSO branch that would
+// have healed the run is unreachable because no profile was applied, and every
+// request 401s while bmcp reports a perfectly ordinary credential source.
+//
+// The table is written around the demotion's two edges, because both are ways
+// to get this wrong and only one of them is the bug. Demote too little and #66
+// stands; demote too eagerly and a long-lived IAM user key or a wrapper bmcp
+// does not understand loses to a profile that may be an unrelated identity —
+// which is #58 again, reintroduced from the other side.
+func TestExpiredEnvironmentCredentialsYieldToTheConfiguredProfile(t *testing.T) {
+	const (
+		past   = "2020-01-02T03:04:05Z"
+		future = "2099-01-02T03:04:05Z"
+	)
+	fileProfile := effectiveConfig{Profile: "has-static", ProfileSource: profileSourceFile, Region: "us-east-1"}
+	for _, tc := range []struct {
+		name string
+		env  func(t *testing.T)
+		cfg  effectiveConfig
+		// wantProfile is the profile handed to the SDK programmatically, and
+		// wantDemotion whether expired environment credentials are why.
+		wantProfile  string
+		wantDemotion bool
+		wantSource   string
+	}{
+		{
+			// The fix. The dead keys are treated as absent, so the profile wins and
+			// the message says the environment was passed over rather than leaving
+			// the operator to wonder why their aws-vault shell stopped counting.
+			name: "expired environment credentials yield to the profile",
+			env: func(t *testing.T) {
+				setEnvCredentials(t)
+				t.Setenv("AWS_CREDENTIAL_EXPIRATION", past)
+			},
+			cfg:          fileProfile,
+			wantProfile:  "has-static",
+			wantDemotion: true,
+			wantSource: "AWS profile has-static from aws_profile in config.toml, " +
+				"after the credentials in the environment were passed over as expired at " + past,
+		},
+		{
+			// Expired with nothing to fall back to. There is no demotion to make —
+			// sharedProfileFor returns at its first line with no profile at all — but
+			// the operator still has to be told, because these are the credentials
+			// that will be signed with and they are already dead.
+			name: "expired environment credentials with no profile to fall back to",
+			env: func(t *testing.T) {
+				setEnvCredentials(t)
+				t.Setenv("AWS_CREDENTIAL_EXPIRATION", past)
+			},
+			wantSource: "environment credentials (AWS_ACCESS_KEY_ID), which expired at " + past,
+		},
+		{
+			// The #58 behaviour, untouched: a live aws-vault session still outranks
+			// the profile in config.toml, which is the entire point of running bmcp
+			// under one.
+			name: "unexpired environment credentials still outrank the profile",
+			env: func(t *testing.T) {
+				setEnvCredentials(t)
+				t.Setenv("AWS_CREDENTIAL_EXPIRATION", future)
+			},
+			cfg:        fileProfile,
+			wantSource: "environment credentials (AWS_ACCESS_KEY_ID), which outrank AWS profile has-static from aws_profile in config.toml",
+		},
+		{
+			// A long-lived IAM user key names no expiry, and is the ordinary CI
+			// shape. Demoting it would be #58 all over again.
+			name:       "static keys with no expiration are untouched",
+			env:        setEnvCredentials,
+			cfg:        fileProfile,
+			wantSource: "environment credentials (AWS_ACCESS_KEY_ID), which outrank AWS profile has-static from aws_profile in config.toml",
+		},
+		{
+			// Evidence of a wrapper bmcp does not understand, not evidence that
+			// credentials are dead. Failing open here costs a confusing 401; failing
+			// closed would silently sign as a different identity over a typo.
+			name: "an unparseable expiration is not an expiry",
+			env: func(t *testing.T) {
+				setEnvCredentials(t)
+				t.Setenv("AWS_CREDENTIAL_EXPIRATION", "some time last tuesday")
+			},
+			cfg:        fileProfile,
+			wantSource: "environment credentials (AWS_ACCESS_KEY_ID), which outrank AWS profile has-static from aws_profile in config.toml",
+		},
+		{
+			// --profile already beat the environment, expired or not, so the expiry
+			// had no bearing on what resolved. Announcing it here would be a fresh
+			// instance of the dishonesty this change exists to remove.
+			name: "a profile named for this invocation does not advertise the expiry",
+			env: func(t *testing.T) {
+				setEnvCredentials(t)
+				t.Setenv("AWS_CREDENTIAL_EXPIRATION", past)
+			},
+			cfg:         effectiveConfig{Profile: "has-static", ProfileSource: profileSourceFlag, Region: "us-east-1"},
+			wantProfile: "has-static",
+			wantSource:  "AWS profile has-static from --profile",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateAWSEnv(t)
+			tc.env(t)
+			a := authTestApp()
+			profile, _, demotedAt := a.sharedProfileFor(tc.cfg)
+			if profile != tc.wantProfile {
+				t.Fatalf("profile %q, want %q", profile, tc.wantProfile)
+			}
+			if demotedAt.IsZero() == tc.wantDemotion {
+				t.Fatalf("demotedAt %v, want a demotion=%v", demotedAt, tc.wantDemotion)
+			}
+			if got := a.describeCredentialSource(tc.cfg); got != tc.wantSource {
+				t.Fatalf("source %q, want %q", got, tc.wantSource)
+			}
+		})
+	}
+
+	// And the demotion end to end, through the SDK, because everything above
+	// tests bmcp's own bookkeeping and none of it proves the SDK then resolves
+	// the profile. has-static resolves offline and carries a key distinct from
+	// the environment's, so only one of the two can produce this answer.
+	t.Run("the profile is what actually resolves", func(t *testing.T) {
+		isolateAWSEnv(t)
+		setEnvCredentials(t)
+		t.Setenv("AWS_CREDENTIAL_EXPIRATION", past)
+		cfg := fileProfile
+		cfg.NonInteractive = true
+		creds, _, err := authTestApp().awsCredentials(authTestContext(t), cfg)
+		if err != nil {
+			t.Fatalf("the profile should have resolved: %v", err)
+		}
+		if creds.AccessKeyID != profileKey {
+			t.Fatalf("resolved %q, want the profile's %q", creds.AccessKeyID, profileKey)
+		}
+	})
+}
+
+// The expiry is read against the injected clock, not the wall clock, so the
+// comparison is pinned on both sides of the instant rather than only on values
+// far enough from now to be safe by accident.
+func TestEnvCredentialsExpiredAtSitsOnBothSidesOfTheClock(t *testing.T) {
+	at := time.Date(2026, 9, 10, 16, 34, 1, 0, time.UTC)
+	for _, tc := range []struct {
+		name        string
+		now         time.Time
+		wantExpired bool
+	}{
+		{name: "a second after the expiry", now: at.Add(time.Second), wantExpired: true},
+		// Not yet expired at the instant itself: the SDK's own providers treat an
+		// expiry as the last moment the credentials are good, and a boundary that
+		// disagreed would demote a credential the signer would still have accepted.
+		{name: "at the expiry itself", now: at},
+		{name: "a second before the expiry", now: at.Add(-time.Second)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateAWSEnv(t)
+			setEnvCredentials(t)
+			t.Setenv("AWS_CREDENTIAL_EXPIRATION", at.Format(time.RFC3339))
+			a := authTestApp()
+			a.now = func() time.Time { return tc.now }
+			if got := a.envCredentialsExpiredAt(); got.IsZero() == tc.wantExpired {
+				t.Fatalf("expiredAt %v with now=%v, want expired=%v", got, tc.now, tc.wantExpired)
+			}
+		})
+	}
+
+	// No keys, no expiry to speak of — the variable alone describes nothing, and
+	// a web identity token carries its own expiry inside the token.
+	t.Run("the variable alone without static keys", func(t *testing.T) {
+		isolateAWSEnv(t)
+		t.Setenv("AWS_CREDENTIAL_EXPIRATION", at.Format(time.RFC3339))
+		if got := authTestApp().envCredentialsExpiredAt(); !got.IsZero() {
+			t.Fatalf("expiredAt %v, want the zero time", got)
+		}
+	})
+}
+
 // The truth table, stated once, with each expectation attached to the axis that
 // owns it rather than to a row's position in a parallel slice.
 //
@@ -402,7 +590,7 @@ func TestSharedProfileForHierarchy(t *testing.T) {
 					e.set(t)
 				}
 				want := !(s.yieldsToEnv && e.outranksProfile)
-				profile, outrankedBy := sharedProfileFor(effectiveConfig{Profile: "p", ProfileSource: s.source})
+				profile, outrankedBy, _ := authTestApp().sharedProfileFor(effectiveConfig{Profile: "p", ProfileSource: s.source})
 				if (profile != "") != want {
 					t.Fatalf("profile applied=%v (%q, outranked by %q), want applied=%v",
 						profile != "", profile, outrankedBy, want)
@@ -417,7 +605,7 @@ func TestSharedProfileForHierarchy(t *testing.T) {
 	t.Run("no profile at all", func(t *testing.T) {
 		isolateAWSEnv(t)
 		setEnvCredentials(t)
-		profile, outrankedBy := sharedProfileFor(effectiveConfig{})
+		profile, outrankedBy, _ := authTestApp().sharedProfileFor(effectiveConfig{})
 		if profile != "" || outrankedBy != "" {
 			t.Fatalf("no profile means nothing to apply and nothing to outrank, got %q/%q", profile, outrankedBy)
 		}
@@ -490,6 +678,34 @@ func TestAuthFailureNamesTheCredentialSource(t *testing.T) {
 				"which outrank AWS profile sso-only from aws_profile in config.toml",
 			},
 			absent: []string{"aws sso login"},
+		},
+		{
+			// #66. The environment's credentials expired, so the configured profile
+			// was preferred over them — and the failure has to say so, because the
+			// operator is looking at a message naming a profile they may not know is
+			// in play, in a shell whose whole purpose was to supply credentials.
+			//
+			// The two halves of this assertion are what keep R5 and R6 apart. The
+			// expiry is a fact about the credentials, so it rides inside
+			// describeCredentialSource and reaches "(using %s)" here; "found, not
+			// verified" is a fact about what doctor's credentials row tested, so it
+			// stays at that row and must never appear on an error path — this
+			// attempt verified the credentials by failing with them.
+			name: "expired environment credentials demoted to the configured profile",
+			env: func(t *testing.T) {
+				setEnvCredentials(t)
+				t.Setenv("AWS_CREDENTIAL_EXPIRATION", "2020-01-02T03:04:05Z")
+			},
+			cfg: effectiveConfig{
+				Profile:       "definitely-not-a-real-profile",
+				ProfileSource: profileSourceFile,
+				Region:        "us-east-1",
+			},
+			contains: []string{
+				"AWS profile definitely-not-a-real-profile from aws_profile in config.toml",
+				"after the credentials in the environment were passed over as expired at 2020-01-02T03:04:05Z",
+			},
+			absent: []string{"found, not verified"},
 		},
 		{
 			// And the converse: when the SSO profile *was* what resolution used, the
@@ -665,7 +881,7 @@ func TestDescribeCredentialSource(t *testing.T) {
 			if tc.env != nil {
 				tc.env(t)
 			}
-			if got := describeCredentialSource(tc.cfg); got != tc.want {
+			if got := authTestApp().describeCredentialSource(tc.cfg); got != tc.want {
 				t.Fatalf("got %q, want %q", got, tc.want)
 			}
 		})
@@ -831,7 +1047,7 @@ func TestInitPromptProfileNamesItselfHonestly(t *testing.T) {
 		t.Fatal("a profile typed at the prompt was named for this invocation")
 	}
 	want := "AWS profile has-static from the bmcp init prompt"
-	if got := describeCredentialSource(cfg); got != want {
+	if got := authTestApp().describeCredentialSource(cfg); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
@@ -2182,7 +2398,15 @@ func TestSSOLoginAfterAnAbandonedRetrievalStillReachesTheOperator(t *testing.T) 
 
 		// Now an SSO profile, whose retrieval cannot succeed here, so the login
 		// branch runs. Its subprocess must reach fd 2, not the sink.
-		_, _, err := a.awsCredentials(authTestContext(t), effectiveConfig{
+		//
+		// context.Background(), not authTestContext: awsCredentials declines to
+		// shell out to a device flow under a deadline, because the flow is a human
+		// walking to a browser and exec.CommandContext would kill it part-way. A
+		// bounded context here would skip the branch this case exists to observe.
+		// Safe without the helper's deadline because isolateAWSEnv above disables
+		// IMDS and clears the container variables, so nothing in this resolution
+		// has a link-local endpoint left to block on.
+		_, _, err := a.awsCredentials(context.Background(), effectiveConfig{
 			Profile:       "sso-only",
 			ProfileSource: profileSourceFile,
 			Region:        "us-east-1",

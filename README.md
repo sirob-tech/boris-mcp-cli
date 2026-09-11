@@ -266,9 +266,23 @@ it from a shell profile will quietly defeat `aws-vault exec` for every later
 call. Prefer `aws_profile` in `config.toml` for a standing default, and keep
 `BMCP_PROFILE` for a shell where you mean it.
 
+One exception to step 2, and the only case where `bmcp` departs from this order
+on its own: environment credentials stamped with an `AWS_CREDENTIAL_EXPIRATION`
+that has already passed — a lapsed `aws-vault exec` shell — are treated as
+absent, so the profile from step 3 wins after all. The AWS SDK does not read
+that variable, so without this those credentials are inescapable: it sees static
+keys it believes cannot expire, signs with them, and every request is rejected
+while no `aws_profile` in `config.toml` can take over. Credentials naming no
+expiration, or one still in the future, are untouched.
+
 Every `bmcp doctor` reports a `credentials` row naming the source a call would
 use, and an authentication failure names the one it tried — so a failure never
-sends you to repair a profile the call never consulted.
+sends you to repair a profile the call never consulted. That row ends in
+`— found, not verified`: it says what resolved locally, having contacted
+nothing. `bmcp doctor --deep` is what tests the credentials, in its `auth` and
+`remote` rows, and both come from a single attempt against the server. `auth`
+fails only when `bmcp` never produced a signed request or when the BORIS gateway
+refused the one it did; a connection that never arrives fails `remote` alone.
 
 Harness detection checks for a known executable on `PATH` or an existing config
 directory such as `~/.claude`, `~/.codex`, `~/.config/opencode`, `~/.cursor`,

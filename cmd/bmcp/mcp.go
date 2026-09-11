@@ -161,8 +161,50 @@ func isAuthErr(err error) bool {
 	return errors.As(err, &ae)
 }
 
+// httpStatusError carries the gateway's status code alongside the body it sent,
+// so callers can ask what the server actually said rather than matching on the
+// message text.
+//
+// The distinction it exists to draw is between "bmcp never produced a signed
+// request" — which is authError, decided entirely on this side — and "bmcp
+// signed a request and the gateway refused the identity in it". Only the server
+// can answer the second, and before this type the answer arrived as prose and
+// was indistinguishable from a 500 or a routing error.
+//
+// Deliberately not wrapped in authError. isAuthErr means "credentials never
+// produced a signed request", a pre-request invariant that awsauth.go's
+// remedies depend on; a 401 is the opposite case, and overloading the predicate
+// would send both down paths written for one of them.
+type httpStatusError struct {
+	status int
+	body   string
+}
+
+// The 401 hint rides on Error() rather than on doctor's row, so every path that
+// surfaces the error carries it: `bmcp <tool>`, `bmcp sync`, `bmcp serve` and
+// the failure document, not only the one command that classifies statuses.
+//
+// 401 alone. This gateway answers 401 for every credential failure measured
+// against it — an invalid signature and a wrong signing region both — and 400
+// for an unknown route, so 401 is the whole of the credential case. 403 is
+// excluded on purpose: nothing observed produces one, so a 403 arriving here
+// would have come from an interposed WAF or proxy, where naming the gateway and
+// the operator's credentials would be a misdiagnosis.
+func (e *httpStatusError) Error() string {
+	msg := fmt.Sprintf("remote MCP HTTP %d: %s", e.status, e.body)
+	if e.status == http.StatusUnauthorized {
+		msg += " (the BORIS gateway rejected the signed request, so the credentials it was signed with are not valid for it)"
+	}
+	return msg
+}
+
+func isGatewayAuthRejection(err error) bool {
+	var status *httpStatusError
+	return errors.As(err, &status) && status.status == http.StatusUnauthorized
+}
+
 func errorName(err error) string {
-	if isAuthErr(err) {
+	if isAuthErr(err) || isGatewayAuthRejection(err) {
 		return "auth_failure"
 	}
 	if errors.Is(err, errUpstream) {
@@ -398,7 +440,7 @@ func (c *mcpClient) rpc(ctx context.Context, rpcReq jsonRPCRequest, expectRespon
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("remote MCP HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return nil, &httpStatusError{status: resp.StatusCode, body: strings.TrimSpace(string(respBody))}
 	}
 	if !expectResponse {
 		return nil, nil
