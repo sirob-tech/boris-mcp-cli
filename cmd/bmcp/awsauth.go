@@ -439,12 +439,14 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 	if usesSSO && deviceFlowFits(ctx) && !cfg.NonInteractive && !a.machine && a.isInteractive() {
 		fmt.Fprintf(a.prose(), "AWS SSO credentials for profile %s are expired or missing. Running aws sso login --profile %s\n", profile, profile)
 		cmd := exec.CommandContext(ctx, "aws", "sso", "login", "--profile", profile)
-		// The pinned descriptor, not os.Stderr: a retrieval abandoned earlier in
-		// this run may have left the variable pointing at /dev/null on purpose, and
-		// this subprocess is not the one that sink exists to contain. Handing it the
-		// global destroyed the verification URL and user code, leaving bmcp blocked
-		// on a device flow with nothing on screen to answer.
-		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, a.subprocessStderr(), a.subprocessStderr()
+		// The pinned descriptors, not the globals: a retrieval abandoned earlier in
+		// this run may have left either variable pointing at /dev/null on purpose,
+		// and this subprocess is not the one those sinks exist to contain. Handing
+		// it the global stderr destroyed the verification URL and user code, leaving
+		// bmcp blocked on a device flow with nothing on screen to answer; handing it
+		// the global stdin would give `aws sso login` end-of-file for the one prompt
+		// it may still need.
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = a.subprocessStdin(), a.subprocessStderr(), a.subprocessStderr()
 		if runErr := cmd.Run(); runErr != nil {
 			// Carrying the failure the login was trying to repair, because the branch
 			// is chosen from configuration now and fires for causes a login cannot
@@ -495,16 +497,29 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 }
 
 // retrieveCredentials resolves credentials with a credential_process helper's
-// stderr pointed wherever this invocation can afford to have it.
+// stderr and stdin each pointed wherever this invocation can afford to have it —
+// two streams under two different policies, decided below.
 //
-// #61. processcreds hands the helper the process-global os.Stderr —
-// DefaultNewCommandBuilder.NewCommand, "display stderr on console for MFA" — and
-// reads that variable when Retrieve builds the command. So the helper writes to
-// fd 2 directly, outside everything bmcp renders and outside everything #60
-// withholds: a helper with tracing on echoes the credential JSON it just
-// printed, on *success*, into whatever is capturing that descriptor. That is a
-// CI log or an agent transcript, and under a machine format it is also the
-// stream bmcp promised would carry nothing but one parseable document.
+// #61 and #65. processcreds hands the helper the process-global os.Stderr *and*
+// os.Stdin — DefaultNewCommandBuilder.NewCommand, "display stderr on console for
+// MFA" and "enable stdin for MFA" — and reads both variables when Retrieve
+// builds the command. Each is a defect, in opposite directions.
+//
+// Outward (#61): the helper writes to fd 2 directly, outside everything bmcp
+// renders and outside everything #60 withholds. A helper with tracing on echoes
+// the credential JSON it just printed, on *success*, into whatever is capturing
+// that descriptor. That is a CI log or an agent transcript, and under a machine
+// format it is also the stream bmcp promised would carry nothing but one
+// parseable document.
+//
+// Inward (#65): the helper *reads* fd 0, which for `echo '{...}' | bmcp call
+// <tool>` is the payload runCall has not read yet — credentials resolve first,
+// through cacheForCatalog. A helper that reads stdin at all, which is what a
+// wrapper prompting with `read -r code` does by accident, consumes it. bmcp then
+// finds stdin empty, falls back to payload "{}", and calls the tool with no
+// arguments at all — reporting ok:true and exit 0. A wrong answer wearing the
+// shape of a right one, and the only defect in this file that is silent on the
+// success path.
 //
 // The config API cannot reach the assignment — Provider.commandBuilder is
 // unexported and processcreds.Options carries only Timeout and
@@ -523,24 +538,52 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 // is not always safe to put back.
 //
 // It wraps Retrieve and nothing else on purpose: the `aws sso login` branch
-// above deliberately hands its subprocess os.Stderr, and that is a browser
-// prompt an operator needs to see.
+// above deliberately hands its subprocess the real fd 0 and fd 2, and that is a
+// browser prompt an operator needs to see and answer.
 func (a *app) retrieveCredentials(ctx context.Context, cfg effectiveConfig, provider aws.CredentialsProvider) (aws.Credentials, error) {
-	// An earlier retrieval was abandoned with the sink still installed, and the
-	// goroutine that outlived it may still read os.Stderr to build its command.
-	// So the variable is left exactly as it is: no second sink, no restore. It
-	// already points at /dev/null, which is the containment this function exists
-	// for, so there is nothing to do but retrieve.
+	// An earlier retrieval was abandoned with a sink still installed, and the
+	// goroutine that outlived it may still read that variable to build its
+	// command. Recording the discard is all there is to do here; what keeps the
+	// variable from being touched again is the `a.stderrSunk ||` and
+	// `a.stdinSunk ||` disjunct in each policy below, which answers "keep" for a
+	// latched stream and so opens no second sink and registers no restore.
 	//
-	// Returning here also declines to re-run the policy, which would answer on a
-	// descriptor that is now /dev/null rather than on fd 2. That costs an operator
-	// at a terminal the MFA prompt for the rest of a run in which a retrieval was
-	// already abandoned — the conservative direction, and the same one the sink
-	// itself takes.
+	// That also declines to re-run the policy for that stream. For stderr it costs
+	// an operator at a terminal the MFA prompt for the rest of a run in which a
+	// retrieval was already abandoned — the conservative direction, and the same
+	// one the sink itself takes.
 	if a.stderrSunk {
 		a.helperStderrDiscarded = true
-		return provider.Retrieve(ctx)
 	}
+	if a.stdinSunk {
+		a.helperStdinDiscarded = true
+	}
+	// Two streams, two policies, decided separately — which is the correction #65
+	// turns on. Its own issue text proposed putting stdin behind the stderr gate;
+	// that gate is an early return leaving both descriptors alone, and it fires
+	// for precisely the shape that loses the payload. `echo '{...}' | bmcp call
+	// <tool>` at a terminal has fd 2 on the tty and fd 0 on the pipe, so a shared
+	// gate answers "keep" and hands the helper the payload. The questions are
+	// different because the streams are: one asks who can *see* fd 2, the other
+	// asks who is *reading* fd 0.
+	//
+	// One consequence of splitting them is worth naming, because it used to be
+	// structural and is now an invariant held up from outside. Before, a single
+	// `if a.stderrSunk { return }` meant one abandonment froze both globals for
+	// the rest of the run. Now a latch on one stream does not stop a write to the
+	// other, so "no global is written while an abandoned goroutine may read it"
+	// holds only because neither policy can change between retrievals.
+	//
+	// Each input is fixed before the first one: a.machine and a.ownsStdin are set
+	// before anything resolves credentials (selectOutput before dispatch, and
+	// cmdServe and runCall each ahead of their own first resolution),
+	// cfg.NonInteractive comes from a flag or the environment, and
+	// stderrIsTerminal reads a descriptor pinned in run(). Note that "fixed before
+	// the first retrieval" is the property, not "only ever goes false to true" —
+	// a monotonic flag that flipped after an abandonment would write os.Stdin
+	// under the goroutine that abandonment left behind. If any of these becomes
+	// per-command, this needs a real guard rather than an argument.
+	//
 	// The MFA prompt the SDK's comment protects is worth keeping only where all
 	// three of these hold: someone is watching fd 2, bmcp has not promised to keep
 	// that stream free of prose, and this invocation has not declared that nothing
@@ -550,15 +593,6 @@ func (a *app) retrieveCredentials(ctx context.Context, cfg effectiveConfig, prov
 	// buys nothing, so keeping it is pure exposure. That matters because of the
 	// residual case below.
 	//
-	// Note what this does *not* establish. The SSO branch above asks
-	// a.isInteractive(), which tests stdin; this asks about stderr, and
-	// cfg.NonInteractive is only a flag or an environment variable. So a run with
-	// stdin redirected and the flag unset keeps the helper's stderr visible even
-	// though nothing can type an MFA code at it. Narrowing that means adding the
-	// stdin test here too, which would take the prompt away from helpers that read
-	// /dev/tty or a hardware token rather than stdin — a live question, not an
-	// oversight.
-	//
 	// The residual case, measured rather than assumed: a *pty* is a character
 	// device, so `script -q log bmcp <tool>`, `docker run -t`, `ssh -t` and a
 	// logging tmux pane all look exactly like an operator's own terminal here and
@@ -567,68 +601,157 @@ func (a *app) retrieveCredentials(ctx context.Context, cfg effectiveConfig, prov
 	// narrow the branch by something other than the descriptor, which is what
 	// a.machine and cfg.NonInteractive do, and to say plainly that a human-format
 	// interactive run under a recorder is still exposed.
-	if !a.machine && !cfg.NonInteractive && a.stderrIsTerminal() {
+	keepStderr := a.stderrSunk || (!a.machine && !cfg.NonInteractive && a.stderrIsTerminal())
+	// Stdin asks something else entirely, and deliberately not a terminal test.
+	// Whether a *person* is typing at fd 0 is not the question; whether *bmcp* is
+	// reading it is. a.ownsStdin says so, and it is set by `bmcp call` when its
+	// payload is arriving on stdin and by `bmcp serve` for the whole session.
+	//
+	// A third reader declines to set it: the `bmcp init` wizard, which prompts,
+	// syncs, and then prompts again — so a helper spawned by that sync does
+	// inherit the descriptor its later answers arrive on. Left that way on
+	// purpose. The wizard runs only when fd 0 is a character device, which means
+	// an operator is there, and first-run setup is the resolution most likely to
+	// need an MFA prompt of its own; taking fd 0 away from the helper there would
+	// trade a real prompt for a typed-ahead answer nobody has reported losing.
+	//
+	// A terminal test was the obvious gate and is wrong. It also fires for
+	// `printf %s "$MFA_CODE" | bmcp call <tool> '{"query":"x"}'`, where the
+	// payload came from argv and the pipe was put there *for the helper* — so
+	// bmcp would answer a working setup with end-of-file to protect a payload
+	// that was never on that descriptor. saml2aws hands os.Stdin to its prompter,
+	// gimme-aws-creds reads it with input(), and a `vault login token=-` shim
+	// needs it; none of them are bmcp's to break. The same applies to every
+	// command that never reads stdin at all — sync, doctor, list, describe — which
+	// a terminal test would have sunk for no benefit.
+	//
+	// Where bmcp does own the descriptor there is no prompt to preserve, because
+	// the bytes on it are bmcp's. A helper that blocks waiting for input then
+	// reads end-of-file rather than eating the call's arguments or the client's
+	// protocol frames, which is the more honest failure.
+	//
+	// This is also the conjunct the stderr policy above notes it does not
+	// establish, and it still does not: a run with stdin redirected and
+	// --non-interactive unset keeps the helper's *stderr* visible even though
+	// nothing can type at it. Deliberately left, because helpers that read
+	// /dev/tty or a hardware token prompt without fd 0, and taking their prompt
+	// away is a separate decision from protecting the payload.
+	keepStdin := a.stdinSunk || !a.ownsStdin
+	if keepStderr && keepStdin {
 		return provider.Retrieve(ctx)
 	}
-	sink, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	if err != nil {
-		// Failing closed, but only where there is something to contain. Refusing
-		// unconditionally would fail static keys, SSO, web identity and IMDS —
-		// none of which spawn a subprocess — and would explain the refusal in
-		// terms of a credential_process helper the profile may not even have.
-		if chainRunsACredentialProcess(provider) {
-			return aws.Credentials{}, fmt.Errorf("cannot open %s to contain a credential_process helper's output: %w", os.DevNull, err)
+	// Both sinks are opened before either is installed, so a failure on the second
+	// cannot leave the first swapped in with no restore arranged. They are two
+	// opens rather than one descriptor used twice because the modes differ: the
+	// helper writes to fd 2 and reads fd 0, and /dev/null opened write-only is not
+	// a readable stdin.
+	var errSink, inSink *os.File
+	if !keepStderr {
+		f, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+		if err != nil {
+			return a.retrieveWithoutSinks(ctx, provider, err)
 		}
-		return provider.Retrieve(ctx)
+		errSink = f
 	}
-	a.helperStderrDiscarded = true
-	// The pinned startup descriptor, not os.Stderr. Reading the global here meant
-	// that a second call after an abandoned one saved the *first* call's sink as
-	// the thing to restore, installed /dev/null permanently, and closed the
-	// descriptor the live retrieval was using rather than the stale one.
-	restore := a.subprocessStderr()
-	os.Stderr = sink
-	// Put back only when the retrieval actually finished — and left in place,
-	// still open, when it did not.
-	//
-	// The claim above that nothing races this is true of bmcp and false of the
-	// SDK, in the one call it has to hold for. LoadDefaultConfig always wraps the
-	// provider in an aws.CredentialsCache (config's wrapWithCredentialsCache),
-	// whose Retrieve runs the real provider on a singleflight goroutine and then
-	// selects on the caller's ctx.Done(). On a cancelled or expired context it
-	// abandons that goroutine and returns — and the goroutine is handed a
-	// suppressedContext, whose Done() is nil and Deadline() reports none, so
-	// nothing ever stops it. It reaches NewCommand afterwards, reads os.Stderr
-	// *then*, and runs the helper with whatever the variable now holds.
-	//
-	// Restoring on that path therefore hands the helper the captured descriptor
-	// after bmcp has already reported failure, which is exactly the disclosure
-	// this function exists to prevent. Reproduced 3/3 before this check existed.
-	// Closing the sink instead is no better: exec starts the child anyway, with
-	// fd 2 closed, so the first file the helper opens becomes its stderr.
-	//
-	// So the sink stays, the fd is leaked on purpose, and stderrSunk records it.
-	// The latch is what the first version of this rule lacked: the run does not
-	// necessarily end here — a failed sync is downgraded to a warning and the run
-	// continues (see cacheForCatalog), resolving credentials again on a fresh
-	// context — and without the latch that second call reassigned os.Stderr
-	// underneath a goroutine still reading it, which could hand a helper a closed
-	// descriptor and made the write a data race besides.
-	//
-	// ctx.Err() == nil is the conservative side of the test: it can only be nil
-	// if Retrieve returned through the channel, which happens after the
-	// goroutine's work is done. A context that expires just after a successful
-	// retrieval merely keeps the sink for the rest of the run, which costs
-	// nothing. This is a fact about aws-sdk-go-v2's cache, so it is worth
-	// re-checking on an SDK bump.
-	defer func() {
-		if ctx.Err() != nil {
-			a.stderrSunk = true
-			return
+	if !keepStdin {
+		f, err := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
+		if err != nil {
+			if errSink != nil {
+				errSink.Close()
+			}
+			return a.retrieveWithoutSinks(ctx, provider, err)
 		}
-		os.Stderr = restore
-		sink.Close()
-	}()
+		inSink = f
+	}
+	if inSink != nil {
+		a.helperStdinDiscarded = true
+		// The pinned startup descriptor rather than the global, for the reason the
+		// stderr restore below gives. Reaching this line needs !a.stdinSunk, and
+		// only the abandonment path leaves a sink installed, so the two agree
+		// here today — the pin is the source that cannot go wrong rather than a
+		// repair for a state this line can reach.
+		restoreStdin := a.subprocessStdin()
+		os.Stdin = inSink
+		// The same restore rule as stderr's below, for the same abandoned
+		// goroutine: it reads os.Stdin when it reaches NewCommand, which is after
+		// a cancelled Retrieve has already returned. Putting fd 0 back on that path
+		// hands the helper the payload this function exists to protect — the very
+		// collision, merely later. So the sink stays and stdinSunk records it.
+		defer func() {
+			if ctx.Err() != nil {
+				a.stdinSunk = true
+				return
+			}
+			os.Stdin = restoreStdin
+			inSink.Close()
+		}()
+	}
+	if errSink != nil {
+		a.helperStderrDiscarded = true
+		// The pinned startup descriptor, not os.Stderr. Reading the global here
+		// meant that a second call after an abandoned one saved the *first* call's
+		// sink as the thing to restore, installed /dev/null permanently, and closed
+		// the descriptor the live retrieval was using rather than the stale one.
+		restore := a.subprocessStderr()
+		os.Stderr = errSink
+		// Put back only when the retrieval actually finished — and left in place,
+		// still open, when it did not.
+		//
+		// The claim above that nothing races this is true of bmcp and false of the
+		// SDK, in the one call it has to hold for. LoadDefaultConfig always wraps
+		// the provider in an aws.CredentialsCache (config's
+		// wrapWithCredentialsCache), whose Retrieve runs the real provider on a
+		// singleflight goroutine and then selects on the caller's ctx.Done(). On a
+		// cancelled or expired context it abandons that goroutine and returns — and
+		// the goroutine is handed a suppressedContext, whose Done() is nil and
+		// Deadline() reports none, so nothing ever stops it. It reaches NewCommand
+		// afterwards, reads os.Stderr *then*, and runs the helper with whatever the
+		// variable now holds.
+		//
+		// Restoring on that path therefore hands the helper the captured descriptor
+		// after bmcp has already reported failure, which is exactly the disclosure
+		// this function exists to prevent. Reproduced 3/3 before this check
+		// existed. Closing the sink instead is no better: exec starts the child
+		// anyway, with fd 2 closed, so the first file the helper opens becomes its
+		// stderr.
+		//
+		// So the sink stays, the fd is leaked on purpose, and stderrSunk records
+		// it. The latch is what the first version of this rule lacked: the run does
+		// not necessarily end here — a failed sync is downgraded to a warning and
+		// the run continues (see cacheForCatalog), resolving credentials again on a
+		// fresh context — and without the latch that second call reassigned
+		// os.Stderr underneath a goroutine still reading it, which could hand a
+		// helper a closed descriptor and made the write a data race besides.
+		//
+		// ctx.Err() == nil is the conservative side of the test: it can only be nil
+		// if Retrieve returned through the channel, which happens after the
+		// goroutine's work is done. A context that expires just after a successful
+		// retrieval merely keeps the sink for the rest of the run, which costs
+		// nothing. This is a fact about aws-sdk-go-v2's cache, so it is worth
+		// re-checking on an SDK bump.
+		defer func() {
+			if ctx.Err() != nil {
+				a.stderrSunk = true
+				return
+			}
+			os.Stderr = restore
+			errSink.Close()
+		}()
+	}
+	return provider.Retrieve(ctx)
+}
+
+// retrieveWithoutSinks is what retrieveCredentials does when /dev/null cannot be
+// opened: fail closed where there is something to contain, and otherwise get on
+// with the retrieval.
+//
+// Refusing unconditionally would fail static keys, SSO, web identity and IMDS —
+// none of which spawn a subprocess — and would explain the refusal in terms of a
+// credential_process helper the profile may not even have.
+func (a *app) retrieveWithoutSinks(ctx context.Context, provider aws.CredentialsProvider, err error) (aws.Credentials, error) {
+	if chainRunsACredentialProcess(provider) {
+		return aws.Credentials{}, fmt.Errorf("cannot open %s to contain a credential_process helper's streams: %w", os.DevNull, err)
+	}
 	return provider.Retrieve(ctx)
 }
 
@@ -733,14 +856,24 @@ func (a *app) credentialProcessFailure(cfg effectiveConfig, err error) error {
 		// name something that is not a status and lose the fact that it was killed.
 		cause = "was killed before it returned credentials, which is what happens when it overruns its timeout"
 	}
-	// Naming the discard, when there was one. Withholding the SDK's error text
+	// Naming the discards, when there were any. Withholding the SDK's error text
 	// leaves the helper's own diagnostics as the operator's next step, and #61
 	// took those away too — so a message that only said "run it yourself" would
 	// let an empty CI log read as "the helper printed nothing" when bmcp is what
 	// threw it away.
+	//
+	// The stdin line is the same courtesy for a failure bmcp *caused*: #65 gives a
+	// helper /dev/null to read wherever nobody is typing, so one that prompts sees
+	// end-of-file and whatever it does next — exit non-zero, return nothing —
+	// arrives here as the helper's own fault with nothing to say bmcp closed the
+	// input. It also tells the operator why running the helper themselves, at a
+	// terminal, may succeed where bmcp did not.
 	discarded := ""
 	if a.helperStderrDiscarded {
 		discarded = ", and anything it wrote to stderr was discarded rather than shown here, for the same reason"
+	}
+	if a.helperStdinDiscarded {
+		discarded += ". Its stdin was /dev/null, so a helper that prompts for input read end-of-file — bmcp does that when it is reading fd 0 itself, to keep the helper from consuming the payload of the call or the frames of a serve session"
 	}
 	return fmt.Errorf("credential_process helper %s (using %s). Run the helper yourself to see what it printed — its output is withheld here because it can contain live credentials%s", cause, a.describeCredentialSource(cfg), discarded)
 }
