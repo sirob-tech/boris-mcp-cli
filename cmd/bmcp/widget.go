@@ -7,16 +7,23 @@ import (
 
 // The widget the host mounts for a finder call, and a static shell by
 // necessity: the host reads this resource while the tool input is still
-// streaming, so a drawing inlined here could only be the previous call's. The
-// picture arrives instead on the call's own result, which the host forwards as
-// ui/notifications/tool-result.
+// streaming, so a drawing inlined here could only be the previous call's.
+// It asks for its own call's drawing instead, named by the arguments the host
+// hands it — the one thing both ends of this can see.
 const widgetTemplate = `<div style="font:13px system-ui,-apple-system,sans-serif">
 <div id="pic"><p style="color:#6b7280">Drawing the neighbourhood…</p></div>
 </div>
 <script>
 (function () {
-  var handshakeId = 1;
+  var nextId = 1, pending = {}, asked = false;
   function send(m) { window.parent.postMessage(m, "*"); }
+  function call(method, params) {
+    return new Promise(function (resolve, reject) {
+      var id = nextId++;
+      pending[id] = { resolve: resolve, reject: reject };
+      send({ jsonrpc: "2.0", id: id, method: method, params: params });
+    });
+  }
   function size() {
     var r = document.body.getBoundingClientRect();
     send({ jsonrpc: "2.0", method: "ui/notifications/size-changed",
@@ -26,34 +33,62 @@ const widgetTemplate = `<div style="font:13px system-ui,-apple-system,sans-serif
     document.getElementById("pic").innerHTML = html;
     size();
   }
+  // Keyed the way the server keys it: sorted keys, no HTML escaping, FNV-1a
+  // over the UTF-8 bytes.
+  function canon(v) {
+    if (v === null || typeof v !== "object") return JSON.stringify(v);
+    if (Array.isArray(v)) return "[" + v.map(canon).join(",") + "]";
+    return "{" + Object.keys(v).sort().map(function (k) {
+      return JSON.stringify(k) + ":" + canon(v[k]);
+    }).join(",") + "}";
+  }
+  function digest(args) {
+    var bytes = new TextEncoder().encode(canon(args || {})), h = 2166136261;
+    for (var i = 0; i < bytes.length; i++) {
+      h = (h ^ bytes[i]) >>> 0;
+      h = Math.imul(h, 16777619) >>> 0;
+    }
+    return h.toString(16);
+  }
+  // The arguments name the call, so the drawing asked for here is this call's
+  // and no other. The server holds the answer until that call has run.
+  function fetchPicture(args) {
+    if (asked) return;
+    asked = true;
+    call("resources/read", { uri: %q + "?call=" + digest(args) }).then(function (res) {
+      var svg = res && res.contents && res.contents[0] && res.contents[0].text;
+      settle(svg || '<p style="color:#6b7280">No graph for this answer.</p>');
+    }).catch(function () {
+      settle('<p style="color:#6b7280">Could not reach bmcp for this picture.</p>');
+    });
+  }
   window.addEventListener("message", function (e) {
     var d = e.data;
     if (!d || d.jsonrpc !== "2.0") return;
-    // The picture for THIS call, and the only message that carries one. An
-    // answer that drew nothing lands here too, so the placeholder never sticks.
-    if (d.method === "ui/notifications/tool-result") {
-      var svg = d.params && d.params._meta && d.params._meta[%q];
-      settle(svg || '<p style="color:#6b7280">No graph for this answer.</p>');
+    if (d.method === "ui/notifications/tool-input") {
+      fetchPicture(d.params && d.params.arguments);
       return;
     }
-    // A host forwards the result only to a widget that announced itself, so
-    // this notification is what arms the message above.
-    if (d.id === handshakeId) {
-      send({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} });
-    }
+    if (d.id === undefined || !pending[d.id]) return;
+    var p = pending[d.id];
+    delete pending[d.id];
+    if (d.error) p.reject(new Error(d.error.message || "error")); else p.resolve(d.result);
   });
   new ResizeObserver(size).observe(document.body);
 
-  send({ jsonrpc: "2.0", id: handshakeId, method: "ui/initialize", params: {
+  call("ui/initialize", {
     protocolVersion: "2025-11-21",
     appInfo: { name: "bmcp", version: %q },
     appCapabilities: {}
-  }});
+  }).then(function () {
+    // A host sends the tool input only to a widget that has announced itself.
+    send({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} });
+  });
 })();
 </script>`
 
 func widgetHTML() string {
-	return fmt.Sprintf(widgetTemplate, pictureField, version)
+	return fmt.Sprintf(widgetTemplate, pictureURI, version)
 }
 
 // fitWithinPanel makes the drawing responsive without resizing what is in it.

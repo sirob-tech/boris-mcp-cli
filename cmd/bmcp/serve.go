@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 )
 
 // bmcp as an MCP server: it re-exports the remote catalog over stdio so an IDE
@@ -18,6 +19,10 @@ import (
 const (
 	widgetURI  = "ui://boris/graph.html"
 	widgetMIME = "text/html;profile=mcp-app"
+	// Read by the widget, for the call that mounted it. The shell above is
+	// static and every drawing is fetched through here.
+	pictureURI  = "ui://boris/graph.svg"
+	pictureMIME = "image/svg+xml"
 	// The version to answer with when a client sends none. A client that names
 	// one gets its own back: the methods below are common to every revision the
 	// client half of this binary speaks.
@@ -45,10 +50,18 @@ type server struct {
 	cfg   effectiveConfig
 	cache *toolCache
 
-	// apps records whether the client negotiated MCP Apps at initialize. Nothing
-	// about the picture is offered without it, since no widget can mount to
-	// receive it.
+	// Requests are answered concurrently, so a widget asking for its own
+	// picture does not sit behind the call that draws it.
+	mu   sync.RWMutex
 	apps bool
+
+	desk *pictureDesk
+}
+
+func (s *server) appsOn() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.apps
 }
 
 // cmdServe speaks MCP over stdin and stdout until the client closes the pipe.
@@ -88,7 +101,7 @@ func (a *app) cmdServe(flags globalFlags, args []string) int {
 		return a.fail(flags, code, errorName(err), err.Error())
 	}
 
-	s := &server{a: a, flags: flags, cfg: cfg, cache: cache}
+	s := &server{a: a, flags: flags, cfg: cfg, cache: cache, desk: newPictureDesk()}
 	if err := s.run(a.stdin, a.stdout); err != nil {
 		return a.fail(flags, exitGeneric, "serve_failed", err.Error())
 	}
@@ -99,6 +112,13 @@ func (s *server) run(stdin io.Reader, stdout io.Writer) error {
 	in := bufio.NewScanner(stdin)
 	in.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	out := bufio.NewWriter(stdout)
+	// One reply reaches stdout at a time; the order between them is the
+	// client's to reassemble by id.
+	var writing sync.Mutex
+	// A closed pipe does not cancel the replies already being worked on, so
+	// they are waited for rather than dropped half-written.
+	var handling sync.WaitGroup
+	defer handling.Wait()
 	for in.Scan() {
 		line := strings.TrimSpace(in.Text())
 		if line == "" {
@@ -108,27 +128,39 @@ func (s *server) run(stdin io.Reader, stdout io.Writer) error {
 		if err := json.Unmarshal([]byte(line), &req); err != nil {
 			continue
 		}
-		result, rpcErr := s.handle(req)
-		// A notification carries no id and takes no reply, whatever it produced.
-		if len(req.ID) == 0 {
+		respond := func() {
+			result, rpcErr := s.handle(req)
+			// A notification carries no id and takes no reply, whatever it produced.
+			if len(req.ID) == 0 {
+				return
+			}
+			reply := map[string]any{"jsonrpc": "2.0", "id": req.ID}
+			if rpcErr != nil {
+				reply["error"] = rpcErr
+			} else {
+				reply["result"] = result
+			}
+			encoded, err := json.Marshal(reply)
+			if err != nil {
+				return
+			}
+			writing.Lock()
+			defer writing.Unlock()
+			if _, err := out.Write(append(encoded, '\n')); err == nil {
+				_ = out.Flush()
+			}
+		}
+		// Answered before anything else is dispatched: what it negotiates
+		// decides what every later frame is allowed to see.
+		if req.Method == "initialize" {
+			respond()
 			continue
 		}
-		reply := map[string]any{"jsonrpc": "2.0", "id": req.ID}
-		if rpcErr != nil {
-			reply["error"] = rpcErr
-		} else {
-			reply["result"] = result
-		}
-		encoded, err := json.Marshal(reply)
-		if err != nil {
-			return err
-		}
-		if _, err := out.Write(append(encoded, '\n')); err != nil {
-			return err
-		}
-		if err := out.Flush(); err != nil {
-			return err
-		}
+		handling.Add(1)
+		go func() {
+			defer handling.Done()
+			respond()
+		}()
 	}
 	return in.Err()
 }
@@ -143,7 +175,9 @@ func (s *server) handle(req serveRequest) (any, *rpcError) {
 			} `json:"capabilities"`
 		}
 		_ = json.Unmarshal(req.Params, &params)
+		s.mu.Lock()
 		_, s.apps = params.Capabilities.Extensions[uiExtensionID]
+		s.mu.Unlock()
 		if params.ProtocolVersion == "" {
 			params.ProtocolVersion = serveProtocolVersion
 		}
@@ -152,7 +186,7 @@ func (s *server) handle(req serveRequest) (any, *rpcError) {
 		// the resources capability alone into a model-facing read tool that is
 		// not restricted to listed resources, which would let a model pull the
 		// widget's markup into its own context by guessing the URI.
-		if s.apps {
+		if s.appsOn() {
 			capabilities["resources"] = map[string]any{}
 		}
 		return map[string]any{
@@ -202,7 +236,7 @@ func (s *server) tools() []serveTool {
 			Description: t.Description,
 			InputSchema: objectSchema(t.InputSchema),
 		}
-		if s.apps && wantsPicture(t.Name) {
+		if s.appsOn() && wantsPicture(t.Name) {
 			entry.Meta = map[string]any{"ui": map[string]any{"resourceUri": widgetURI}}
 		}
 		out = append(out, entry)
@@ -239,12 +273,15 @@ func (s *server) callTool(raw json.RawMessage) (any, *rpcError) {
 	}
 	// Asked for after Validate, which runs against the advertised schema and
 	// does not declare the marker.
-	drawing := s.apps && wantsPicture(t.Name)
+	drawing := s.appsOn() && wantsPicture(t.Name)
+	call := ""
 	if drawing {
+		call = callDigest(params.Arguments)
 		input = withPictureRequest(input)
 	}
 	result, err := s.a.callTool(context.Background(), s.cfg, t.Name, input)
 	if err != nil {
+		s.desk.publish(call, "")
 		// An upstream failure carries the whole remote body in its message, so
 		// it is a markup path like any other.
 		return toolFailure(scrubMarkup(err.Error())), nil
@@ -253,21 +290,15 @@ func (s *server) callTool(raw json.RawMessage) (any, *rpcError) {
 	// Stripped unconditionally, not only for the tools this build expects to
 	// render: the field is the gateway's to send, and the list here is a guess.
 	stripped, svg := stripPicture(result)
+	if drawing {
+		s.desk.publish(call, fitWithinPanel(svg))
+	}
 	if stripped == nil {
 		return toolFailure("the answer carried a graph picture that could not be separated from it"), nil
 	}
-	answer := map[string]any{
+	return map[string]any{
 		"content": []any{map[string]any{"type": "text", "text": string(stripped)}},
-	}
-	// A host reads the ui:// resource before this call is dispatched, so a
-	// drawing inlined there is always the previous call's; the result's own
-	// _meta arrives with the call it belongs to and is kept out of the model's
-	// request. The result's _meta, never a content block's — that one does
-	// reach the model.
-	if drawing && svg != "" {
-		answer["_meta"] = map[string]any{pictureField: fitWithinPanel(svg)}
-	}
-	return answer, nil
+	}, nil
 }
 
 func toolFailure(msg string) any {
@@ -282,7 +313,17 @@ func (s *server) readResource(raw json.RawMessage) (any, *rpcError) {
 		URI string `json:"uri"`
 	}
 	_ = json.Unmarshal(raw, &params)
-	if !s.apps || (params.URI != "" && params.URI != widgetURI) {
+	if !s.appsOn() {
+		return nil, &rpcError{Code: -32602, Message: "unknown resource: " + params.URI}
+	}
+	if call, ok := pictureRequest(params.URI); ok {
+		return map[string]any{"contents": []any{map[string]any{
+			"uri":      params.URI,
+			"mimeType": pictureMIME,
+			"text":     s.desk.collect(call, pictureWait),
+		}}}, nil
+	}
+	if params.URI != "" && params.URI != widgetURI {
 		return nil, &rpcError{Code: -32602, Message: "unknown resource: " + params.URI}
 	}
 	return map[string]any{"contents": []any{map[string]any{
@@ -391,4 +432,13 @@ func scrubMarkup(text string) string {
 		return text[:start] + string(cleaned)
 	}
 	return text[:start] + withheld
+}
+
+// pictureRequest reads the call a widget is asking the drawing for.
+func pictureRequest(uri string) (string, bool) {
+	prefix := pictureURI + "?call="
+	if !strings.HasPrefix(uri, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(uri, prefix), true
 }
