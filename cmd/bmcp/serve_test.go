@@ -773,3 +773,26 @@ func TestCallDigestIgnoresKeyOrderAndLeavesMarkupUnescaped(t *testing.T) {
 		t.Errorf("markup in an argument was escaped before hashing: %s", got)
 	}
 }
+
+func TestCallDigestMatchesTheWidgetsJavaScript(t *testing.T) {
+	// Verified against the canon/digest functions extracted from widgetHTML and
+	// run under node: if either side's spelling drifts, the widget asks for a
+	// call this server has never heard of and waits for a drawing forever.
+	for _, c := range []struct {
+		args map[string]any
+		want string
+	}{
+		{map[string]any{"query": "x"}, "285ec8bf"},
+		{map[string]any{"query": "a", "scope": map[string]any{"type": "vpc"}}, "e4951d83"},
+		{map[string]any{"query": "a<b&c"}, "216ccc25"},
+		{map[string]any{}, "5465b825"},
+		{map[string]any{"query": "café ☕"}, "1a819eb4"},
+		{map[string]any{"b": true, "f": 0.5, "k": 5, "n": nil}, "2d06a405"},
+		{map[string]any{"edge_types": []any{"ROUTES_TO", "ASSUMES"}}, "d8d35b7d"},
+	} {
+		if got := callDigest(c.args); got != c.want {
+			encoded, _ := json.Marshal(c.args)
+			t.Errorf("callDigest(%s) = %s, want %s", encoded, got, c.want)
+		}
+	}
+}
