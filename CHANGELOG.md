@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.10.0...v0.10.1) (2026-09-13)
+
+
+### Bug Fixes
+
+* stop a credential_process helper eating the payload of a tool call ([#78](https://github.com/sirob-tech/boris-mcp-cli/issues/78)) ([596ba1a](https://github.com/sirob-tech/boris-mcp-cli/commit/596ba1a254e3668c1c0d6606ba8cd92c53a00525)), closes [#65](https://github.com/sirob-tech/boris-mcp-cli/issues/65)
+
 ## [0.10.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.9.1...v0.10.0) (2026-09-11)
 
 
