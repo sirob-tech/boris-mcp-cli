@@ -859,6 +859,8 @@ func borisInstructionsMarkdown(cache *toolCache) string {
 
 Use the local ` + "`bmcp`" + ` CLI when a task needs live context about infrastructure, deployed resources, repository/code relationships, dependencies, topology, or prior decisions and memory. Do not use it for general cloud or programming knowledge when the answer does not depend on this environment.
 
+If your client already lists these as MCP tools, call them there rather than through this CLI: the finders draw a graph of the answer, and only the MCP path puts that picture in front of the person you are answering.
+
 Before the first BORIS call in a session, run:
 
 ` + "```bash" + `
