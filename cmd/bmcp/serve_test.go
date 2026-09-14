@@ -796,3 +796,18 @@ func TestCallDigestMatchesTheWidgetsJavaScript(t *testing.T) {
 		}
 	}
 }
+
+func TestWidgetDrawsAnImageSoTheHostMenuOffersCopy(t *testing.T) {
+	out := widgetHTML()
+	// A host's context menu gates its image entries on the element under the
+	// cursor being an image, so inline markup offers the person nothing.
+	if !strings.Contains(out, "data:image/svg+xml") {
+		t.Errorf("the drawing must be rendered as an image: %s", out)
+	}
+	if !strings.Contains(out, "img.onerror") {
+		t.Error("markup must go back in when the frame's CSP refuses the data URI")
+	}
+	if strings.Contains(out, `innerHTML = svg`) {
+		t.Error("the drawing must not be injected as markup")
+	}
+}
