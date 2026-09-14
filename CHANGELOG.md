@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.11.0...v0.11.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* draw the graph as an image, so Copy Image is on the menu ([#82](https://github.com/sirob-tech/boris-mcp-cli/issues/82)) ([23cfb93](https://github.com/sirob-tech/boris-mcp-cli/commit/23cfb93a13eb195ba948eb7373529547f3c9b6b5))
+
 ## [0.11.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.10.0...v0.11.0) (2026-09-13)
 
 
