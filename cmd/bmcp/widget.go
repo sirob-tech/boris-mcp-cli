@@ -33,6 +33,21 @@ const widgetTemplate = `<div style="font:13px system-ui,-apple-system,sans-serif
     document.getElementById("pic").innerHTML = html;
     size();
   }
+  // Drawn as an image, not as inline markup: a host's own context menu offers
+  // Copy Image over an image element and nothing at all over inline markup,
+  // which goes back in if the frame's CSP turns the data URI away.
+  function draw(svg) {
+    var pic = document.getElementById("pic"), img = new Image();
+    img.alt = "infrastructure graph";
+    img.style.maxWidth = "100%%";
+    img.style.height = "auto";
+    img.style.display = "block";
+    img.onload = size;
+    img.onerror = function () { settle(svg); };
+    img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+    pic.innerHTML = "";
+    pic.appendChild(img);
+  }
   // Keyed the way the server keys it: sorted keys, no HTML escaping, FNV-1a
   // over the UTF-8 bytes.
   function canon(v) {
@@ -57,7 +72,8 @@ const widgetTemplate = `<div style="font:13px system-ui,-apple-system,sans-serif
     asked = true;
     call("resources/read", { uri: %q + "?call=" + digest(args) }).then(function (res) {
       var svg = res && res.contents && res.contents[0] && res.contents[0].text;
-      settle(svg || '<p style="color:#6b7280">No graph for this answer.</p>');
+      if (svg) draw(svg);
+      else settle('<p style="color:#6b7280">No graph for this answer.</p>');
     }).catch(function () {
       settle('<p style="color:#6b7280">Could not reach bmcp for this picture.</p>');
     });
