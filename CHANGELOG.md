@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.2](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.11.1...v0.11.2) (2026-09-16)
+
+
+### Bug Fixes
+
+* give an agent a way back from an expired SSO session ([#85](https://github.com/sirob-tech/boris-mcp-cli/issues/85)) ([ef6dcfb](https://github.com/sirob-tech/boris-mcp-cli/commit/ef6dcfb5eaba8d8db6edd629331c929cb191ca02))
+
 ## [0.11.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.11.0...v0.11.1) (2026-09-14)
 
 
