@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"testing/iotest"
 	"time"
@@ -21,8 +22,14 @@ import (
 )
 
 type fakeMCP struct {
+	// serve answers requests concurrently, so two tool calls can be in this
+	// fake at once; every field below is written under it.
+	mu         sync.Mutex
 	tools      []tool
 	callResult []byte
+	// perQuery answers a tools/call by its "query" argument, so one session can
+	// serve two calls different bodies. Falls back to callResult.
+	perQuery map[string][]byte
 	// github serves the update endpoints. Left nil, any GitHub request is a
 	// hard test failure rather than a silent trip to the real network — which
 	// is what makes the "tool calls never check for updates" tests meaningful.
@@ -64,6 +71,8 @@ type fakeMCP struct {
 const gatewayAuthRejectionBody = `{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"Authentication error - Invalid credentials"}}`
 
 func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if req.URL != nil && (req.URL.Host == "github.com" || req.URL.Host == "api.github.com") {
 		m.githubRequests++
 		if m.github == nil {
@@ -148,7 +157,17 @@ func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
 		}
 		_ = json.Unmarshal(rpc.Params, &params)
 		m.lastCallArgs = params.Arguments
-		env, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": rpc.ID, "result": json.RawMessage(m.callResult)})
+		payload := m.callResult
+		if len(m.perQuery) > 0 {
+			var args struct {
+				Query string `json:"query"`
+			}
+			_ = json.Unmarshal(params.Arguments, &args)
+			if body, ok := m.perQuery[args.Query]; ok {
+				payload = body
+			}
+		}
+		env, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": rpc.ID, "result": json.RawMessage(payload)})
 		return respond(string(env))
 	}
 	return respond(`{"jsonrpc":"2.0","id":0,"error":{"code":-32601,"message":"unexpected"}}`)

@@ -23,6 +23,8 @@ type callRecorder struct {
 }
 
 func (r *callRecorder) lastArgs() map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if len(r.lastCallArgs) == 0 {
 		return nil
 	}
@@ -125,15 +127,35 @@ func serveFrames(t *testing.T, doer httpDoer, frames ...string) ([]map[string]an
 	if len(lines) == 0 {
 		t.Fatal("serve wrote nothing at all")
 	}
-	replies := make([]map[string]any, 0, len(lines)-1)
-	for _, line := range lines[1:] {
+	byID := map[string]map[string]any{}
+	lineByID := map[string]string{}
+	for _, line := range lines {
 		var reply map[string]any
 		if err := json.Unmarshal([]byte(line), &reply); err != nil {
 			t.Fatalf("reply is not JSON: %s", line)
 		}
-		replies = append(replies, reply)
+		id, _ := json.Marshal(reply["id"])
+		byID[string(id)] = reply
+		lineByID[string(id)] = line
 	}
-	return replies, lines[1:]
+	// Handled concurrently, so a reply arrives when its work is done rather
+	// than in the order asked. Tests read them in the order they asked.
+	replies := make([]map[string]any, 0, len(frames))
+	ordered := make([]string, 0, len(frames))
+	for _, frame := range frames {
+		var req map[string]any
+		if json.Unmarshal([]byte(frame), &req) != nil || req["id"] == nil {
+			continue
+		}
+		id, _ := json.Marshal(req["id"])
+		reply, ok := byID[string(id)]
+		if !ok {
+			t.Fatalf("no reply for request id %s in:\n%s", id, strings.Join(lines, "\n"))
+		}
+		replies = append(replies, reply)
+		ordered = append(ordered, lineByID[string(id)])
+	}
+	return replies, ordered
 }
 
 func resultOf(t *testing.T, reply map[string]any) map[string]any {
@@ -279,12 +301,14 @@ func TestServeKeepsTheMarkupOutOfTheToolResult(t *testing.T) {
 			"_svg":   "<svg>the picture</svg>",
 		}),
 	}}
+	call := callDigest(map[string]any{"query": "the shared vpc"})
 	replies, lines := serveFrames(t, doer,
 		callFrame(1, finderTool, `{"query":"the shared vpc"}`),
 		`{"jsonrpc":"2.0","id":2,"method":"resources/read","params":{"uri":"`+widgetURI+`"}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"`+pictureURI+`?call=`+call+`"}}`,
 	)
-	if len(replies) != 2 {
-		t.Fatalf("expected 2 replies, got %d", len(replies))
+	if len(replies) != 3 {
+		t.Fatalf("expected 3 replies, got %d", len(replies))
 	}
 
 	assertNoMarkup(t, "finder answer", lines[0])
@@ -298,9 +322,13 @@ func TestServeKeepsTheMarkupOutOfTheToolResult(t *testing.T) {
 		t.Errorf("declared arguments must survive: %v", doer.lastArgs())
 	}
 
-	// The picture belongs to the call that drew it, and rides that call's reply.
-	if svg := pictureOf(t, replies[0]); !strings.Contains(svg, "the picture") {
-		t.Errorf("the call carried no picture of its own: %q", svg)
+	// The drawing is fetched by the widget, under the call that drew it.
+	drawn, _ := resultOf(t, replies[2])["contents"].([]any)
+	if len(drawn) != 1 {
+		t.Fatalf("expected one picture content, got %v", drawn)
+	}
+	if svg, _ := drawn[0].(map[string]any)["text"].(string); !strings.Contains(svg, "the picture") {
+		t.Errorf("the call's own drawing was not served: %q", svg)
 	}
 
 	contents, _ := resultOf(t, replies[1])["contents"].([]any)
@@ -529,8 +557,11 @@ func TestWidgetShellCarriesNoDrawingAndWaitsForItsOwnCall(t *testing.T) {
 	if strings.Contains(out, "<svg") {
 		t.Errorf("the shell must carry no drawing: %s", out)
 	}
-	if !strings.Contains(out, "ui/notifications/tool-result") {
-		t.Errorf("the shell must wait for its own call's result: %s", out)
+	if !strings.Contains(out, "ui/notifications/tool-input") {
+		t.Errorf("the shell must learn which call it belongs to: %s", out)
+	}
+	if !strings.Contains(out, pictureURI) {
+		t.Errorf("the shell must fetch its own call's drawing: %s", out)
 	}
 	// Both ends of the wait are spelled out, so neither leaves a widget blank.
 	for _, said := range []string{"Drawing the neighbourhood", "No graph for this answer"} {
@@ -538,10 +569,7 @@ func TestWidgetShellCarriesNoDrawingAndWaitsForItsOwnCall(t *testing.T) {
 			t.Errorf("the shell never says %q: %s", said, out)
 		}
 	}
-	// The field the picture arrives under has to match what serve attaches.
-	if !strings.Contains(out, `_meta["`+pictureField+`"]`) {
-		t.Errorf("the shell reads a different _meta field: %s", out)
-	}
+
 }
 
 func TestServeHidesTheResourceFromAClientWithoutMCPApps(t *testing.T) {
@@ -680,5 +708,106 @@ func TestServeTakesStdinFromACredentialProcessHelper(t *testing.T) {
 	// And the session still worked: the client got an answer to its call.
 	if !strings.Contains(stdout.String(), `"id":1`) {
 		t.Fatalf("the tools/call was never answered:\n%s", stdout.String())
+	}
+}
+
+func TestServeHoldsAWidgetsReadUntilItsOwnCallHasDrawn(t *testing.T) {
+	doer := &callRecorder{fakeMCP: &fakeMCP{
+		tools: finderCatalog(),
+		callResult: upstreamAnswer(map[string]any{
+			"status": "success",
+			"_svg":   "<svg>the picture</svg>",
+		}),
+	}}
+	// Asked in the order a host asks it: the widget mounts, and reads, while
+	// the tool input is still streaming — before the call is dispatched.
+	call := callDigest(map[string]any{"query": "x"})
+	replies, lines := serveFrames(t, doer,
+		`{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"`+pictureURI+`?call=`+call+`"}}`,
+		callFrame(2, finderTool, `{"query":"x"}`),
+	)
+	contents, _ := resultOf(t, replies[0])["contents"].([]any)
+	if len(contents) != 1 {
+		t.Fatalf("the read was not answered: %v", replies[0])
+	}
+	svg, _ := contents[0].(map[string]any)["text"].(string)
+	if !strings.Contains(svg, "the picture") {
+		t.Errorf("a read asked before the call must still get that call's drawing, got %q", svg)
+	}
+	assertNoMarkup(t, "finder answer", lines[1])
+}
+
+func TestServeGivesEachCallItsOwnDrawing(t *testing.T) {
+	doer := &callRecorder{fakeMCP: &fakeMCP{tools: finderCatalog()}}
+	doer.perQuery = map[string][]byte{
+		"first":  upstreamAnswer(map[string]any{"status": "ok", "_svg": "<svg>first drawing</svg>"}),
+		"second": upstreamAnswer(map[string]any{"status": "ok", "_svg": "<svg>second drawing</svg>"}),
+	}
+	second := callDigest(map[string]any{"query": "second"})
+	replies, _ := serveFrames(t, doer,
+		callFrame(1, finderTool, `{"query":"first"}`),
+		callFrame(2, finderTool, `{"query":"second"}`),
+		`{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"`+pictureURI+`?call=`+second+`"}}`,
+	)
+	contents, _ := resultOf(t, replies[2])["contents"].([]any)
+	if len(contents) != 1 {
+		t.Fatalf("the read was not answered: %v", replies[2])
+	}
+	svg, _ := contents[0].(map[string]any)["text"].(string)
+	if !strings.Contains(svg, "second drawing") {
+		t.Errorf("a widget must get its own call's drawing, got %q", svg)
+	}
+}
+
+func TestCallDigestIgnoresKeyOrderAndLeavesMarkupUnescaped(t *testing.T) {
+	// The widget computes this in JavaScript from the arguments the host hands
+	// it, so the two spellings of one call have to agree.
+	one := callDigest(map[string]any{"query": "a", "scope": map[string]any{"type": "vpc"}})
+	two := callDigest(map[string]any{"scope": map[string]any{"type": "vpc"}, "query": "a"})
+	if one != two {
+		t.Errorf("key order changed the digest: %s vs %s", one, two)
+	}
+	// Go escapes <, > and & in JSON by default and JSON.stringify does not; a
+	// query containing them must still name the same call on both sides.
+	if got := callDigest(map[string]any{"query": "a<b&c"}); got != fnv1a([]byte(`{"query":"a<b&c"}`)) {
+		t.Errorf("markup in an argument was escaped before hashing: %s", got)
+	}
+}
+
+func TestCallDigestMatchesTheWidgetsJavaScript(t *testing.T) {
+	// Verified against the canon/digest functions extracted from widgetHTML and
+	// run under node: if either side's spelling drifts, the widget asks for a
+	// call this server has never heard of and waits for a drawing forever.
+	for _, c := range []struct {
+		args map[string]any
+		want string
+	}{
+		{map[string]any{"query": "x"}, "285ec8bf"},
+		{map[string]any{"query": "a", "scope": map[string]any{"type": "vpc"}}, "e4951d83"},
+		{map[string]any{"query": "a<b&c"}, "216ccc25"},
+		{map[string]any{}, "5465b825"},
+		{map[string]any{"query": "café ☕"}, "1a819eb4"},
+		{map[string]any{"b": true, "f": 0.5, "k": 5, "n": nil}, "2d06a405"},
+		{map[string]any{"edge_types": []any{"ROUTES_TO", "ASSUMES"}}, "d8d35b7d"},
+	} {
+		if got := callDigest(c.args); got != c.want {
+			encoded, _ := json.Marshal(c.args)
+			t.Errorf("callDigest(%s) = %s, want %s", encoded, got, c.want)
+		}
+	}
+}
+
+func TestWidgetDrawsAnImageSoTheHostMenuOffersCopy(t *testing.T) {
+	out := widgetHTML()
+	// A host's context menu gates its image entries on the element under the
+	// cursor being an image, so inline markup offers the person nothing.
+	if !strings.Contains(out, "data:image/svg+xml") {
+		t.Errorf("the drawing must be rendered as an image: %s", out)
+	}
+	if !strings.Contains(out, "img.onerror") {
+		t.Error("markup must go back in when the frame's CSP refuses the data URI")
+	}
+	if strings.Contains(out, `innerHTML = svg`) {
+		t.Error("the drawing must not be injected as markup")
 	}
 }

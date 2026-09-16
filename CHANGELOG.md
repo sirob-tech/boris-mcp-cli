@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.11.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.11.0...v0.11.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* draw the graph as an image, so Copy Image is on the menu ([#82](https://github.com/sirob-tech/boris-mcp-cli/issues/82)) ([23cfb93](https://github.com/sirob-tech/boris-mcp-cli/commit/23cfb93a13eb195ba948eb7373529547f3c9b6b5))
+
+## [0.11.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.10.0...v0.11.0) (2026-09-13)
+
+
+### Bug Fixes
+
+* let the widget ask for its own call's picture ([#81](https://github.com/sirob-tech/boris-mcp-cli/issues/81)) ([dd71856](https://github.com/sirob-tech/boris-mcp-cli/commit/dd7185643317ee15153b2a87a91240174959c8ac))
+* point agents at the MCP tools, where the picture is ([#80](https://github.com/sirob-tech/boris-mcp-cli/issues/80)) ([d276532](https://github.com/sirob-tech/boris-mcp-cli/commit/d27653215b0c11f1e524748d5e3b4e0158e595b4))
+* stop a credential_process helper eating the payload of a tool call ([#78](https://github.com/sirob-tech/boris-mcp-cli/issues/78)) ([596ba1a](https://github.com/sirob-tech/boris-mcp-cli/commit/596ba1a254e3668c1c0d6606ba8cd92c53a00525)), closes [#65](https://github.com/sirob-tech/boris-mcp-cli/issues/65)
+
 ## [0.10.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.9.1...v0.10.0) (2026-09-11)
 
 
