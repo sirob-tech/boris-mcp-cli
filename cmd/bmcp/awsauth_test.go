@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -521,8 +524,8 @@ func TestADeviceFlowStartsOnlyWhenItCouldFinish(t *testing.T) {
 		wantMessage string
 	}{
 		// SyncTimeout's sixty seconds — what `bmcp sync` and `bmcp doctor` carry.
-		{name: "a sync budget is too short", budget: 60 * time.Second, wantMessage: "aws sso login --profile sso-only"},
-		{name: "just under the budget", budget: ssoLoginBudget - time.Second, wantMessage: "aws sso login --profile sso-only"},
+		{name: "a sync budget is too short", budget: 60 * time.Second, wantMessage: "bmcp --profile sso-only login"},
+		{name: "just under the budget", budget: ssoLoginBudget - time.Second, wantMessage: "bmcp --profile sso-only login"},
 		// CallTimeout's ten minutes — what `bmcp <tool>` carries, and ample.
 		{name: "a call budget is ample", budget: 10 * time.Minute, wantLogin: true, wantMessage: "aws sso login failed"},
 	} {
@@ -744,9 +747,9 @@ func TestAuthFailureNamesTheCredentialSource(t *testing.T) {
 		},
 		{
 			// The profile was outranked, so the failure came from the environment.
-			// Advising `aws sso login` for the configured profile — which is what
-			// this used to do — sends the operator to repair something this attempt
-			// never consulted.
+			// Advising a login for the configured profile — which is what this used
+			// to do — sends the operator to repair something this attempt never
+			// consulted.
 			name: "environment credentials outranking an SSO profile",
 			env: func(t *testing.T) {
 				// A token file that does not exist, with the role ARN that makes it
@@ -764,7 +767,10 @@ func TestAuthFailureNamesTheCredentialSource(t *testing.T) {
 				"web identity credentials (AWS_WEB_IDENTITY_TOKEN_FILE)",
 				"which outrank AWS profile sso-only from aws_profile in config.toml",
 			},
-			absent: []string{"aws sso login"},
+			// Both spellings of the remedy. The old one alone would pass trivially
+			// now that nothing produces it, and the assertion would have stopped
+			// testing anything on the day the message changed.
+			absent: []string{"aws sso login", "bmcp --profile sso-only login"},
 		},
 		{
 			// #66. The environment's credentials expired, so the configured profile
@@ -805,7 +811,7 @@ func TestAuthFailureNamesTheCredentialSource(t *testing.T) {
 				Region:        "us-east-1",
 			},
 			contains: []string{
-				"aws sso login --profile sso-only",
+				"bmcp --profile sso-only login",
 				"AWS profile sso-only from aws_profile in config.toml",
 			},
 		},
@@ -1257,9 +1263,12 @@ func TestCredentialProcessOutputNeverReachesAnErrorMessage(t *testing.T) {
 			}
 			assertNoLeak(t, err.Error())
 			// And the advice is about the helper rather than about SSO, which the
-			// profile does not use.
-			if strings.Contains(err.Error(), "aws sso login") {
-				t.Fatalf("credential_process profile sent to aws sso login: %q", err.Error())
+			// profile does not use. "login" rather than either spelling of the
+			// remedy: the old one is a string nothing produces any more, so asserting
+			// its absence would test nothing, and the next rewording would escape a
+			// pin on the new one just as easily.
+			if strings.Contains(err.Error(), "login") {
+				t.Fatalf("credential_process profile sent to an SSO login: %q", err.Error())
 			}
 			for _, want := range tc.contains {
 				if !strings.Contains(err.Error(), want) {
@@ -1457,11 +1466,18 @@ func TestSSOFailureStillReportsItsCause(t *testing.T) {
 	for _, want := range []string{
 		"failed to refresh cached credentials",
 		"AWS profile sso-only from aws_profile in config.toml",
-		"aws sso login --profile sso-only",
+		"bmcp --profile sso-only login",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("message %q should contain %q", err.Error(), want)
 		}
+	}
+	// And exactly one remedy. The replacement of `aws sso login` was an append in
+	// an earlier draft, which would have passed every assertion above while the
+	// message named two different commands and readers took whichever they
+	// reached first. The generated instructions key on the one bmcp names.
+	if strings.Contains(err.Error(), "aws sso login") {
+		t.Fatalf("message carries both remedies, so a reader picks one at random: %q", err.Error())
 	}
 }
 
@@ -1533,8 +1549,11 @@ sso_region = us-east-1
 		t.Fatal("expected an auth failure")
 	}
 	assertNoLeak(t, err.Error())
-	if strings.Contains(err.Error(), "aws sso login") {
-		t.Fatalf("sent to aws sso login for a credential_process chain: %q", err.Error())
+	// "login" rather than the old `aws sso login`, which nothing produces any
+	// more: an absence assertion against a string the code can no longer emit
+	// passes whatever the message says.
+	if strings.Contains(err.Error(), "login") {
+		t.Fatalf("sent to an SSO login for a credential_process chain: %q", err.Error())
 	}
 	if !strings.Contains(err.Error(), "credential_process helper") {
 		t.Fatalf("message %q should name the helper as the cause", err.Error())
@@ -3042,5 +3061,666 @@ func TestAnAbandonedRetrievalLeavesTheStdinSinkInstalled(t *testing.T) {
 	}
 	if survived != callPayload {
 		t.Fatalf("the payload did not survive: %q", survived)
+	}
+}
+
+// The SSO start URL the sso-only fixture profile carries, and the sha1 of it
+// spelled out rather than computed by the code under test.
+//
+// That derivation is the one thing about `bmcp login`'s idempotence guard that
+// fails invisibly: a wrong key names a file that does not exist, a missing file
+// reads as "expired", and the only symptom is a browser opening on a run where
+// nothing was wrong. Pinning it against a literal is what makes a drift in
+// either direction — bmcp's or the SDK's — a failure rather than a regression
+// nobody sees.
+const (
+	fixtureStartURL  = "https://example.awsapps.com/start"
+	fixtureTokenFile = "e8be5486177c5b5392bd9aa76563515b29358e6e.json"
+)
+
+// ssoCachePath is where the AWS CLI and the Go SDK agree the cached token for
+// key lives: ~/.aws/sso/cache/<sha1-hex>.json, under whatever HOME this test
+// isolated.
+func ssoCachePath(t *testing.T, key string) string {
+	t.Helper()
+	sum := sha1.Sum([]byte(key))
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("resolve home: %v", err)
+	}
+	// Checked against the temp root, exactly as appendSharedConfig checks
+	// AWS_CONFIG_FILE, and for a sharper reason. The callers below write and
+	// *truncate* files in this directory: reached without isolateAWSEnv having
+	// repointed HOME, the truncating case would zero a maintainer's own cached SSO
+	// token and log them out of AWS. Both current callers isolate first; this is
+	// what keeps that true for the next one.
+	if !strings.HasPrefix(home, os.TempDir()) {
+		t.Fatalf("the SSO cache helpers would write outside the test's fixtures: HOME=%q; isolateAWSEnv must run first", home)
+	}
+	return filepath.Join(home, ".aws", "sso", "cache", hex.EncodeToString(sum[:])+".json")
+}
+
+// writeSSOToken puts a cached token with this expiry where the SSO cache keeps
+// it. accessToken is present but inert: the readers require the field, and
+// nothing here ever presents it to anything.
+func writeSSOToken(t *testing.T, key string, expiresAt time.Time) {
+	t.Helper()
+	path := ssoCachePath(t, key)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir sso cache: %v", err)
+	}
+	body := fmt.Sprintf(`{"accessToken":"not-a-real-token","expiresAt":%q}`,
+		expiresAt.UTC().Format(time.RFC3339))
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write cached token: %v", err)
+	}
+}
+
+// loginTestEnv isolates everything `bmcp login` reads and puts a fake `aws` on
+// PATH that records the arguments it was given.
+//
+// The recording is the observation every case below makes about this
+// subprocess: whether it ran at all, and — the part the leaf-profile fix is
+// about — which profile it was pointed at.
+func loginTestEnv(t *testing.T, exitCode int) (argvFile string) {
+	t.Helper()
+	isolateAWSEnv(t)
+	// Not in isolateAWSEnv's list, because nothing else in that file reads them.
+	// Every one would otherwise let a maintainer's own shell decide what these
+	// cases assert: a BMCP_HOME pointing at their real config, a
+	// BMCP_NON_INTERACTIVE that turns every case into the refusal path, a
+	// BMCP_SYNC_TTL that decides whether the walk test's catalog counts as stale,
+	// or a BMCP_PROFILE that silently renames the profile a refusal hands back.
+	t.Setenv("BMCP_HOME", filepath.Join(t.TempDir(), "absent"))
+	for _, name := range []string{
+		"BMCP_NON_INTERACTIVE", "BMCP_PROFILE", "BMCP_URL", "BMCP_REGION", "BMCP_SERVICE",
+		"BMCP_SYNC_TTL", "BMCP_SYNC_TIMEOUT", "BMCP_CONNECT_TIMEOUT", "BMCP_CALL_TIMEOUT",
+		"BMCP_AUTO_UPDATE", "BMCP_VERSION",
+	} {
+		t.Setenv(name, "")
+	}
+	binDir := t.TempDir()
+	argvFile = filepath.Join(t.TempDir(), "aws-argv")
+	script := "#!/bin/sh\necho \"$@\" > '" + argvFile + "'\nexit " + strconv.Itoa(exitCode) + "\n"
+	if err := os.WriteFile(filepath.Join(binDir, "aws"), []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake aws: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return argvFile
+}
+
+// loginTestApp builds the app a `bmcp login` case runs, with both subprocess
+// descriptors pinned at /dev/null.
+//
+// Pinned rather than left to run() to fill from the globals, for two reasons:
+// the fake `aws` would otherwise write into the test binary's own streams, and
+// nothing here should depend on whether `go test` was run at a terminal.
+func loginTestApp(t *testing.T, stdout, stderr *bytes.Buffer) *app {
+	t.Helper()
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open /dev/null: %v", err)
+	}
+	t.Cleanup(func() { devNull.Close() })
+	return &app{
+		stdin: strings.NewReader(""), stdout: stdout, stderr: stderr, now: time.Now,
+		realStdin: devNull, realStderr: devNull,
+	}
+}
+
+// corruptBMCPConfig makes config.toml unreadable, which is the only way
+// readConfig fails — its parser skips anything it cannot understand, so a
+// malformed file parses to defaults. A directory where the file belongs gives
+// os.ReadFile an EISDIR that is not os.ErrNotExist, which is exactly the
+// distinction loadEffective turns into config_invalid.
+func corruptBMCPConfig(t *testing.T) {
+	t.Helper()
+	home := os.Getenv("BMCP_HOME")
+	if home == "" {
+		t.Fatal("corruptBMCPConfig needs BMCP_HOME; loginTestEnv must run first")
+	}
+	if err := os.MkdirAll(filepath.Join(home, "config.toml"), 0o700); err != nil {
+		t.Fatalf("make config.toml unreadable: %v", err)
+	}
+}
+
+// awsRan reports what the fake `aws` was invoked with, and whether it ran at
+// all. The absence is as load-bearing as the arguments: half of what this
+// command promises is the runs on which no browser opens.
+func awsRan(t *testing.T, argvFile string) (string, bool) {
+	t.Helper()
+	body, err := os.ReadFile(argvFile)
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(string(body)), true
+}
+
+// The shapes that must refuse rather than open a browser, each with its own
+// name and its own escape.
+//
+// interactive_login_required, never auth_failure, is the whole point of the
+// name: the generated instructions tell an agent to run `bmcp login` when a
+// bmcp message names it, so a refusal wearing the name agents react to would
+// have them run it again, in the same format, indefinitely.
+func TestLoginRefusesWhereABrowserCannotBeOpened(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  func(*testing.T)
+		// structured is true where the refusal must arrive as one parseable
+		// document on stderr — both machine formats, and the legacy --json.
+		structured bool
+		contains   []string
+		absent     []string
+	}{
+		{
+			name:       "under --format json",
+			args:       []string{"--format", "json", "--profile", "sso-only", "login"},
+			structured: true,
+			// The invocation carries --profile, so the command handed back must too.
+			// A bare `bmcp login` would send its reader to log into whatever
+			// config.toml names instead.
+			contains: []string{"--format json", "bmcp --profile sso-only login"},
+		},
+		{
+			name:       "under --format ndjson",
+			args:       []string{"--format", "ndjson", "login"},
+			structured: true,
+			contains:   []string{"--format ndjson", "bmcp login"},
+		},
+		{
+			// Not the contract, but its callers parse what bmcp writes just the
+			// same, and a login would block and then write English into it.
+			name:       "under the legacy --json",
+			args:       []string{"--json", "login"},
+			structured: true,
+			contains:   []string{"--json"},
+		},
+		{
+			name: "under --non-interactive",
+			args: []string{"--non-interactive", "--profile", "sso-only", "login"},
+			// Its own message naming its own escape. The flag and the variable are
+			// OR'd together with no --interactive to clear either, so handing back
+			// any form of "run bmcp login" would be advice this invocation has just
+			// disproved. "Run" rather than the command: the message opens with the
+			// words "bmcp login", so only the imperative separates advice from
+			// description, and pinning the command would pin nothing.
+			contains: []string{"--non-interactive", "BMCP_NON_INTERACTIVE"},
+			absent:   []string{"Run"},
+		},
+		{
+			name: "under BMCP_NON_INTERACTIVE",
+			args: []string{"--profile", "sso-only", "login"},
+			env:  func(t *testing.T) { t.Setenv("BMCP_NON_INTERACTIVE", "1") },
+			// A human format, so the refusal is prose — and it still must not be the
+			// format refusal, which would name formats nothing here selected.
+			contains: []string{"BMCP_NON_INTERACTIVE"},
+			absent:   []string{"--format json", "Run"},
+		},
+		{
+			// The ordering the format refusal's comment claims: ahead of anything
+			// that reads config or disk, so it cannot depend on whether the machine
+			// happens to be configured. Without this, moving the guard below
+			// loadEffective passes every other row — a missing config resolves
+			// cleanly — and a machine-format login on a machine with a corrupt
+			// config.toml answers config_invalid instead of refusing.
+			name:       "under --format json with a corrupt config",
+			args:       []string{"--format", "json", "login"},
+			env:        func(t *testing.T) { corruptBMCPConfig(t) },
+			structured: true,
+			contains:   []string{"--format json"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			argvFile := loginTestEnv(t, 0)
+			if tc.env != nil {
+				tc.env(t)
+			}
+			var stdout, stderr bytes.Buffer
+			if code := loginTestApp(t, &stdout, &stderr).run(tc.args); code != exitAuth {
+				t.Fatalf("exit %d, want %d; stderr: %s", code, exitAuth, stderr.String())
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("a refusal must leave stdout empty, got: %s", stdout.String())
+			}
+			if argv, ran := awsRan(t, argvFile); ran {
+				t.Fatalf("a refusal spawned the login anyway: aws %s", argv)
+			}
+			message := stderr.String()
+			if tc.structured {
+				var doc struct {
+					OK      bool   `json:"ok"`
+					Error   string `json:"error"`
+					Message string `json:"message"`
+				}
+				if err := json.Unmarshal(stderr.Bytes(), &doc); err != nil {
+					t.Fatalf("stderr is not one JSON document (%v): %s", err, stderr.String())
+				}
+				if doc.OK || doc.Error != "interactive_login_required" {
+					t.Fatalf("unexpected envelope: %+v", doc)
+				}
+				message = doc.Message
+			}
+			for _, want := range tc.contains {
+				if !strings.Contains(message, want) {
+					t.Fatalf("message %q should contain %q", message, want)
+				}
+			}
+			for _, unwanted := range tc.absent {
+				if strings.Contains(message, unwanted) {
+					t.Fatalf("message %q should not contain %q", message, unwanted)
+				}
+			}
+		})
+	}
+}
+
+// The guard that makes `bmcp login` safe for an agent to run on a message it
+// may have reached for some other reason.
+//
+// `aws sso login` runs with force_refresh=True and never short-circuits on a
+// token that is still good, so without a check of bmcp's own a browser opens on
+// every invocation — including the ones where the session is fine and the real
+// failure is something a login cannot fix.
+func TestLoginWithAValidSessionOpensNothing(t *testing.T) {
+	argvFile := loginTestEnv(t, 0)
+	writeSSOToken(t, fixtureStartURL, time.Now().Add(6*time.Hour))
+	var stdout, stderr bytes.Buffer
+	if code := loginTestApp(t, &stdout, &stderr).run([]string{"--profile", "sso-only", "login"}); code != 0 {
+		t.Fatalf("exit %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if argv, ran := awsRan(t, argvFile); ran {
+		t.Fatalf("a valid session still opened a browser: aws %s", argv)
+	}
+	if !strings.Contains(stdout.String(), "already valid") {
+		t.Fatalf("the no-op should say why it did nothing, got: %s", stdout.String())
+	}
+}
+
+// The other half: absent, expired and unreadable are all "log in", and the
+// third of those is not hypothetical — aws-cli writes this file
+// non-atomically, so a read racing a concurrent login lands on a zero-length
+// window.
+func TestLoginWithoutAValidSessionLogsIn(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		token func(*testing.T)
+	}{
+		{name: "no cached token at all", token: func(*testing.T) {}},
+		{
+			name:  "a cached token past its expiry",
+			token: func(t *testing.T) { writeSSOToken(t, fixtureStartURL, time.Now().Add(-time.Hour)) },
+		},
+		{
+			name: "a truncated token file",
+			token: func(t *testing.T) {
+				writeSSOToken(t, fixtureStartURL, time.Now().Add(6*time.Hour))
+				if err := os.Truncate(ssoCachePath(t, fixtureStartURL), 0); err != nil {
+					t.Fatalf("truncate cached token: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			argvFile := loginTestEnv(t, 0)
+			tc.token(t)
+			var stdout, stderr bytes.Buffer
+			if code := loginTestApp(t, &stdout, &stderr).run([]string{"--profile", "sso-only", "login"}); code != 0 {
+				t.Fatalf("exit %d, want 0; stderr: %s", code, stderr.String())
+			}
+			argv, ran := awsRan(t, argvFile)
+			if !ran {
+				t.Fatal("no login was started")
+			}
+			if argv != "sso login --profile sso-only" {
+				t.Fatalf("aws %s, want `sso login --profile sso-only`", argv)
+			}
+		})
+	}
+}
+
+// The cache key, pinned against a literal rather than against the function that
+// derives it, and then round-tripped through the reader. See fixtureTokenFile.
+func TestSSOTokenCacheKeyMatchesWhatTheAWSCLIWrites(t *testing.T) {
+	isolateAWSEnv(t)
+	if got := filepath.Base(ssoCachePath(t, fixtureStartURL)); got != fixtureTokenFile {
+		t.Fatalf("token file %q, want %q — the sha1 of the start URL", got, fixtureTokenFile)
+	}
+	expiry := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	writeSSOToken(t, fixtureStartURL, expiry)
+	got, err := ssoTokenExpiry(authTestContext(t), "sso-only")
+	if err != nil {
+		t.Fatalf("bmcp could not read the token it and the AWS CLI agree on: %v", err)
+	}
+	if !got.Equal(expiry) {
+		t.Fatalf("expiry %v, want %v", got, expiry)
+	}
+}
+
+// A login pointed at the leaf of a source_profile chain, which is where the SSO
+// configuration lives.
+//
+// profileUsesSSO answers about the leaf — the only node whose credential type
+// the SDK ever dispatches — while `aws sso login --profile X` reads X's own SSO
+// config. So a chained profile passed the check and then failed the login with
+// "profile does not have valid SSO configuration". The implicit login inside
+// awsCredentials had the same defect and is fixed by the same helper.
+func TestLoginTargetsTheLeafOfASourceProfileChain(t *testing.T) {
+	argvFile := loginTestEnv(t, 0)
+	appendSharedConfig(t, `
+[profile chained]
+role_arn = arn:aws:iam::123456789012:role/Chained
+source_profile = sso-only
+region = us-east-1
+`)
+	var stdout, stderr bytes.Buffer
+	if code := loginTestApp(t, &stdout, &stderr).run([]string{"--profile", "chained", "login"}); code != 0 {
+		t.Fatalf("exit %d, want 0; stderr: %s", code, stderr.String())
+	}
+	argv, ran := awsRan(t, argvFile)
+	if !ran {
+		t.Fatal("no login was started")
+	}
+	if argv != "sso login --profile sso-only" {
+		t.Fatalf("aws %s, want the leaf profile: `sso login --profile sso-only`", argv)
+	}
+}
+
+// Where there is no SSO session to refresh, the refusal has to say what bmcp
+// did resolve and how to name something else — not merely decline.
+//
+// The second row is the one that makes this worth a test rather than a
+// docstring: unexpired-looking ambient keys make sharedProfileFor yield, so
+// there is no profile to log into even though the environment names one.
+func TestLoginRefusesWhatIsNotAnSSOProfile(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		env      func(*testing.T)
+		contains []string
+	}{
+		{
+			name:     "a static-credentials profile",
+			args:     []string{"--profile", "has-static", "login"},
+			contains: []string{"AWS profile has-static from --profile"},
+		},
+		{
+			name: "environment credentials outranking an ambient SSO profile",
+			args: []string{"login"},
+			env: func(t *testing.T) {
+				setEnvCredentials(t)
+				t.Setenv("AWS_PROFILE", "sso-only")
+			},
+			contains: []string{
+				"environment credentials (AWS_ACCESS_KEY_ID)",
+				"which outrank AWS profile sso-only",
+			},
+		},
+		{
+			name:     "no profile and nothing in the environment",
+			args:     []string{"login"},
+			contains: []string{"the default AWS credential chain"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			argvFile := loginTestEnv(t, 0)
+			if tc.env != nil {
+				tc.env(t)
+			}
+			var stdout, stderr bytes.Buffer
+			if code := loginTestApp(t, &stdout, &stderr).run(tc.args); code != exitAuth {
+				t.Fatalf("exit %d, want %d; stderr: %s", code, exitAuth, stderr.String())
+			}
+			if argv, ran := awsRan(t, argvFile); ran {
+				t.Fatalf("a refusal spawned the login anyway: aws %s", argv)
+			}
+			for _, want := range append(tc.contains, "bmcp --profile <name> login") {
+				if !strings.Contains(stderr.String(), want) {
+					t.Fatalf("message %q should contain %q", stderr.String(), want)
+				}
+			}
+		})
+	}
+}
+
+// A failed `bmcp login` must not tell its reader to run `bmcp login`.
+//
+// This is the loop guard that actually bears weight. The error *name* is the one
+// the code comments talk about, but it is unobservable here: this command
+// refuses every machine format, and failDoc prints only the message in a human
+// one — so no caller ever sees `sso_login_failed` at all, and a test asserting
+// the absence of "auth_failure" on stderr would pass whatever the name was.
+//
+// The message is what the generated instructions key on: "when a bmcp message
+// tells you to run `bmcp login`, run it". So a failed login whose message named
+// the command again would be an agent's infinite loop, written in prose.
+func TestAFailedLoginDoesNotTellTheReaderToLogInAgain(t *testing.T) {
+	loginTestEnv(t, 1)
+	var stdout, stderr bytes.Buffer
+	code := loginTestApp(t, &stdout, &stderr).run([]string{"--profile", "sso-only", "login"})
+	if code != exitAuth {
+		t.Fatalf("exit %d, want %d; stderr: %s", code, exitAuth, stderr.String())
+	}
+	for _, loop := range []string{"bmcp login", "bmcp --profile sso-only login", "Run:"} {
+		if strings.Contains(stderr.String(), loop) {
+			t.Fatalf("a failed login handed back %q, which is the loop: %s", loop, stderr.String())
+		}
+	}
+	if !strings.Contains(stderr.String(), "sso-only") {
+		t.Fatalf("the failure should name the profile it was for, got: %s", stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("a failed login must not report success on stdout, got: %s", stdout.String())
+	}
+}
+
+// The modern profile form, which nothing else in this file exercises and whose
+// cache key is derived differently: the SDK hashes the sso_session *name* for
+// it (resolveSSOCredentials) and the start URL only for the legacy form
+// (ssocreds.New). The fixture's `sso-only` is legacy, so without this the
+// `leaf.SSOSession != nil` arm has no coverage at all — and deleting it, or
+// reaching for the URL sitting right there on the same struct, would make
+// `bmcp login` open a browser on every single run for every user on the form
+// AWS now recommends, silently, because a key that names no file reads as
+// "expired".
+func TestSSOTokenCacheKeyFollowsTheProfileForm(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		profile string
+		// key is what the SDK would hash for this profile, spelled out here rather
+		// than taken from the code under test.
+		key string
+	}{
+		{name: "legacy sso_start_url", profile: "sso-only", key: fixtureStartURL},
+		{name: "sso_session names the session", profile: "modern-sso", key: "corp-session"},
+		{name: "a chain resolves through its leaf", profile: "chained-sso", key: fixtureStartURL},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateAWSEnv(t)
+			appendSharedConfig(t, `
+[profile modern-sso]
+sso_session = corp-session
+sso_account_id = 123456789012
+sso_role_name = ExampleRole
+region = us-east-1
+
+[sso-session corp-session]
+sso_start_url = https://example.awsapps.com/start
+sso_region = us-east-1
+
+[profile chained-sso]
+role_arn = arn:aws:iam::123456789012:role/Chained
+source_profile = sso-only
+region = us-east-1
+`)
+			// A start URL on the session and a different one nowhere else, so a
+			// derivation that reached for SSOSession.SSOStartURL instead of its Name
+			// would look in the wrong place and find nothing.
+			expiry := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+			writeSSOToken(t, tc.key, expiry)
+			got, err := ssoTokenExpiry(authTestContext(t), tc.profile)
+			if err != nil {
+				t.Fatalf("profile %s: %v — bmcp looked somewhere the AWS CLI does not write", tc.profile, err)
+			}
+			if !got.Equal(expiry) {
+				t.Fatalf("expiry %v, want %v", got, expiry)
+			}
+		})
+	}
+}
+
+// A cached token carrying an expiry but no accessToken must read as expired.
+//
+// The SDK rejects that file outright — loadCachedToken requires both fields —
+// so calling it valid produces the worst shape this command has: `bmcp login`
+// reports "already valid, nothing to do", the call it was run for fails exactly
+// as before, and the agent is sent back to the command that just declined to
+// act. An expiry-only check cannot tell the two apart.
+func TestACachedTokenWithNoAccessTokenIsNotValid(t *testing.T) {
+	argvFile := loginTestEnv(t, 0)
+	path := ssoCachePath(t, fixtureStartURL)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir sso cache: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`{"expiresAt":"2099-01-01T00:00:00Z"}`), 0o600); err != nil {
+		t.Fatalf("write cached token: %v", err)
+	}
+	if _, err := ssoTokenExpiry(authTestContext(t), "sso-only"); err == nil {
+		t.Fatal("a token the SDK would reject was reported as readable")
+	}
+	var stdout, stderr bytes.Buffer
+	if code := loginTestApp(t, &stdout, &stderr).run([]string{"--profile", "sso-only", "login"}); code != 0 {
+		t.Fatalf("exit %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if _, ran := awsRan(t, argvFile); !ran {
+		t.Fatalf("no login was started, so bmcp believed a token the SDK rejects: %s", stdout.String())
+	}
+}
+
+// The success line reports how long the new session lasts.
+//
+// It needs a fake `aws` that writes a token, which no other case here does —
+// so without this, loginValidity always takes its error path and returning ""
+// unconditionally would be invisible.
+func TestASuccessfulLoginReportsTheNewExpiry(t *testing.T) {
+	isolateAWSEnv(t)
+	t.Setenv("BMCP_HOME", filepath.Join(t.TempDir(), "absent"))
+	t.Setenv("BMCP_NON_INTERACTIVE", "")
+	expiry := time.Now().Add(8 * time.Hour).UTC().Truncate(time.Second)
+	// The fake writes the token where `aws sso login` writes it, so the command
+	// reads back what the subprocess produced rather than what the test staged.
+	path := ssoCachePath(t, fixtureStartURL)
+	binDir := t.TempDir()
+	script := "#!/bin/sh\nmkdir -p '" + filepath.Dir(path) + "'\n" +
+		"printf '%s' '{\"accessToken\":\"t\",\"expiresAt\":\"" + expiry.Format(time.RFC3339) + "\"}' > '" + path + "'\n"
+	if err := os.WriteFile(filepath.Join(binDir, "aws"), []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake aws: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var stdout, stderr bytes.Buffer
+	if code := loginTestApp(t, &stdout, &stderr).run([]string{"--profile", "sso-only", "login"}); code != 0 {
+		t.Fatalf("exit %d, want 0; stderr: %s", code, stderr.String())
+	}
+	for _, want := range []string{"Logged in", "sso-only", formatExpiry(expiry)} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("stdout %q should contain %q", stdout.String(), want)
+		}
+	}
+}
+
+// `bmcp login` takes no arguments, and a typo must not be read as one.
+func TestLoginTakesNoArguments(t *testing.T) {
+	argvFile := loginTestEnv(t, 0)
+	var stdout, stderr bytes.Buffer
+	if code := loginTestApp(t, &stdout, &stderr).run([]string{"login", "sso-only"}); code != exitValidation {
+		t.Fatalf("exit %d, want %d; stderr: %s", code, exitValidation, stderr.String())
+	}
+	if argv, ran := awsRan(t, argvFile); ran {
+		t.Fatalf("a usage error spawned a login: aws %s", argv)
+	}
+}
+
+// A profile bmcp cannot parse is reported as that, not as "name an SSO profile".
+//
+// profileUsesSSO answers false for an unreadable profile deliberately: wherever
+// it is used inside awsCredentials, the SDK failure that made the profile
+// unreadable is already the error being reported. cmdLogin has no such preceding
+// failure, so without its own check it would answer a caller who named a broken
+// SSO profile by telling them to name an SSO profile.
+func TestLoginReportsAnUnreadableProfileRatherThanBlamingTheChoice(t *testing.T) {
+	argvFile := loginTestEnv(t, 0)
+	// A profile naming a session section that does not exist: the SDK fails with
+	// "failed to find SSO session section", which is the answer worth keeping.
+	appendSharedConfig(t, `
+[profile dangling-session]
+sso_session = nowhere
+sso_account_id = 123456789012
+sso_role_name = ExampleRole
+region = us-east-1
+`)
+	var stdout, stderr bytes.Buffer
+	if code := loginTestApp(t, &stdout, &stderr).run([]string{"--profile", "dangling-session", "login"}); code != exitConfig {
+		t.Fatalf("exit %d, want %d; stderr: %s", code, exitConfig, stderr.String())
+	}
+	if argv, ran := awsRan(t, argvFile); ran {
+		t.Fatalf("an unreadable profile still started a login: aws %s", argv)
+	}
+	if !strings.Contains(stderr.String(), "SSO session section") {
+		t.Fatalf("the SDK's own account of the problem was lost: %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Name an SSO profile") {
+		t.Fatalf("a broken SSO profile was answered by telling the caller to name one: %s", stderr.String())
+	}
+}
+
+// The implicit login gets the same leaf-profile fix as the command, because
+// both now go through runSSOLogin.
+//
+// This is the half of the shared-helper claim that nothing else pins.
+// TestADeviceFlowStartsOnlyWhenItCouldFinish records only that the subprocess
+// ran, so reverting awsCredentials to building the command inline —
+// reinstating both the outer-profile and unresolved-path defects on the path a
+// tool call actually takes — would pass every other test in the package.
+func TestTheImplicitLoginAlsoTargetsTheLeafProfile(t *testing.T) {
+	isolateAWSEnv(t)
+	appendSharedConfig(t, `
+[profile chained-implicit]
+role_arn = arn:aws:iam::123456789012:role/Chained
+source_profile = sso-only
+region = us-east-1
+`)
+	binDir := t.TempDir()
+	argvFile := filepath.Join(t.TempDir(), "aws-argv")
+	script := "#!/bin/sh\necho \"$@\" > '" + argvFile + "'\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "aws"), []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake aws: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	a := authTestApp()
+	// Everything the implicit branch needs: a human format, a terminal, and a
+	// budget a login could finish in.
+	a.machine = false
+	a.interactive = func() bool { return true }
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	_, _, err := a.awsCredentials(ctx, effectiveConfig{
+		Profile:       "chained-implicit",
+		ProfileSource: profileSourceFile,
+		Region:        "us-east-1",
+	})
+	if err == nil {
+		t.Fatal("a chain onto an sso-only profile should not have resolved in a test")
+	}
+	argv, ran := awsRan(t, argvFile)
+	if !ran {
+		t.Fatalf("the implicit login never ran; error was: %v", err)
+	}
+	if argv != "sso login --profile sso-only" {
+		t.Fatalf("aws %s, want the leaf profile: `sso login --profile sso-only` — "+
+			"`aws sso login --profile chained-implicit` reads that profile's own SSO "+
+			"config, which is empty", argv)
 	}
 }

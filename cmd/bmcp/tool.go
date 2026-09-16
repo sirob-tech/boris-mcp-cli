@@ -811,7 +811,7 @@ func nearest(name string, candidates []string) string {
 // That distinction carries real weight against short command names. Transposition
 // is one of the most common ways to mistype a word, and under plain Levenshtein
 // `lsit`, `snyc`, `inti` and `clal` all cost two — out of reach of the tight
-// threshold that four-letter command names need to avoid swallowing unrelated
+// threshold that short command names need to avoid swallowing unrelated
 // tokens. Counting the swap as one edit covers them without loosening anything
 // else.
 func editDistance(a, b string) int {

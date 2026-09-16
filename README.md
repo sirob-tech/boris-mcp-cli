@@ -331,6 +331,43 @@ Check setup:
 bmcp doctor
 ```
 
+### Refreshing an expired SSO session
+
+When the profile in play resolves through AWS SSO and its session has expired,
+every message about it names one command:
+
+```bash
+bmcp login                       # or: bmcp --profile <name> login
+```
+
+Run it exactly as the message spells it. It carries `--profile` whenever a
+profile is in play, and dropping it logs into a different profile than the one
+that failed.
+
+It shells out to `aws sso login`, following `source_profile` to the leaf, which
+is where the SSO configuration lives. A browser opens on this machine and `bmcp`
+blocks until the login is approved — the AWS CLI allows ten minutes for that,
+and `bmcp` allows a minute more so it is never the one to cut the window short.
+If the cached session is still valid it exits 0 and opens nothing, so it is safe
+to run on a failure it turns out not to fix.
+
+It refuses, with an actionable `interactive_login_required` error and no prompt,
+under `--format json`, `--format ndjson` and `--json` — see
+[Machine output](#machine-output) — and separately under `--non-interactive` or
+`BMCP_NON_INTERACTIVE`, which is how a caller says nobody is there to approve
+anything. It does **not** require a terminal: a browser does not need one, and
+refusing without a tty would rule out the case this command mostly exists for,
+an agent running it while its operator approves in a window already open. Run it
+on its own in the human format, then retry the call that failed, once.
+
+A tool call on a *fresh* catalog will also start this login by itself, without
+being asked, when it is running interactively in a human format and has enough
+of its ten-minute budget left. That is a convenience, not something to rely on:
+a stale catalog puts the credential load inside a sixty-second sync budget,
+which is shorter than a login, so the implicit one declines and the message
+naming `bmcp login` is what you get. An expired session and a stale catalog
+usually arrive together, which is why the command exists.
+
 ## Install Agent Instructions
 
 The installer does not register BORIS as a local MCP server. It writes
@@ -509,6 +546,7 @@ bmcp list
 bmcp describe <tool>
 bmcp <tool> --arg value
 bmcp call <tool> '{"arg":"value"}'
+bmcp login
 bmcp update
 ```
 
@@ -568,8 +606,13 @@ Under `--format json` or `--format ndjson`, three rules hold for every command:
   `--help` prints human text in every format.
 - **Success documents carry `ok` and `command`**, then whatever that command
   answers with.
-- **Nothing prompts.** No first-run wizard, no URL or profile question, no
-  `aws sso login` shell-out — each returns an actionable error instead.
+- **Nothing prompts.** No first-run wizard, no URL or profile question, no SSO
+  login shell-out — each returns an actionable error instead. `bmcp login`,
+  whose whole job is to open a browser and block, refuses outright under both
+  machine formats and under the legacy `--json`, with
+  `error: "interactive_login_required"` and exit 3. The name is deliberately
+  not `auth_failure`: that is the name whose message sends you to `bmcp login`
+  in the first place, and a refusal wearing it would be a loop.
 
 A tool call answers like this:
 
