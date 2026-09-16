@@ -186,12 +186,21 @@ func (a *app) hasAnyCommand(names []string) bool {
 }
 
 func (a *app) hasCommand(name string) bool {
+	_, err := a.resolveCommand(name)
+	return err == nil
+}
+
+// resolveCommand is hasCommand's other half: the absolute path, for the callers
+// that go on to run what they just looked for. Sharing one lookup is what keeps
+// a detection and the exec that follows it from disagreeing about which binary
+// on PATH they mean — and it is the seam a test needs to put a fake `aws` in
+// front of runSSOLogin.
+func (a *app) resolveCommand(name string) (string, error) {
 	lookPath := a.lookPath
 	if lookPath == nil {
 		lookPath = exec.LookPath
 	}
-	_, err := lookPath(name)
-	return err == nil
+	return lookPath(name)
 }
 
 func userDirExists(name string) bool {
@@ -869,11 +878,13 @@ This is a local check: while the cached tool catalog is fresh it authenticates n
 
 **Never shorten ` + "`bmcp`" + ` output to a fixed number of lines, bytes, or records.** The cut leaves no marker, so a partial answer looks exactly like a complete one. If a result is too large: filter by scope (account, region, namespace, selector) first, then ` + "`bmcp --max-bytes <n>`" + `, the one cut that marks what it dropped — and a count cap like ` + "`max_results`" + ` only last, because that one may leave no marker at all. A result is not complete if ` + "`truncated`" + ` or ` + "`has_more`" + ` is set, or a count cap applied — yours, or the tool's own default.
 
-If a tool call later fails on authentication or connectivity, run ` + "`bmcp doctor --deep`" + `, which checks credentials, the server and the live catalog for real, and says which of them is at fault. The BORIS MCP server requires AWS credentials for any account in the AWS Organization; if auth is unavailable, use the normal environment credential workflow available in this harness or explain the credential requirement to the user.
+If a tool call later fails on authentication or connectivity, run ` + "`bmcp doctor --deep`" + `, which checks credentials, the server and the live catalog for real, and says which of them is at fault. The BORIS MCP server requires AWS credentials for any account in the AWS Organization; if auth is unavailable, explain the credential requirement to the user.
+
+**When a bmcp message tells you to run ` + "`bmcp login`" + `, run it.** That is the one auth remedy you may apply on your own, and the message naming it is the only trigger — never run it on some other failure, and never because an error was merely about credentials. A gateway rejection reports the same error name as an expired session, and logging in does not repair one. Then: retry the original call exactly **once**, and if it fails again report the cause the message carried rather than logging in a second time. The command opens a browser on this machine and blocks until a human approves it, so raise the timeout **for that one command** rather than for the session, and tell the user bmcp is waiting on them. Do not run ` + "`aws sso login`" + ` yourself — it goes around bmcp's own profile resolution, and the user's environment may forbid it.
 
 Every ` + "`bmcp doctor`" + ` reports a ` + "`credentials`" + ` row naming which credentials a call would use: an AWS profile and where that profile came from, or the credentials the environment carries and the profile they outrank. It ends in ` + "`— found, not verified`" + ` because it states what resolved locally and is not a verdict on whether those credentials work — nothing was contacted to form one. Only a run that goes remote tests them — ` + "`bmcp doctor --deep`" + `, or a plain ` + "`bmcp doctor`" + ` whose cached catalog is missing, unreadable or stale — and then its ` + "`auth`" + ` and ` + "`remote`" + ` rows both come from that one attempt, so they cannot contradict each other. A failing ` + "`auth`" + ` row means either that bmcp never produced a signed request, in which case there is no ` + "`remote`" + ` row at all, or that the BORIS gateway refused the request it did sign; every other remote failure leaves ` + "`auth`" + ` passing and fails ` + "`remote`" + ` alone.
 
-If the ` + "`credentials`" + ` row names a source the user did not intend — stale ` + "`AWS_ACCESS_KEY_ID`" + ` in the environment displacing their configured profile, say — ` + "`bmcp --profile <name> <tool>`" + ` overrides it for one call, since a profile named for the invocation outranks anything ambient. One case bmcp corrects by itself: environment credentials stamped with a past ` + "`AWS_CREDENTIAL_EXPIRATION`" + ` — a lapsed ` + "`aws-vault exec`" + ` shell — are passed over in favour of the ambient profile they were outranking, and that row says so.
+If the ` + "`credentials`" + ` row names a source the user did not intend — stale ` + "`AWS_ACCESS_KEY_ID`" + ` in the environment displacing their configured profile, say — ` + "`bmcp --profile <name> <tool>`" + ` overrides it for one call, since a profile named for the invocation outranks anything ambient. One case bmcp corrects by itself: environment credentials stamped with a past ` + "`AWS_CREDENTIAL_EXPIRATION`" + ` — a lapsed ` + "`aws-vault exec`" + ` shell — are passed over in favour of the ambient profile they were outranking, and that row says so. In the other direction: do not wrap a ` + "`bmcp`" + ` call in a credential helper, and do not set ` + "`AWS_ACCESS_KEY_ID`" + ` for one, unless displacing the configured profile is what you meant to do — bmcp resolves credentials itself, and anything ambient outranks what it would have chosen.
 
 Useful commands:
 
@@ -884,6 +895,7 @@ Useful commands:
 - ` + "`bmcp call <tool> '{\"arg\":\"value\"}'`" + `: call a tool with JSON.
 - ` + "`bmcp --pretty <tool> ...`" + `: pretty-print JSON output when the tool returns JSON. Not needed under ` + "`--format json`" + `.
 - ` + "`bmcp --raw <tool> ...`" + `: show the original MCP tool envelope for debugging.
+- ` + "`bmcp login`" + `: refresh the AWS SSO session for the profile bmcp would use. Run it only when a bmcp message names it, as above. It exits 0 without opening anything when the session is already valid, and refuses under ` + "`--format json`" + `, ` + "`--format ndjson`" + `, ` + "`--json`" + ` and ` + "`--non-interactive`" + ` — so run it on its own, in the human format, and put ` + "`--format`" + ` back on the call you retry.
 
 Output format: pass ` + "`--format human|json|ndjson`" + ` to any command to get the machine-output contract. Prefer ` + "`--format json`" + ` (or ` + "`--format ndjson`" + ` for ` + "`bmcp list`" + `) for anything you intend to parse. Without it each command keeps its older output, which is not a contract — ` + "`--output`" + ` and ` + "`--json`" + ` are the legacy flags and are deprecated.
 

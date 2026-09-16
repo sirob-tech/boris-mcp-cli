@@ -5284,8 +5284,33 @@ func TestGeneratedInstructionsDoNotDependOnJQ(t *testing.T) {
 	if !strings.Contains(got, "requires AWS credentials for any account in the AWS Organization") {
 		t.Fatalf("instructions should explain AWS credential requirement: %s", got)
 	}
-	if strings.Contains(got, "refresh AWS SSO") || strings.Contains(got, "Do not try to fix auth") {
-		t.Fatalf("instructions should not prescribe auth remediation: %s", got)
+	// Reversed deliberately. This used to demand that the instructions prescribe
+	// no auth remediation at all — traceable to an original "Report the failure
+	// and stop" — and an agent meeting an expired SSO session followed it exactly:
+	// it reported, stopped, and handed the task back, which is the session this
+	// command was built from.
+	//
+	// The stance is still "agents do not improvise auth fixes". What changed is
+	// that there is now exactly one sanctioned remedy, so naming it IS the
+	// guardrail: an agent told which single command to run is an agent told not to
+	// invent another. `aws sso login` must not be prescribed — it goes around
+	// bmcp's profile resolution, and some operators forbid it outright — but the
+	// paragraph does name it, in a sentence saying not to run it, so the pin is on
+	// the prescription rather than on the bare name.
+	if !strings.Contains(got, "`bmcp login`") {
+		t.Fatalf("instructions should name the one sanctioned auth remedy: %s", got)
+	}
+	if strings.Contains(got, "Run: aws sso login") {
+		t.Fatalf("instructions should not prescribe running the AWS CLI directly: %s", got)
+	}
+	if !strings.Contains(got, "Do not run `aws sso login` yourself") {
+		t.Fatalf("instructions should rule the AWS CLI out explicitly: %s", got)
+	}
+	// And the trigger is the message, not the error name. `auth_failure` unions a
+	// gateway 401 with an expired session by design, so an agent keyed on the name
+	// would log in, retry, meet the same 401, and log in again.
+	if !strings.Contains(got, "When a bmcp message tells you to run `bmcp login`, run it") {
+		t.Fatalf("instructions should key the remedy on the message, not on an error name: %s", got)
 	}
 	if !strings.Contains(got, "unwraps MCP text envelopes internally") {
 		t.Fatalf("instructions should explain internal unwrapping: %s", got)
@@ -5967,9 +5992,16 @@ func TestNearestCommandRules(t *testing.T) {
 		{"inti", "init"},
 		{"clal", "call"},
 		{"doctro", "doctor"},
+		// The five-character band, which nothing pinned before `login` joined the
+		// table and widened it from four. One edit still resolves; two no longer do.
+		{"logn", "login"},
+		{"serv", "serve"}, // and by prefix as well, which is what makes it survive
+		{"sever", ""},
 		// Plausible tool names must NOT be captured: every one of these is within
-		// three edits of a four-letter command, and `init` and `sync` both have
-		// side effects, so a confident wrong answer is worse than none.
+		// three edits of a short command name, and `init` and `sync` have side
+		// effects while `login` opens a browser, so a confident wrong answer is
+		// worse than none. `logs` is the case that forced the band open: it is two
+		// edits from `login`, and `get_eks_logs` is a real tool in the catalog.
 		{"cost", ""},
 		{"logs", ""},
 		{"info", ""},
@@ -6528,5 +6560,156 @@ func TestPipedInputStillReachesTheHelperWhenThePayloadCameFromArgv(t *testing.T)
 	}
 	if a.helperStdinDiscarded {
 		t.Fatal("bmcp recorded a stdin discard on a call whose payload came from argv")
+	}
+}
+
+// The loop from session 6268dc30, walked end to end on the streams an agent
+// actually reads.
+//
+// That session met an expired SSO session, was told to run `aws sso login`,
+// was forbidden by its own instructions from running it, and handed the task
+// back. Every individual piece of the fix is pinned elsewhere in this package;
+// what nothing else pins is that the pieces join up — that each step's output
+// names a next step which is itself runnable, and that the walk terminates in
+// a working call rather than in another message about credentials.
+//
+// The catalog is deliberately stale, at 233h against the 168h default TTL,
+// because that is the state 6268dc30 was actually in and it is the one where
+// the implicit login in awsCredentials cannot help: both documented call forms
+// converge on a strict cacheForCatalog whose sixty-second SyncTimeout is
+// shorter than ssoLoginBudget, so deviceFlowFits declines before the output
+// format is ever consulted. A walk on a fresh catalog would prove much less.
+func TestExpiredSSORecoveryLoopIsWalkable(t *testing.T) {
+	argvFile := loginTestEnv(t, 0)
+	t.Chdir(t.TempDir())
+	tools := []tool{{Name: "tools___search_aws", Description: "Search."}}
+	borisHome := setupInstallCatalog(t, os.Getenv("HOME"), tools)
+	// config.toml naming the SSO profile, as `bmcp init --profile` leaves it —
+	// so the remedy has a profile to carry and the walk has one to log into.
+	cfgPath := filepath.Join(borisHome, "config.toml")
+	fileCfg, err := readConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	fileCfg.AWSProfile = "sso-only"
+	if err := writeConfig(cfgPath, fileCfg); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cachePath := filepath.Join(borisHome, "tools.json")
+	cache, err := readCache(cachePath)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+	cache.LastSync = time.Now().Add(-233 * time.Hour)
+	if err := writeCache(cachePath, cache); err != nil {
+		t.Fatalf("write cache: %v", err)
+	}
+
+	// The whole walk turns on one fact changing underneath it: credentials fail
+	// until the login has run, and work afterwards. Before it, the real
+	// awsCredentials answers, so every message the walk reads is the one
+	// production produces rather than a fixture's idea of it; after it, static
+	// credentials stand in for the token `aws sso login` would have written,
+	// which no offline test can mint for itself.
+	loggedIn := func() bool {
+		_, ran := awsRan(t, argvFile)
+		return ran
+	}
+	newApp := func(stdout, stderr *bytes.Buffer) *app {
+		a := loginTestApp(t, stdout, stderr)
+		a.httpClient = &fakeMCP{tools: tools, callResult: []byte(`{"nodes":[]}`)}
+		a.credentials = func(ctx context.Context, cfg effectiveConfig) (aws.Credentials, string, error) {
+			if loggedIn() {
+				return staticCreds()(ctx, cfg)
+			}
+			return a.awsCredentials(ctx, cfg)
+		}
+		return a
+	}
+	const remedy = "bmcp --profile sso-only login"
+
+	// 1. The command BORIS.md tells an agent to run first. On a stale catalog it
+	//    escalates to the network half, so it is the first place the expired
+	//    session is reported — and it has to name the remedy, because an agent
+	//    that stops here is 6268dc30.
+	var stdout, stderr bytes.Buffer
+	if code := newApp(&stdout, &stderr).run([]string{"doctor"}); code != exitGeneric {
+		t.Fatalf("doctor exit %d, want %d; stdout:\n%s", code, exitGeneric, stdout.String())
+	}
+	if !strings.Contains(stdout.String(), remedy) {
+		t.Fatalf("doctor should name the remedy, got:\n%s", stdout.String())
+	}
+
+	// 2. The tool call itself, in the format the instructions tell agents to
+	//    prefer. One parseable document on stderr, nothing on stdout, and the
+	//    remedy inside the message rather than in prose the format suppresses.
+	call := []string{"--format", "json", "tools___search_aws"}
+	stdout.Reset()
+	stderr.Reset()
+	if code := newApp(&stdout, &stderr).run(call); code != exitAuth {
+		t.Fatalf("tool call exit %d, want %d; stderr:\n%s", code, exitAuth, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("a failure must leave stdout empty, got:\n%s", stdout.String())
+	}
+	var failure struct {
+		OK      bool   `json:"ok"`
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(stderr.Bytes(), &failure); err != nil {
+		t.Fatalf("stderr is not one JSON document (%v):\n%s", err, stderr.String())
+	}
+	if failure.OK || !strings.Contains(failure.Message, remedy) {
+		t.Fatalf("the failure should carry the remedy in its message, got: %+v", failure)
+	}
+
+	// 3. The remedy run in the format the failed call was using, which is what an
+	//    agent reaches for first. It must refuse — and under a name of its own,
+	//    because a refusal called auth_failure is a refusal that sends the agent
+	//    back to step 3 forever.
+	stdout.Reset()
+	stderr.Reset()
+	if code := newApp(&stdout, &stderr).run([]string{"--format", "json", "--profile", "sso-only", "login"}); code != exitAuth {
+		t.Fatalf("machine-format login exit %d, want %d; stderr: %s", code, exitAuth, stderr.String())
+	}
+	if err := json.Unmarshal(stderr.Bytes(), &failure); err != nil {
+		t.Fatalf("stderr is not one JSON document (%v): %s", err, stderr.String())
+	}
+	if failure.Error != "interactive_login_required" {
+		t.Fatalf("a machine-format refusal named %q, which would loop", failure.Error)
+	}
+	if !strings.Contains(failure.Message, remedy) {
+		t.Fatalf("the refusal should hand back the runnable form, got: %q", failure.Message)
+	}
+	if loggedIn() {
+		t.Fatal("a machine-format login opened a browser")
+	}
+
+	// 4. And the form it handed back, which has to be the one that works.
+	stdout.Reset()
+	stderr.Reset()
+	if code := newApp(&stdout, &stderr).run([]string{"--profile", "sso-only", "login"}); code != 0 {
+		t.Fatalf("login exit %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if argv, ran := awsRan(t, argvFile); !ran || argv != "sso login --profile sso-only" {
+		t.Fatalf("the login ran %q, want `sso login --profile sso-only`", argv)
+	}
+
+	// 5. The original call, retried once, as the instructions say to.
+	stdout.Reset()
+	stderr.Reset()
+	if code := newApp(&stdout, &stderr).run(call); code != 0 {
+		t.Fatalf("the retry exit %d, want 0; stderr:\n%s", code, stderr.String())
+	}
+	var answer struct {
+		OK   bool   `json:"ok"`
+		Tool string `json:"tool"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &answer); err != nil {
+		t.Fatalf("the retry's stdout is not one JSON document (%v):\n%s", err, stdout.String())
+	}
+	if !answer.OK || answer.Tool != "tools___search_aws" {
+		t.Fatalf("the walk did not end in a working call: %+v", answer)
 	}
 }

@@ -51,6 +51,15 @@ var commands = []command{
 	{names: []string{"init"}, autoUpdate: true, run: (*app).cmdInit},
 	{names: []string{"sync"}, autoUpdate: true, run: (*app).cmdSync},
 	{names: []string{"doctor"}, autoUpdate: true, scope: scopeDoctor, run: (*app).cmdDoctor},
+	// No `auth` alias. `tools` below earned its place through a transcript audit
+	// that measured it as the commonest wrong first token; `auth` has no such
+	// evidence, and an alias added on a hunch is one more name the catalog can
+	// never use. The same trade as `tools`: this shadows a remote tool literally
+	// named `login`, which the namespace prefix (`tools___<name>`) makes an
+	// implausible name for a tool inside it.
+	//
+	// No autoUpdate either: see cmdLogin.
+	{names: []string{"login"}, run: (*app).cmdLogin},
 	{names: []string{"update"}, scope: scopeUpdate, run: (*app).cmdUpdate},
 	// `tools` is here because it is what agents typed. It was the single most
 	// common wrong first token in the transcript audit, ahead of every
@@ -93,11 +102,12 @@ func commandNames() []string {
 // nearestCommand answers with a command name only where the guess is a good one.
 // Plain edit distance is not good enough here, and it fails in both directions.
 //
-// Command names are short, so `sync`, `init`, `call` and `list` become attractors
-// that swallow any three-to-five character token: at a flat threshold of 3, `info`
-// meant `init` and `cost` meant `list`. Both of those point at commands with side
-// effects — `init` rewrites config and `sync` rewrites installed instruction files
-// — so a confidently wrong suggestion can talk a caller into one.
+// Command names are short, so `sync`, `init`, `call`, `list` and `login` become
+// attractors that swallow any three-to-five character token: at a flat threshold
+// of 3, `info` meant `init` and `cost` meant `list`. Both of those point at
+// commands with side effects — `init` rewrites config, `sync` rewrites installed
+// instruction files, and `login` opens a browser — so a confidently wrong
+// suggestion can talk a caller into one.
 //
 // In the other direction, truncation costs one edit per dropped character, so the
 // most natural abbreviations lost to unrelated short names: `desc` was answered
@@ -111,11 +121,20 @@ func nearestCommand(name string) string {
 		return prefixed[0]
 	}
 	// Then distance, scaled to the length of what it is matching against. One edit
-	// on a four-letter command is already a quarter of it.
+	// on a five-letter command is already a fifth of it.
+	//
+	// The band was four until `login` joined the table. `logs` is two edits from
+	// it — and `get_eks_logs` is a real tool in the catalog, so a caller typing
+	// `logs` was being answered with a command that opens a browser. Widening to
+	// five costs the other five-letter command, `serve`, the suggestions for `srv`
+	// and `sever`; `serv`, `server` and `sevre` still resolve. That trade is in the
+	// safe direction, which is the one that matters here: it removes wrong
+	// suggestions and adds none, and nearestCommand's other caller can talk
+	// someone into running `init` or `sync`.
 	best, bestDist := "", 0
 	for _, candidate := range commandNames() {
 		limit := 3
-		if len(candidate) <= 4 {
+		if len(candidate) <= 5 {
 			limit = 1
 		}
 		d := editDistance(name, candidate)
@@ -457,6 +476,127 @@ func (a *app) cmdSync(flags globalFlags, args []string) int {
 		return a.fail(flags, exitValidation, "usage", "usage: bmcp sync")
 	}
 	return a.cmdSyncWithRefresh(flags, true, true)
+}
+
+// cmdLogin refreshes the AWS SSO session bmcp's own calls resolve through.
+//
+// It exists because the implicit login in awsCredentials cannot be reached when
+// it is most needed. That branch needs a fresh catalog to get anywhere near a
+// browser: a stale one sends both documented call forms through
+// cacheForCatalog's sixty-second SyncTimeout, and deviceFlowFits declines a
+// device flow under any budget shorter than ssoLoginBudget — before the output
+// format or the terminal is ever consulted. An expired SSO session usually
+// means the machine has been idle, which is also how the catalog went stale, so
+// the two arrive together. `bmcp login` carries no sync budget at all, which is
+// the whole point of it being a command rather than a wording change.
+//
+// It is also the one remedy this binary can name to an agent: a message that
+// said `aws sso login` would send one outside bmcp's profile resolution, and
+// operators whose instructions forbid running the AWS CLI directly had no
+// sanctioned step left at all.
+//
+// Deliberately not on the autoUpdate list. A binary swap underneath a recovery
+// is the wrong moment for one, and it would put a download between the operator
+// and the browser they are waiting for.
+func (a *app) cmdLogin(flags globalFlags, args []string) int {
+	if len(args) != 0 {
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp login")
+	}
+	invocation := loginInvocation(flags)
+	// Ahead of anything that reads config or disk: this refusal is about the
+	// invocation's own output contract, and it must not depend on whether the
+	// machine it runs on happens to be configured.
+	//
+	// interactive_login_required, never auth_failure, and the difference is a
+	// loop. The generated instructions tell an agent to run this command when a
+	// bmcp message names it; a refusal wearing the name agents react to would have
+	// them run it again, in the same format, indefinitely. It still exits 3, so
+	// the loop guard is the name alone.
+	//
+	// --format human is not gated, which is why the message names the two machine
+	// formats rather than the flag. The legacy --json is gated alongside them: it
+	// is not the contract, but its callers parse what bmcp writes just the same,
+	// and a login would block and then write English into it.
+	if flags.machine() || flags.legacyJSON() {
+		return a.fail(flags, exitAuth, "interactive_login_required", fmt.Sprintf(
+			"bmcp login opens a browser and blocks until the login is approved, so it is not available under --format json, --format ndjson or --json. Run it in a human format: %s", invocation))
+	}
+	cfg, _, err := a.loadEffective(flags, false)
+	if err != nil {
+		return a.fail(flags, exitConfig, "config_invalid", err.Error())
+	}
+	// Its own message, naming its own escape, and never repeating the command
+	// above. --non-interactive and BMCP_NON_INTERACTIVE are OR'd together and
+	// there is no --interactive to clear either, so "run bmcp login" would be
+	// advice this very invocation has just proved cannot work.
+	if cfg.NonInteractive {
+		return a.fail(flags, exitAuth, "interactive_login_required",
+			"bmcp login opens a browser and blocks until the login is approved, and this invocation disabled prompts and SSO login: --non-interactive, or BMCP_NON_INTERACTIVE in the environment. No flag clears it — drop --non-interactive, or unset BMCP_NON_INTERACTIVE, and log in from a session where a browser can open.")
+	}
+	// The budget bmcp's own login gets, rather than whatever a caller's command
+	// happened to leave: ten minutes, matching what the AWS CLI itself waits for.
+	ctx, cancel := context.WithTimeout(context.Background(), ssoLoginTimeout)
+	defer cancel()
+	// sharedProfileFor, so that --profile and BMCP_PROFILE name the profile to log
+	// into, and so that an ambient profile yields to environment credentials here
+	// exactly as it does for a call. When it yields there is nothing to log in
+	// to — which is the case describeCredentialSource is here to explain rather
+	// than leave as a silent refusal.
+	profile, _, _ := a.sharedProfileFor(cfg)
+	if profile == "" || !profileUsesSSO(ctx, profile) {
+		return a.fail(flags, exitAuth, "not_an_sso_profile", fmt.Sprintf(
+			"bmcp login refreshes an AWS SSO session, and this invocation resolves credentials from %s, which is not one.\nName an SSO profile for the login: bmcp --profile <name> login", a.describeCredentialSource(cfg)))
+	}
+	// The guard that keeps this command idempotent. `aws sso login` runs with
+	// force_refresh=True and never short-circuits on a token that is still good,
+	// so without this an agent told to run bmcp login would open a browser on
+	// every failure that reached it, including the ones a login cannot fix.
+	if expiry, err := ssoTokenExpiry(ctx, profile); err == nil && expiry.After(a.now()) {
+		fmt.Fprintf(a.stdout, "The AWS SSO session for %s is already valid, until %s. Nothing to do.\n", profile, formatExpiry(expiry))
+		return 0
+	}
+	// On prose, not stdout: it is what is about to happen rather than the answer.
+	// It says "blocks" because the caller may be an agent with a timeout of its
+	// own, and a browser waiting on a human is the one bmcp operation that can
+	// outlast one.
+	fmt.Fprintf(a.prose(), "Logging in to AWS SSO for profile %s. A browser opens on this machine, and bmcp blocks until the login is approved.\n", profile)
+	if runErr := a.runSSOLogin(ctx, profile); runErr != nil {
+		// sso_login_failed rather than auth_failure, for the reason the refusals
+		// above give: this command's own failures must never wear the name that
+		// sends an agent back to this command.
+		return a.fail(flags, exitAuth, "sso_login_failed", fmt.Sprintf(
+			"the AWS SSO login for profile %s failed: %v", profile, runErr))
+	}
+	fmt.Fprintf(a.stdout, "Logged in to AWS SSO for profile %s.%s\n", profile, loginValidity(ctx, profile, a.now()))
+	return 0
+}
+
+// loginInvocation renders the command that would run this login, carrying
+// --profile when one was named for the invocation.
+//
+// A bare `bmcp login` in a refusal aimed at a caller who passed --profile prod
+// would send them to log into whatever config.toml names instead — the same
+// defect the remedy text in awsauth.go spells the profile out to avoid.
+func loginInvocation(flags globalFlags) string {
+	if flags.profile != "" {
+		return "bmcp --profile " + flags.profile + " login"
+	}
+	return "bmcp login"
+}
+
+// loginValidity reports how long the session just obtained lasts, or nothing at
+// all when that cannot be read.
+//
+// Nothing, rather than a warning: the login itself succeeded, and a token bmcp
+// cannot find is far more likely to mean the cache key derivation disagrees with
+// this profile's form than that `aws` wrote nothing. Every call that follows
+// will say so properly if it is really absent.
+func loginValidity(ctx context.Context, profile string, now time.Time) string {
+	expiry, err := ssoTokenExpiry(ctx, profile)
+	if err != nil || !expiry.After(now) {
+		return ""
+	}
+	return " The session is valid until " + formatExpiry(expiry) + "."
 }
 
 // report is false when init calls this, because the contract allows a machine
@@ -1206,6 +1346,7 @@ func usage(w io.Writer) {
   bmcp install <claude-code|codex|opencode|cursor|kiro|all> [--scope user|project]
   bmcp sync
   bmcp doctor [--deep]
+  bmcp login
   bmcp list|ls|tools [--schemas] [--format human|json|ndjson]
   bmcp describe|d <tool>
   bmcp call <tool> ['{"arg":"value"}']
@@ -1213,6 +1354,15 @@ func usage(w io.Writer) {
   bmcp [--format json] [--max-bytes <n>] <exact_tool_name> --arg value
   bmcp update [--check] [--to <version>] [--rollback]
   bmcp version
+
+Flags for bmcp login:
+  (none)                       Refresh the AWS SSO session bmcp resolves through,
+                               for the profile this invocation would use. Opens a
+                               browser and blocks until the login is approved.
+                               Exits 0 without opening anything when the cached
+                               session is still valid. Not available under
+                               --format json, --format ndjson, --json or
+                               --non-interactive
 
 Flags for bmcp serve:
   (none)                       Speak MCP over stdin and stdout, re-exporting the

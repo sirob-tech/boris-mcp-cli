@@ -300,6 +300,36 @@ when `bmcp` never produced a signed request, in which case no `remote` row is
 emitted at all, or when the BORIS gateway refused the request it did sign; a
 connection that never arrives fails `remote` alone.
 
+#### Refreshing an expired SSO session
+
+When the profile in play resolves through AWS SSO and its session has expired,
+every message about it names one command:
+
+```bash
+bmcp login                       # or: bmcp --profile <name> login
+```
+
+It shells out to `aws sso login` for the profile this invocation would have
+used — following `source_profile` to the leaf, which is where the SSO
+configuration lives — and that command stays the only writer of
+`~/.aws/sso/cache`. A browser opens on this machine and `bmcp` blocks, for up
+to ten minutes, which is what the AWS CLI itself waits. If the cached session is
+still valid it exits 0 and opens nothing, so it is safe to run on a failure it
+turns out not to fix.
+
+It refuses, with an actionable `interactive_login_required` error and no
+prompt, under `--format json`, `--format ndjson`, `--json`, and
+`--non-interactive` — see [Machine output](#machine-output). Run it on its own
+in the human format, then retry the call that failed.
+
+A tool call on a *fresh* catalog will also start this login by itself, without
+being asked, when it is running interactively in a human format and has enough
+of its ten-minute budget left. That is a convenience, not something to rely on:
+a stale catalog puts the credential load inside a sixty-second sync budget,
+which is shorter than a device flow, so the implicit login declines and the
+message naming `bmcp login` is what you get. An expired session and a stale
+catalog usually arrive together.
+
 Harness detection checks for a known executable on `PATH` or an existing config
 directory such as `~/.claude`, `~/.codex`, `~/.config/opencode`, `~/.cursor`,
 or `~/.kiro`. Kiro is detected from either `kiro-cli` or `kiro` on `PATH`. Each detected harness is
@@ -509,6 +539,7 @@ bmcp list
 bmcp describe <tool>
 bmcp <tool> --arg value
 bmcp call <tool> '{"arg":"value"}'
+bmcp login
 bmcp update
 ```
 
@@ -568,8 +599,13 @@ Under `--format json` or `--format ndjson`, three rules hold for every command:
   `--help` prints human text in every format.
 - **Success documents carry `ok` and `command`**, then whatever that command
   answers with.
-- **Nothing prompts.** No first-run wizard, no URL or profile question, no
-  `aws sso login` shell-out — each returns an actionable error instead.
+- **Nothing prompts.** No first-run wizard, no URL or profile question, no SSO
+  login shell-out — each returns an actionable error instead. `bmcp login`,
+  whose whole job is to open a browser and block, refuses outright under both
+  machine formats and under the legacy `--json`, with
+  `error: "interactive_login_required"` and exit 3. The name is deliberately
+  not `auth_failure`: that is the name whose message sends you to `bmcp login`
+  in the first place, and a refusal wearing it would be a loop.
 
 A tool call answers like this:
 
