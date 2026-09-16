@@ -5300,11 +5300,18 @@ func TestGeneratedInstructionsDoNotDependOnJQ(t *testing.T) {
 	if !strings.Contains(got, "`bmcp login`") {
 		t.Fatalf("instructions should name the one sanctioned auth remedy: %s", got)
 	}
-	if strings.Contains(got, "Run: aws sso login") {
-		t.Fatalf("instructions should not prescribe running the AWS CLI directly: %s", got)
+	// Exactly one mention of the AWS CLI login, and it is the sentence forbidding
+	// it. A bare `!Contains("Run: aws sso login")` would have been the vacuous
+	// shape this change exists to remove elsewhere: that spelling never appeared
+	// in this template, so the assertion could not have failed, and every other
+	// phrasing of the same prescription — "run `aws sso login`", "if auth fails,
+	// aws sso login" — would have walked straight past it. Counting is what makes
+	// a second, prescriptive mention impossible.
+	if n := strings.Count(got, "aws sso login"); n != 1 {
+		t.Fatalf("instructions mention `aws sso login` %d times, want exactly 1 (the prohibition): %s", n, got)
 	}
 	if !strings.Contains(got, "Do not run `aws sso login` yourself") {
-		t.Fatalf("instructions should rule the AWS CLI out explicitly: %s", got)
+		t.Fatalf("the one mention should be the prohibition, not a prescription: %s", got)
 	}
 	// And the trigger is the message, not the error name. `auth_failure` unions a
 	// gateway 401 with an expired session by design, so an agent keyed on the name
@@ -5993,10 +6000,19 @@ func TestNearestCommandRules(t *testing.T) {
 		{"clal", "call"},
 		{"doctro", "doctor"},
 		// The five-character band, which nothing pinned before `login` joined the
-		// table and widened it from four. One edit still resolves; two no longer do.
+		// table and widened it from four.
+		//
+		// Only the negatives are directional. `logn` is one edit from `login` and
+		// resolved under the old band too, and `serv` is an unambiguous prefix of
+		// `serve` so it never reaches the distance loop at all — both are here
+		// because they are the cases that must keep working, not because they
+		// measure the band. `sever` and `srv` are what actually pin it: two and
+		// three edits from `serve`, so both answered `serve` at the old limit of 3
+		// and neither may answer anything at the new limit of 1.
 		{"logn", "login"},
-		{"serv", "serve"}, // and by prefix as well, which is what makes it survive
+		{"serv", "serve"},
 		{"sever", ""},
+		{"srv", ""},
 		// Plausible tool names must NOT be captured: every one of these is within
 		// three edits of a short command name, and `init` and `sync` have side
 		// effects while `login` opens a browser, so a confident wrong answer is

@@ -54,9 +54,11 @@ var commands = []command{
 	// No `auth` alias. `tools` below earned its place through a transcript audit
 	// that measured it as the commonest wrong first token; `auth` has no such
 	// evidence, and an alias added on a hunch is one more name the catalog can
-	// never use. The same trade as `tools`: this shadows a remote tool literally
-	// named `login`, which the namespace prefix (`tools___<name>`) makes an
-	// implausible name for a tool inside it.
+	// never use. The same trade as `tools`: this shadows the bare form of a remote
+	// tool literally named `login` — resolveTool matches on the un-prefixed
+	// display name, so it is the `bmcp login` spelling that is taken, while
+	// `bmcp tools___login`, `bmcp call login` and `bmcp describe login` all still
+	// reach it. No BORIS tool is plausibly named that.
 	//
 	// No autoUpdate either: see cmdLogin.
 	{names: []string{"login"}, run: (*app).cmdLogin},
@@ -124,13 +126,23 @@ func nearestCommand(name string) string {
 	// on a five-letter command is already a fifth of it.
 	//
 	// The band was four until `login` joined the table. `logs` is two edits from
-	// it — and `get_eks_logs` is a real tool in the catalog, so a caller typing
-	// `logs` was being answered with a command that opens a browser. Widening to
-	// five costs the other five-letter command, `serve`, the suggestions for `srv`
-	// and `sever`; `serv`, `server` and `sevre` still resolve. That trade is in the
-	// safe direction, which is the one that matters here: it removes wrong
-	// suggestions and adds none, and nearestCommand's other caller can talk
-	// someone into running `init` or `sync`.
+	// it — and `get_eks_logs` is a real tool in the catalog, so at the old band a
+	// caller typing `logs` would have been answered with a command that opens a
+	// browser. Widening to five costs the other five-letter command, `serve`, the
+	// suggestions for `srv` and `sever`; `serv`, `server` and `sevre` still
+	// resolve.
+	//
+	// Not a strict improvement, and the exception is worth knowing. Dropping
+	// `serve` out of the eligible set lets a farther candidate win where it used
+	// to: `stale` is distance 3 from both `serve` and `install`, so it answered
+	// `serve` before and answers `install` now. Every token in that class is three
+	// edits from two different commands and none of them is a plausible thing to
+	// type at bmcp. Accepted on those grounds rather than on "adds nothing wrong",
+	// which is not true.
+	//
+	// Adding `login` to the table also costs `l` its suggestion — it is now a
+	// prefix of both `list` and `login`, so prefix affinity declines to guess. That
+	// is the table entry's doing, not the band's.
 	best, bestDist := "", 0
 	for _, candidate := range commandNames() {
 		limit := 3
@@ -533,8 +545,18 @@ func (a *app) cmdLogin(flags globalFlags, args []string) int {
 		return a.fail(flags, exitAuth, "interactive_login_required",
 			"bmcp login opens a browser and blocks until the login is approved, and this invocation disabled prompts and SSO login: --non-interactive, or BMCP_NON_INTERACTIVE in the environment. No flag clears it — drop --non-interactive, or unset BMCP_NON_INTERACTIVE, and log in from a session where a browser can open.")
 	}
+	// And no a.isInteractive() gate, which is the one refusal this command
+	// deliberately does not make. The implicit branch in awsCredentials has one
+	// because it is deciding whether to *interrupt* somebody's tool call with a
+	// browser; here the browser is the entire request. `aws sso login` opens it
+	// through the desktop's own handler and needs no controlling terminal, so a
+	// tty test would refuse the primary case this command exists for — an agent
+	// spawning `bmcp login` with stdin from /dev/null while its operator approves
+	// in a window that is already open. cfg.NonInteractive is how a caller says
+	// nobody is there to approve, and it is honoured above.
+	//
 	// The budget bmcp's own login gets, rather than whatever a caller's command
-	// happened to leave: ten minutes, matching what the AWS CLI itself waits for.
+	// happened to leave. See ssoLoginTimeout.
 	ctx, cancel := context.WithTimeout(context.Background(), ssoLoginTimeout)
 	defer cancel()
 	// sharedProfileFor, so that --profile and BMCP_PROFILE name the profile to log
@@ -543,8 +565,21 @@ func (a *app) cmdLogin(flags globalFlags, args []string) int {
 	// to — which is the case describeCredentialSource is here to explain rather
 	// than leave as a silent refusal.
 	profile, _, _ := a.sharedProfileFor(cfg)
+	// The shared config is read before the SSO predicate, so that a profile which
+	// cannot be parsed is reported as what it is. profileUsesSSO answers false for
+	// an unreadable profile on purpose — everywhere it is used, the SDK failure
+	// that made it unreadable is already the error being reported. This command
+	// has no such preceding failure, so without this the SDK's precise account
+	// ("failed to find SSO session section, corp") would be replaced by advice to
+	// name an SSO profile, which is what the caller just did.
+	if profile != "" {
+		if _, err := sharedConfigProfile(ctx, profile); err != nil {
+			return a.fail(flags, exitConfig, "profile_invalid", fmt.Sprintf(
+				"AWS profile %s could not be read, so bmcp cannot tell whether it uses SSO: %v", profile, err))
+		}
+	}
 	if profile == "" || !profileUsesSSO(ctx, profile) {
-		return a.fail(flags, exitAuth, "not_an_sso_profile", fmt.Sprintf(
+		return a.fail(flags, exitAuth, "not_sso_profile", fmt.Sprintf(
 			"bmcp login refreshes an AWS SSO session, and this invocation resolves credentials from %s, which is not one.\nName an SSO profile for the login: bmcp --profile <name> login", a.describeCredentialSource(cfg)))
 	}
 	// The guard that keeps this command idempotent. `aws sso login` runs with
@@ -577,9 +612,21 @@ func (a *app) cmdLogin(flags globalFlags, args []string) int {
 // A bare `bmcp login` in a refusal aimed at a caller who passed --profile prod
 // would send them to log into whatever config.toml names instead — the same
 // defect the remedy text in awsauth.go spells the profile out to avoid.
+//
+// BMCP_PROFILE counts too, and is read from the environment directly rather than
+// from an effectiveConfig: this is used by the refusal that deliberately runs
+// ahead of any config load, and the variable is the other half of
+// "named for this invocation" (see profileSource.namedForThisInvocation). A
+// caller who exported it and then reads a bare `bmcp login` back would be sent
+// to a different profile the moment they ran it from a shell that did not carry
+// the variable. The flag wins, as it does everywhere else.
 func loginInvocation(flags globalFlags) string {
-	if flags.profile != "" {
-		return "bmcp --profile " + flags.profile + " login"
+	profile := flags.profile
+	if profile == "" {
+		profile = strings.TrimSpace(os.Getenv("BMCP_PROFILE"))
+	}
+	if profile != "" {
+		return "bmcp --profile " + profile + " login"
 	}
 	return "bmcp login"
 }

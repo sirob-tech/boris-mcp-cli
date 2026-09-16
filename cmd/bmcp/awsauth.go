@@ -362,18 +362,29 @@ func deviceFlowFits(ctx context.Context) bool {
 //
 // Not a reuse of ssoLoginBudget, whose docstring calls it the line below which
 // starting a flow is pointless: a minimum, not a measurement, and three minutes
-// of it. aws-cli's own PKCE callback waits ten (_OVERALL_TIMEOUT in
+// of it. aws-cli's own callback waits ten (_OVERALL_TIMEOUT in
 // awscli/customizations/sso/utils.py), so a shorter bound here would have
 // exec.CommandContext SIGKILL `aws` in the middle of a window the operator is
 // still allowed to answer in — the operator approves in the browser, the token
 // is never written, and bmcp reports `signal: killed` for a login that from the
 // outside succeeded. That is the failure ssoLoginBudget exists to prevent,
 // reintroduced by the command whose entire purpose is to finish one.
-const ssoLoginTimeout = 10 * time.Minute
+//
+// The margin over those ten minutes is the point, not slack. bmcp's clock starts
+// strictly earlier than aws-cli's: this context is created before resolveCommand,
+// before fork/exec, and before a Python interpreter starts and completes the
+// device-authorization round trip. Ten minutes exactly is therefore *shorter*
+// than the window it is quoting, and the last seconds of a flow the operator is
+// still entitled to finish would be killed by the constant that exists to stop
+// exactly that. A minute is far more than the startup cost and still bounds the
+// command.
+const ssoLoginTimeout = 11 * time.Minute
 
-// runSSOLogin shells out to `aws sso login`, which stays the only writer of
-// ~/.aws/sso/cache. Shared by the implicit branch in awsCredentials and by
-// cmdLogin, so the two cannot drift.
+// runSSOLogin shells out to `aws sso login`, which stays the only thing bmcp
+// asks to *mint* a token into ~/.aws/sso/cache — the SDK still refreshes an
+// sso_session token in that directory on its own, and this changes nothing about
+// that. Shared by the implicit branch in awsCredentials and by cmdLogin, so the
+// two cannot drift.
 //
 // Three things it does that the inline version it replaces did not.
 //
@@ -480,7 +491,7 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 	// would block on a browser login it has promised not to ask for, and the login
 	// subprocess would write its own prose straight to the inherited stderr —
 	// which is the one thing a machine format guarantees will not happen. Refusing
-	// here falls through to the actionable "run aws sso login" error below.
+	// here falls through to the actionable "run: bmcp --profile X login" error below.
 	//
 	// Too little time left is the third refusal, and the newest. An SSO device
 	// flow is a human reading a code, switching to a browser, authenticating and
@@ -507,11 +518,16 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 	// doing. The silent mint from ~/.aws/sso/cache needs no browser and is
 	// untouched on every path.
 	if usesSSO && deviceFlowFits(ctx) && !cfg.NonInteractive && !a.machine && a.isInteractive() {
-		// What it says, and not the command it is about to run. Naming
-		// `aws sso login` here would teach the one remedy every other message on
-		// this path now withholds: an agent that reads it runs the AWS CLI itself,
-		// outside bmcp's profile resolution and outside whatever its operator's own
-		// instructions say about SSO. The subprocess announces itself well enough.
+		// What it says, and not the command it is about to run. An announcement
+		// naming `aws sso login` reads as an instruction to run it, and a reader
+		// who does runs the AWS CLI outside bmcp's profile resolution and outside
+		// whatever its operator's own instructions say about SSO. The subprocess
+		// announces itself well enough.
+		//
+		// The failure below still names the command, because there it is reporting
+		// what ran rather than prescribing what to run — and a failure that said
+		// only "the login failed" would hide which login. This branch is also
+		// unreachable in a machine format, so no agent-facing document carries it.
 		fmt.Fprintf(a.prose(), "AWS SSO credentials for profile %s are expired or missing. Logging in.\n", profile)
 		if runErr := a.runSSOLogin(ctx, profile); runErr != nil {
 			// Carrying the failure the login was trying to repair, because the branch
@@ -532,9 +548,9 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 		// resolveCredsFromProfile ranks SSO above credential_process at that leaf,
 		// so no helper should be involved. Wrapped anyway, because the cost is one
 		// call and the alternative is an unwrapped Retrieve whose safety depends on
-		// that precedence never changing. No test covers it: reaching it needs the
-		// `aws sso login` subprocess to succeed, and it is built inline with no
-		// injection point.
+		// that precedence never changing. Still uncovered, but no longer
+		// uncoverable: runSSOLogin resolves `aws` through a.resolveCommand, so a
+		// test can put a fake that exits 0 on PATH and reach this line.
 		creds, err = a.retrieveCredentials(ctx, cfg, awsCfg.Credentials)
 	}
 	if err != nil {
@@ -543,8 +559,8 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 			// branch from configuration means it now fires for every failure an SSO
 			// profile can produce, not only the ones whose text happened to mention
 			// SSO — a DNS failure reaching STS, an AccessDenied on a chained role and
-			// an expired token all land here — so replacing the cause with "run aws
-			// sso login" would hide the ones a login cannot fix. Reporting the cause
+			// an expired token all land here — so replacing the cause with the login
+			// remedy alone would hide the ones a login cannot fix. Reporting the cause
 			// and the remedy together is the only version that is true in both cases.
 			//
 			// Going through authFailure is also what keeps #60's withholding in force
@@ -1069,21 +1085,27 @@ func ssoTokenExpiry(ctx context.Context, profile string) (time.Time, error) {
 	if err != nil {
 		return time.Time{}, err
 	}
-	// Only the one field, and no accessToken: a token this function returned as
-	// valid would otherwise be one it had read into memory for no reason, and the
-	// zero value of a struct nobody logs is the cheapest way to keep it out of a
-	// panic trace. aws-cli writes this file non-atomically (O_WRONLY|O_CREAT then
-	// truncate then write, botocore/utils.py), so a read racing a concurrent login
-	// can land on a zero-length window — which arrives here as a parse error and
-	// is treated as "expired", the same as absent.
+	// aws-cli writes this file non-atomically (O_WRONLY|O_CREAT then truncate then
+	// write, botocore/utils.py), so a read racing a concurrent login can land on a
+	// zero-length window — which arrives here as a parse error and is treated as
+	// "expired", the same as absent.
 	var cached struct {
-		ExpiresAt string `json:"expiresAt"`
+		AccessToken string `json:"accessToken"`
+		ExpiresAt   string `json:"expiresAt"`
 	}
 	if err := json.Unmarshal(body, &cached); err != nil {
 		return time.Time{}, fmt.Errorf("cached SSO token at %s is not readable JSON: %w", path, err)
 	}
-	if cached.ExpiresAt == "" {
-		return time.Time{}, fmt.Errorf("cached SSO token at %s names no expiry", path)
+	// Both fields, because the SDK requires both: loadCachedToken rejects a token
+	// with an empty accessToken outright ("cached SSO token must contain
+	// accessToken and expiresAt fields", ssocreds/sso_cached_token.go). Checking
+	// only the expiry would call such a file valid, and the consequence is the
+	// worst shape this command has: `bmcp login` reports "already valid, nothing
+	// to do", the retry it was run for fails identically, and the agent is told
+	// once more to run the command that just declined to act. The value is read
+	// and immediately dropped — it is never returned, logged or interpolated.
+	if cached.AccessToken == "" || cached.ExpiresAt == "" {
+		return time.Time{}, fmt.Errorf("cached SSO token at %s is missing accessToken or expiresAt", path)
 	}
 	at, err := time.Parse(time.RFC3339, cached.ExpiresAt)
 	if err != nil {
