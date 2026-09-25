@@ -811,3 +811,15 @@ func TestWidgetDrawsAnImageSoTheHostMenuOffersCopy(t *testing.T) {
 		t.Error("the drawing must not be injected as markup")
 	}
 }
+
+func TestWidgetCentresThePictureInTheFrame(t *testing.T) {
+	// The drawing is shown at its natural width, so a narrow one sat at the
+	// left of a wide panel. Centred, and still never scaled up or capped.
+	out := widgetHTML()
+	if !strings.Contains(out, `img.style.margin = "0 auto"`) {
+		t.Error("the picture must be centred in the frame")
+	}
+	if strings.Contains(out, "maxHeight") || strings.Contains(out, "max-height") {
+		t.Error("a height cap would shrink the labels with the drawing")
+	}
+}

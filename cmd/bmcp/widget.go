@@ -42,6 +42,7 @@ const widgetTemplate = `<div style="font:13px system-ui,-apple-system,sans-serif
     img.style.maxWidth = "100%%";
     img.style.height = "auto";
     img.style.display = "block";
+    img.style.margin = "0 auto";
     img.onload = size;
     img.onerror = function () { settle(svg); };
     img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
