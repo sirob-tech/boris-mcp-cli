@@ -15,7 +15,7 @@ const widgetTemplate = `<div style="font:13px system-ui,-apple-system,sans-serif
 </div>
 <script>
 (function () {
-  var nextId = 1, pending = {}, asked = false;
+  var nextId = 1, pending = {}, asked = false, canSave = false;
   function send(m) { window.parent.postMessage(m, "*"); }
   function call(method, params) {
     return new Promise(function (resolve, reject) {
@@ -33,20 +33,42 @@ const widgetTemplate = `<div style="font:13px system-ui,-apple-system,sans-serif
     document.getElementById("pic").innerHTML = html;
     size();
   }
-  // Drawn as an image, not as inline markup: a host's own context menu offers
-  // Copy Image over an image element and nothing at all over inline markup,
-  // which goes back in if the frame's CSP turns the data URI away.
+  // Drawn as an image, not as inline markup: the saved PNG is rasterised from
+  // it, and markup goes back in if the frame's CSP turns the data URI away.
   function draw(svg) {
     var pic = document.getElementById("pic"), img = new Image();
     img.alt = "infrastructure graph";
     img.style.maxWidth = "100%%";
     img.style.height = "auto";
     img.style.display = "block";
-    img.onload = size;
+    img.onload = function () { if (canSave) offerSave(img, svg); size(); };
     img.onerror = function () { settle(svg); };
     img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
     pic.innerHTML = "";
     pic.appendChild(img);
+  }
+  // Claude Desktop refuses this frame clipboard writes, and its Copy Image
+  // cannot reach an image inside the frame, so the host's download is the way out.
+  function offerSave(img, svg) {
+    var button = document.createElement("button");
+    button.textContent = "Save as PNG";
+    button.style.cssText = "display:block;margin:0 0 4px auto;padding:0;border:0;" +
+      "background:none;font:inherit;color:#6b7280;text-decoration:underline;cursor:pointer";
+    button.onclick = function () {
+      var title = (svg.match(/<title>([^<]*)<\/title>/) || [])[1] || "graph";
+      new Promise(function (resolve) {
+        var canvas = document.createElement("canvas");
+        canvas.width = img.naturalWidth * 2;
+        canvas.height = img.naturalHeight * 2;
+        canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/png").split(",")[1]);
+      }).then(function (png) {
+        return call("ui/download-file", { contents: [{ type: "resource", resource: {
+          uri: "file:///" + title.replace(/[#?%%\/\\]/g, " ") + ".png",
+          mimeType: "image/png", blob: png } }] });
+      }).catch(function () { button.textContent = "Could not save this picture."; });
+    };
+    document.getElementById("pic").insertBefore(button, img);
   }
   // Keyed the way the server keys it: sorted keys, no HTML escaping, FNV-1a
   // over the UTF-8 bytes.
@@ -96,7 +118,8 @@ const widgetTemplate = `<div style="font:13px system-ui,-apple-system,sans-serif
     protocolVersion: "2025-11-21",
     appInfo: { name: "bmcp", version: %q },
     appCapabilities: {}
-  }).then(function () {
+  }).then(function (res) {
+    canSave = !!(res && res.hostCapabilities && res.hostCapabilities.downloadFile);
     // A host sends the tool input only to a widget that has announced itself.
     send({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} });
   });

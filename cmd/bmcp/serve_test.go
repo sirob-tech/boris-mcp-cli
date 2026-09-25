@@ -811,3 +811,18 @@ func TestWidgetDrawsAnImageSoTheHostMenuOffersCopy(t *testing.T) {
 		t.Error("the drawing must not be injected as markup")
 	}
 }
+
+func TestWidgetSavesAPNGThroughTheHostWhenItCan(t *testing.T) {
+	out := widgetHTML()
+	// Claude Desktop refuses the frame clipboard writes and its Copy Image
+	// cannot reach into the frame, so the host's download is the only way out.
+	for _, want := range []string{`"ui/download-file"`, `"image/png"`, "hostCapabilities.downloadFile"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the widget must save the picture as a PNG through the host; missing %s", want)
+		}
+	}
+	// Rasterised from the image element, so the markup fallback has nothing to save.
+	if !strings.Contains(out, "if (canSave) offerSave(img, svg)") {
+		t.Error("the save must be offered from the loaded image, only when the host can download")
+	}
+}
