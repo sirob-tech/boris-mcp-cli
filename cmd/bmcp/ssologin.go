@@ -244,14 +244,18 @@ func (l *ssoLoginer) deviceCodeLogin(ctx context.Context) (ssoTokenRecord, error
 	if dev.Interval > 0 {
 		interval = time.Duration(dev.Interval) * time.Second
 	}
+	var expiresAt time.Time
 	if dev.ExpiresIn > 0 {
+		lifetime := time.Duration(dev.ExpiresIn) * time.Second
+		expiresAt = l.now().Add(lifetime)
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(dev.ExpiresIn)*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, lifetime)
 		defer cancel()
 	}
+	timedOut := errors.New("the device login was not approved in time")
 	for {
 		if err := l.sleep(ctx, interval); err != nil {
-			return ssoTokenRecord{}, fmt.Errorf("the device login was not approved in time: %w", err)
+			return ssoTokenRecord{}, fmt.Errorf("%w: %w", timedOut, err)
 		}
 		tok, err := l.oidc.CreateToken(ctx, &ssooidc.CreateTokenInput{
 			ClientId:     reg.ClientId,
@@ -264,13 +268,24 @@ func (l *ssoLoginer) deviceCodeLogin(ctx context.Context) (ssoTokenRecord, error
 		}
 		var pending *ssooidctypes.AuthorizationPendingException
 		var slow *ssooidctypes.SlowDownException
+		var expired *ssooidctypes.ExpiredTokenException
+		var invalid *ssooidctypes.InvalidGrantException
 		switch {
 		case errors.As(err, &pending):
 		case errors.As(err, &slow):
 			// RFC 8628 section 3.5: every slow_down adds five seconds for good.
 			interval += 5 * time.Second
 		case ctx.Err() != nil:
-			return ssoTokenRecord{}, fmt.Errorf("the device login was not approved in time: %w", ctx.Err())
+			return ssoTokenRecord{}, fmt.Errorf("%w: %w", timedOut, ctx.Err())
+		case errors.As(err, &expired):
+			return ssoTokenRecord{}, fmt.Errorf("%w: %w", timedOut, withholdSSOError("CreateToken", err))
+		case errors.As(err, &invalid):
+			// The poll that outlives the code races our own deadline, and IAM
+			// Identity Center answers it with invalid_grant, not expired_token.
+			if !expiresAt.IsZero() && !l.now().Before(expiresAt.Add(-interval)) {
+				return ssoTokenRecord{}, fmt.Errorf("%w: %w", timedOut, withholdSSOError("CreateToken", err))
+			}
+			return ssoTokenRecord{}, fmt.Errorf("the device login was denied or the code is no longer valid: %w", withholdSSOError("CreateToken", err))
 		default:
 			return ssoTokenRecord{}, withholdSSOError("CreateToken", err)
 		}

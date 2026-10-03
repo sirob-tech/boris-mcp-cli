@@ -724,9 +724,6 @@ func (a *app) ssoLogin(ctx context.Context, cfg effectiveConfig, profile string,
 		return out, err
 	}
 	src.allowLogin = true
-	// "blocks" because the caller may be an agent with a timeout of its own,
-	// and a browser waiting on a human can outlast one.
-	src.announce = fmt.Sprintf("Logging in to AWS SSO for profile %s. A browser opens on this machine, and bmcp blocks until the login is approved.\n", profile)
 	finish := func(t ssoTokenRecord) ssoLoginOutcome {
 		out.ExpiresAt, out.Refreshable = t.ExpiresAt, refreshable(t, a.now())
 		return out
@@ -756,6 +753,13 @@ func (a *app) ssoLogin(ctx context.Context, cfg effectiveConfig, profile string,
 	if src.deviceCode, _, err = ssoFlowChoice(cfg, explicitDeviceCode); err != nil {
 		return out, err
 	}
+	// "blocks" because the caller may be an agent with a timeout of its own,
+	// and a browser waiting on a human can outlast one.
+	where := "A browser opens on this machine"
+	if src.deviceCode {
+		where = "Approve the login in a browser on any machine"
+	}
+	src.announce = fmt.Sprintf("Logging in to AWS SSO for profile %s. %s, and bmcp blocks until the login is approved.\n", profile, where)
 	t, err := src.login(ctx, "there was no usable AWS SSO token")
 	if err != nil {
 		return out, err

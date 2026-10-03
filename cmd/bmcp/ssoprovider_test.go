@@ -201,6 +201,45 @@ func TestDeviceCodeLoginPollsThroughPendingAndSlowDown(t *testing.T) {
 	}
 }
 
+// IAM Identity Center answers the poll that outlives the device code with
+// InvalidGrantException; only one that arrives early means something else.
+func TestDeviceCodeLoginReportsAnExpiredCodeAsATimeout(t *testing.T) {
+	start := time.Now()
+	for _, tc := range []struct {
+		name, step string
+		elapsed    time.Duration
+		want       string
+	}{
+		{"expired token", "ExpiredTokenException", time.Minute, "the device login was not approved in time"},
+		{"invalid grant at expiry", "InvalidGrantException", 600 * time.Second, "the device login was not approved in time"},
+		{"invalid grant early", "InvalidGrantException", time.Minute, "the device login was denied or the code is no longer valid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolateAWSEnv(t)
+			f := newFakeIdentityCenter(t)
+			f.deviceSteps = []string{"AuthorizationPendingException", tc.step}
+			calls := 0
+			now := func() time.Time {
+				calls++
+				if calls == 1 {
+					return start
+				}
+				return start.Add(tc.elapsed)
+			}
+			l := &ssoLoginer{oidc: fakeOIDCClient(t), sess: ssoSession{Profile: "p", StartURL: fixtureStartURL, Region: "us-east-1"},
+				out: io.Discard, openURL: func(string) error { return nil }, now: now,
+				sleep: func(context.Context, time.Duration) error { return nil }}
+			_, err := l.login(context.Background(), true)
+			if err == nil || !strings.HasPrefix(err.Error(), tc.want) {
+				t.Fatalf("error %v, want it to start with %q", err, tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.step) || strings.Contains(err.Error(), f.errorBody) {
+				t.Fatalf("error %v should name the type and withhold the message", err)
+			}
+		})
+	}
+}
+
 func TestSSOFlowChoice(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -713,8 +752,21 @@ func TestExplicitLoginShortCircuitsOnlyWhenItCan(t *testing.T) {
 		if err != nil || res.AlreadyValid || res.Refreshed || !res.Refreshable {
 			t.Fatalf("%+v %v", res, err)
 		}
-		if !strings.Contains(a.stderr.(*bytes.Buffer).String(), "bmcp blocks until the login is approved") {
-			t.Fatal("the login was not announced")
+		if !strings.Contains(a.stderr.(*bytes.Buffer).String(), "A browser opens on this machine, and bmcp blocks until the login is approved") {
+			t.Fatalf("the login was not announced: %s", a.stderr.(*bytes.Buffer).String())
+		}
+	})
+	t.Run("device code announces a browser anywhere", func(t *testing.T) {
+		isolateAWSEnv(t)
+		f := newFakeIdentityCenter(t)
+		a := ssoTestApp(f)
+		if _, err := a.ssoLogin(loginBudget(t), ssoTestConfig("sso-only"), "sso-only", true); err != nil {
+			t.Fatal(err)
+		}
+		got := a.stderr.(*bytes.Buffer).String()
+		if !strings.Contains(got, "Approve the login in a browser on any machine, and bmcp blocks until the login is approved") ||
+			strings.Contains(got, "on this machine") {
+			t.Fatalf("device-code announcement: %s", got)
 		}
 	})
 }
