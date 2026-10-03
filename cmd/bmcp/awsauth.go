@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials/processcreds"
-	"github.com/aws/aws-sdk-go-v2/credentials/ssocreds"
 	"github.com/aws/smithy-go/logging"
 )
 
@@ -338,117 +338,46 @@ func profileOrigin(source profileSource) string {
 	return " from " + string(source)
 }
 
-// ssoLoginBudget is the time an interactive device flow needs to be worth
-// starting. Not a measurement of how long a login takes — it is the line below
-// which starting one means arranging for it to be killed half-finished, which
-// is worse than declining and printing the command the operator can run
-// themselves.
+// ssoLoginBudget is the time an interactive login needs to be worth starting:
+// not how long one takes, but the line below which starting one means
+// arranging for it to be cut off half-finished, which is worse than declining
+// and printing the command the operator can run themselves. It also decides
+// whether a process may wait for another one's browser login.
 const ssoLoginBudget = 3 * time.Minute
 
 // deviceFlowFits reports whether the context leaves room for an interactive
-// login to complete.
+// login — PKCE or device code — to complete.
 //
 // time.Until, deliberately, rather than the injectable a.now: the clock that
-// decides whether the subprocess is killed is the runtime's, so a test clock
-// that disagreed with it would be measuring the wrong thing. An unbounded
-// context fits by definition, though no production path supplies one.
+// cancels the login is the runtime's. An unbounded context fits by definition,
+// though no production path supplies one.
 func deviceFlowFits(ctx context.Context) bool {
 	deadline, bounded := ctx.Deadline()
 	return !bounded || time.Until(deadline) >= ssoLoginBudget
 }
 
 // ssoLoginTimeout bounds a login bmcp was *asked* for — `bmcp login` — as
-// opposed to one it slips into the budget of some other command.
-//
-// Not a reuse of ssoLoginBudget, whose docstring calls it the line below which
-// starting a flow is pointless: a minimum, not a measurement, and three minutes
-// of it. aws-cli's own callback waits ten (_OVERALL_TIMEOUT in
-// awscli/customizations/sso/utils.py), so a shorter bound here would have
-// exec.CommandContext SIGKILL `aws` in the middle of a window the operator is
-// still allowed to answer in — the operator approves in the browser, the token
-// is never written, and bmcp reports `signal: killed` for a login that from the
-// outside succeeded. That is the failure ssoLoginBudget exists to prevent,
-// reintroduced by the command whose entire purpose is to finish one.
-//
-// The margin over those ten minutes is the point, not slack. bmcp's clock starts
-// strictly earlier than aws-cli's: this context is created before resolveCommand,
-// before fork/exec, and before a Python interpreter starts and completes the
-// device-authorization round trip. Ten minutes exactly is therefore *shorter*
-// than the window it is quoting, and the last seconds of a flow the operator is
-// still entitled to finish would be killed by the constant that exists to stop
-// exactly that. A minute is far more than the startup cost and still bounds the
-// command.
+// opposed to one it slips into the budget of some other command. It outlasts
+// the ten minutes the browser wait itself allows (pkceSignInTimeout, the AWS
+// CLI's figure), so the approval window is never cut short by the command
+// that exists to finish it.
 const ssoLoginTimeout = 11 * time.Minute
 
-// runSSOLogin shells out to `aws sso login`, which stays the only thing bmcp
-// asks to *mint* a token into ~/.aws/sso/cache — the SDK still refreshes an
-// sso_session token in that directory on its own, and this changes nothing about
-// that. Shared by the implicit branch in awsCredentials and by cmdLogin, so the
-// two cannot drift.
+// sdkLogger is the SDK's logger on bmcp's prose channel rather than raw fd 2.
 //
-// Three things it does that the inline version it replaces did not.
-//
-// The leaf profile, not the one bmcp resolved. profileUsesSSO answers about the
-// leaf of the source_profile chain — it is the only node whose credential type
-// the SDK dispatches — while `aws sso login --profile X` reads X's *own* SSO
-// config. So a chained profile passed the check and then failed the login with
-// "profile does not have valid SSO configuration".
-//
-// The resolved absolute path goes into the exec, so a hasCommand test and the
-// command that runs cannot disagree about which `aws` this is — and it is the
-// injection point that made the post-login retry untestable before.
-//
-// The pinned descriptors, not the globals: a retrieval abandoned earlier in the
-// run may have left either variable pointing at /dev/null on purpose, and this
-// subprocess is not the one those sinks exist to contain. Handing it the global
-// stderr destroys the verification URL and user code, leaving bmcp blocked on a
-// device flow with nothing on screen; handing it the global stdin gives
-// `aws sso login` end-of-file for the one prompt it may still need. stdout goes
-// to fd 2 alongside stderr, which is load-bearing under a machine format
-// elsewhere and harmless here.
-//
-// Nothing interposes on those descriptors. A pipe would let bmcp frame the URL
-// in its own prose, and it costs both of the above: the child hands its fds to
-// a browser grandchild, so cmd.Wait blocks until that closes them, and every
-// interposition tried so far has ended with the URL on the floor.
-func (a *app) runSSOLogin(ctx context.Context, profile string) error {
-	leaf := ssoLoginProfile(ctx, profile)
-	path, err := a.resolveCommand("aws")
-	if err != nil {
-		return fmt.Errorf("the AWS CLI is not on PATH, and it is what performs the login: %w", err)
-	}
-	cmd := exec.CommandContext(ctx, path, "sso", "login", "--profile", leaf)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = a.subprocessStdin(), a.subprocessStderr(), a.subprocessStderr()
-	return cmd.Run()
-}
-
-// ssoLoginProfile names the profile `aws sso login --profile` must be given for
-// a login on behalf of profile: the leaf of its source_profile chain, which is
-// where the SSO configuration actually lives.
-//
-// Falls back to the profile it was given whenever the chain cannot be read. The
-// login then fails with the AWS CLI's own account of why, which is a better
-// answer than bmcp inventing one from a config file it could not parse.
-func ssoLoginProfile(ctx context.Context, profile string) string {
-	leaf, ok := ssoLeafConfig(ctx, profile)
-	if !ok || leaf.Profile == "" {
-		return profile
-	}
-	return leaf.Profile
+// The SDK builds its default logger from os.Stderr when the config loads and
+// keeps that writer (config's resolveDefaultAWSConfig, smithy logging). Two
+// problems with letting it: after retrieveCredentials latches a sink, a later
+// load captures /dev/null and every SDK diagnostic for the rest of the run
+// disappears — and on the other side, a raw fd 2 writer would put SDK prose on
+// the stream a machine format promises carries one document and nothing else.
+// a.prose() answers both: bmcp's own channel, and io.Discard under --format json.
+func (a *app) sdkLogger() logging.Logger {
+	return logging.NewStandardLogger(a.prose())
 }
 
 func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Credentials, string, error) {
-	// The SDK builds its default logger from os.Stderr when the config loads and
-	// keeps that writer (config's resolveDefaultAWSConfig, smithy logging). Two
-	// problems with letting it: after retrieveCredentials latches a sink, a later
-	// load captures /dev/null and every SDK diagnostic for the rest of the run
-	// disappears — and on the other side, a raw fd 2 writer would put SDK prose on
-	// the stream a machine format promises carries one document and nothing else.
-	// a.prose() is the writer that already answers both: bmcp's own channel, and
-	// io.Discard under --format json.
-	opts := []func(*awsconfig.LoadOptions) error{
-		awsconfig.WithLogger(logging.NewStandardLogger(a.prose())),
-	}
+	opts := []func(*awsconfig.LoadOptions) error{awsconfig.WithLogger(a.sdkLogger())}
 	if cfg.Region != "" {
 		opts = append(opts, awsconfig.WithRegion(cfg.Region))
 	}
@@ -465,134 +394,105 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 			opts = append(opts, awsconfig.WithRegion(region))
 		}
 	}
+	// A chain ending at an SSO leaf is bmcp's to resolve (decision 5): the SDK
+	// only reads tokens from the AWS CLI's plaintext cache. The MFA refusal comes
+	// first because LoadDefaultConfig would fail on mfa_serial with its own,
+	// less useful, error.
+	var chain *ssoChain
+	var chainErr error
+	if profile != "" {
+		chain, chainErr = resolveSSOChain(ctx, profile)
+		if chain != nil {
+			if err := chain.mfaRefusal(); err != nil {
+				return aws.Credentials{}, "", authError{err}
+			}
+		}
+	}
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return aws.Credentials{}, "", authError{a.authFailure(cfg, err)}
 	}
+	if chainErr != nil {
+		return aws.Credentials{}, "", authError{a.authFailure(cfg, chainErr)}
+	}
+	if chain != nil {
+		return a.ssoCredentials(ctx, cfg, profile, *chain, awsCfg)
+	}
+	// Every other leaf — static keys, credential_process, web identity,
+	// container, IMDS — resolves through the SDK exactly as before.
 	creds, err := a.retrieveCredentials(ctx, cfg, awsCfg.Credentials)
-	if err == nil {
-		return creds, awsCfg.Region, nil
-	}
-	// Resolved once, from configuration, and reused by the branch below: whether
-	// this is an SSO profile has one answer for the whole attempt, and it does not
-	// change because a retry failed differently.
-	usesSSO := profile != "" && profileUsesSSO(ctx, profile)
-	// Deciding this from configuration rather than from the error means it can
-	// still fire for a failure a login will not fix — a valid SSO token whose
-	// outer AssumeRole cannot reach STS, say. That is accepted rather than
-	// narrowed: the only typed SSO error the SDK offers, ssocreds.InvalidTokenError,
-	// is produced by the legacy code path alone, so gating on it would disable
-	// auto-login for the sso_session form AWS now recommends. The cost is bounded
-	// to an unnecessary login attempt on an interactive terminal, and the branch
-	// below reports the original cause either way.
-	//
-	// a.machine is the same gate cmdInit and requireConfig apply: a machine format
-	// is never interactive. Without it, `bmcp --format json <tool>` on a terminal
-	// would block on a browser login it has promised not to ask for, and the login
-	// subprocess would write its own prose straight to the inherited stderr —
-	// which is the one thing a machine format guarantees will not happen. Refusing
-	// here falls through to the actionable "run: bmcp --profile X login" error below.
-	//
-	// Too little time left is the third refusal, and the newest. An SSO device
-	// flow is a human reading a code, switching to a browser, authenticating and
-	// approving, and exec.CommandContext kills the subprocess the moment the
-	// deadline lands — so started under a budget it cannot finish in, the login
-	// is arranged to be destroyed part-way: the operator approves in the browser,
-	// the token is never written, and bmcp reports `signal: killed` for a login
-	// that from the outside succeeded.
-	//
-	// The test is how much budget is left, not whether there is one. Every
-	// production path now carries a deadline — awsCredentials is reached only
-	// through newMCPClient, and both of its callers wrap the context — so asking
-	// merely whether one exists refuses every login bmcp can ever be asked to
-	// make, including the ones with ten minutes in hand. That is a capability
-	// deleted by accident rather than the narrow protection intended here.
-	//
-	// So the two budgets separate, which is what they were always meant to do: a
-	// tool call's CallTimeout is ten minutes and comfortably fits a device flow,
-	// while SyncTimeout is sixty seconds and does not. `bmcp sync` and
-	// `bmcp doctor` therefore stop asking — and for doctor that is a second
-	// endorsement of the audited failures in cmdDoctor's own docstring, where an
-	// expired SSO session met a sandbox that could not reach device
-	// authorization and a diagnostic command hung on work it had no business
-	// doing. The silent mint from ~/.aws/sso/cache needs no browser and is
-	// untouched on every path.
-	if usesSSO && deviceFlowFits(ctx) && !cfg.NonInteractive && !a.machine && a.isInteractive() {
-		// What it says, and not the command it is about to run. An announcement
-		// naming `aws sso login` reads as an instruction to run it, and a reader
-		// who does runs the AWS CLI outside bmcp's profile resolution and outside
-		// whatever its operator's own instructions say about SSO. The subprocess
-		// announces itself well enough.
-		//
-		// The failure below still names the command, because there it is reporting
-		// what ran rather than prescribing what to run — and a failure that said
-		// only "the login failed" would hide which login. This branch is also
-		// unreachable in a machine format, so no agent-facing document carries it.
-		fmt.Fprintf(a.prose(), "AWS SSO credentials for profile %s are expired or missing. Logging in.\n", profile)
-		if runErr := a.runSSOLogin(ctx, profile); runErr != nil {
-			// Carrying the failure the login was trying to repair, because the branch
-			// is chosen from configuration now and fires for causes a login cannot
-			// fix. Reporting only "aws sso login failed: exit status 1" for a machine
-			// whose real problem was DNS names the symptom this code created and
-			// hides the one the operator has.
-			return aws.Credentials{}, "", authError{fmt.Errorf("aws sso login failed: %v, and the credential failure it was trying to repair was: %w", runErr, a.authFailure(cfg, err))}
-		}
-		awsCfg, err = awsconfig.LoadDefaultConfig(ctx, opts...)
-		if err != nil {
-			return aws.Credentials{}, "", authError{a.authFailure(cfg, err)}
-		}
-		// Through the same wrapper as the first attempt, as defence in depth rather
-		// than because a helper is known to run here: reaching this line needs
-		// profileUsesSSO to have said yes, which means the leaf of the
-		// source_profile chain resolves through SSO — and the SDK's
-		// resolveCredsFromProfile ranks SSO above credential_process at that leaf,
-		// so no helper should be involved. Wrapped anyway, because the cost is one
-		// call and the alternative is an unwrapped Retrieve whose safety depends on
-		// that precedence never changing. Still uncovered, but no longer
-		// uncoverable: runSSOLogin resolves `aws` through a.resolveCommand, so a
-		// test can put a fake that exits 0 on PATH and reach this line.
-		creds, err = a.retrieveCredentials(ctx, cfg, awsCfg.Credentials)
-	}
 	if err != nil {
-		if usesSSO {
-			// Wrapped around authFailure rather than replacing it. Deciding this
-			// branch from configuration means it now fires for every failure an SSO
-			// profile can produce, not only the ones whose text happened to mention
-			// SSO — a DNS failure reaching STS, an AccessDenied on a chained role and
-			// an expired token all land here — so replacing the cause with the login
-			// remedy alone would hide the ones a login cannot fix. Reporting the cause
-			// and the remedy together is the only version that is true in both cases.
-			//
-			// Going through authFailure is also what keeps #60's withholding in force
-			// on this path: a chain whose leaf is a credential_process helper can
-			// reach it, and interpolating the raw error here would put the payload
-			// straight back into the message.
-			//
-			// authFailure names the source, which is the message #58 was filed
-			// against: an operator who never chose this profile was being sent to log
-			// into it, with nothing saying where it had come from.
-			//
-			// `bmcp login` rather than `aws sso login`, and the old clause is replaced
-			// rather than joined: a message carrying both would satisfy every assertion
-			// here while readers took whichever they happened to reach first. The
-			// remedy has to be one command, because it is also what the generated
-			// instructions key on — an agent runs the command a bmcp message names, and
-			// only that one. It is bmcp's own, so the login goes through bmcp's profile
-			// resolution rather than around it, and it is the only remedy that works on
-			// a stale catalog, where the implicit login above never gets to run: the
-			// sixty-second sync budget is shorter than a device flow, so deviceFlowFits
-			// refuses long before the format or the terminal is consulted.
-			//
-			// --profile is always spelled out, even though this branch is reached only
-			// with a resolved profile and a bare `bmcp login` would usually resolve the
-			// same one. "Usually" is the problem: a call made with --profile prod or
-			// BMCP_PROFILE would otherwise send its reader to log into whatever
-			// config.toml names instead.
-			return aws.Credentials{}, "", authError{fmt.Errorf("%w. If the AWS SSO session for %s has expired, run: bmcp --profile %s login", a.authFailure(cfg, err), profile, profile)}
-		}
 		return aws.Credentials{}, "", authError{a.authFailure(cfg, err)}
 	}
 	return creds, awsCfg.Region, nil
+}
+
+// ssoCredentials resolves an SSO chain natively.
+//
+// The browser-login gate is the one the AWS CLI login had, now applying to any
+// browser login and to store prompts alike (decision 12). a.machine: a machine
+// format is never interactive, and must not block on a browser or put login
+// prose on its stream. cfg.NonInteractive: the caller said nobody is there.
+// a.isInteractive(): nobody typing at fd 0 means nobody to approve. And
+// deviceFlowFits: a login started under a budget it cannot finish in is
+// arranged to be destroyed part-way — the operator approves and the token is
+// never saved. A tool call's ten-minute budget fits; sync's and doctor's sixty
+// seconds do not, so those read the store without UI and name `bmcp login`.
+func (a *app) ssoCredentials(ctx context.Context, cfg effectiveConfig, profile string, chain ssoChain, awsCfg aws.Config) (aws.Credentials, string, error) {
+	gate := deviceFlowFits(ctx) && !cfg.NonInteractive && !a.machine && a.isInteractive()
+	src, err := a.newSSOSource(ctx, cfg, chain, awsCfg, gate)
+	if err != nil {
+		var locked *storeLockedError
+		if errors.As(err, &locked) {
+			return aws.Credentials{}, "", a.ssoFailure(cfg, profile, src.backend, err)
+		}
+		// A backend that cannot be used here at all, e.g. keychain on Linux: a
+		// configuration problem no login repairs.
+		return aws.Credentials{}, "", authError{fmt.Errorf("credential store: %w", err)}
+	}
+	if gate {
+		if src.deviceCode, _, err = ssoFlowChoice(cfg, false); err != nil {
+			return aws.Credentials{}, "", authError{err}
+		}
+		src.allowLogin = true
+		src.announce = fmt.Sprintf("AWS SSO credentials for profile %s are expired or missing. Logging in.\n", profile)
+	}
+	creds, issued, err := src.credentials(ctx)
+	if err != nil {
+		return aws.Credentials{}, "", a.ssoFailure(cfg, profile, src.backend, err)
+	}
+	a.ssoIssued = issued
+	return creds, awsCfg.Region, nil
+}
+
+// ssoFailure classifies in decision 12's order: a store that could not be read
+// is store_locked, whatever the token might have said; a login in flight
+// elsewhere is its own error; everything else carries its cause and the login
+// remedy.
+//
+// Cause and remedy together, because the native path fails for reasons a login
+// cannot fix too — DNS, an AccessDenied on a chained role — and replacing the
+// cause with the remedy would hide those. --profile is always spelled out: a
+// call made with --profile prod must not send its reader to log into whatever
+// config.toml names. And `bmcp login`, never `aws sso login`: the remedy is
+// what the generated instructions key on, so it has to be bmcp's own command.
+func (a *app) ssoFailure(cfg effectiveConfig, profile string, backend resolvedBackend, err error) error {
+	var (
+		locked *storeLockedError
+		busy   *ssoLoginInProgressError
+		failed *ssoLoginError
+	)
+	switch {
+	case errors.As(err, &locked):
+		return authError{&remediedError{msg: fmt.Sprintf("%s (%s store: %s)", locked.Remedy(profile, backend), locked.Backend, locked.Reason), err: err}}
+	case errors.As(err, &busy):
+		return authError{err}
+	case errors.As(err, &failed):
+		// What ran, not what to run: this branch is reached only interactively,
+		// by an operator who just watched the login fail.
+		return authError{fmt.Errorf("%w (using %s)", err, a.describeCredentialSource(cfg))}
+	}
+	return authError{fmt.Errorf("%w. If the AWS SSO session for %s has expired, run: %s", a.authFailure(cfg, err), profile, ssoLoginCommand(profile, backend))}
 }
 
 // retrieveCredentials resolves credentials with a credential_process helper's
@@ -636,9 +536,9 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 // the restore rule below: that reader outlives a cancelled call, so the variable
 // is not always safe to put back.
 //
-// It wraps Retrieve and nothing else on purpose: the `aws sso login` branch
-// above deliberately hands its subprocess the real fd 0 and fd 2, and that is a
-// browser prompt an operator needs to see and answer.
+// Only the SDK path comes through here: the native SSO path spawns no helper,
+// and its login prompt writes to the startup stderr, which the operator needs
+// to see whatever this did to the variable.
 func (a *app) retrieveCredentials(ctx context.Context, cfg effectiveConfig, provider aws.CredentialsProvider) (aws.Credentials, error) {
 	// An earlier retrieval was abandoned with a sink still installed, and the
 	// goroutine that outlived it may still read that variable to build its
@@ -994,9 +894,10 @@ func (a *app) credentialProcessFailure(cfg effectiveConfig, err error) error {
 // hiding the failure: whatever made it unreadable is the error being reported.
 func profileUsesSSO(ctx context.Context, profile string) bool {
 	leaf, ok := ssoLeafConfig(ctx, profile)
-	if !ok {
-		return false
-	}
+	return ok && leafUsesSSO(leaf)
+}
+
+func leafUsesSSO(leaf awsconfig.SharedConfig) bool {
 	// Static keys, credential_source and web_identity_token_file are all ranked
 	// above SSO in that same switch, and nothing validates them as mutually
 	// exclusive with SSO keys — validateCredentialType does not mention SSO at
@@ -1043,73 +944,107 @@ func ssoLeafConfig(ctx context.Context, profile string) (awsconfig.SharedConfig,
 	return *leaf, true
 }
 
-// ssoTokenExpiry reports when the cached SSO token for this profile's leaf
-// expires, reading ~/.aws/sso/cache and contacting nothing.
-//
-// It exists because `aws sso login` runs with force_refresh=True
-// (awscli/customizations/sso/login.py) and so never short-circuits on a token
-// that is still good — without this guard, `bmcp login` would open a browser
-// every time it is run, including on the runs where nothing is wrong.
-//
-// A file read rather than a credential resolution, deliberately. Asking
-// awsCredentials whether the credentials work would re-enter the very branch
-// whose gate `bmcp login` exists to sit outside, and would spawn a
-// credential_process helper on the way. The cost of the cheap version is that it
-// is blind to a token the BORIS gateway rejects for some reason of its own —
-// which is a failure no login repairs, and which the remedy text deliberately
-// does not fire for either.
-//
-// The cache key follows the SDK's own derivation, which differs between the two
-// profile forms: the sso_session name for the current form (resolveSSOCredentials
-// hashes SSOSession.Name), the start URL for the legacy one (ssocreds.New hashes
-// StartURL). Getting this wrong is invisible rather than loud — it names a file
-// that does not exist, and a missing file means "expired", so the failure mode
-// is a browser that opens when it need not have.
-func ssoTokenExpiry(ctx context.Context, profile string) (time.Time, error) {
-	leaf, ok := ssoLeafConfig(ctx, profile)
-	if !ok {
-		return time.Time{}, fmt.Errorf("profile %s could not be read", profile)
+// ssoChain is a profile whose source_profile chain ends at an SSO leaf: the
+// leaf's session, then every role_arn hop above it, leaf first.
+type ssoChain struct {
+	// Profile is the profile the chain was resolved for, the one messages name.
+	Profile string
+	Leaf    ssoSession
+	Hops    []assumeRoleHop
+}
+
+type assumeRoleHop struct {
+	Profile         string
+	RoleARN         string
+	ExternalID      string
+	RoleSessionName string
+	MFASerial       string
+	Duration        time.Duration
+}
+
+// cacheKey names the credentials the chain yields after its first hops hops:
+// 0 is the leaf's sso:GetRoleCredentials result.
+func (c ssoChain) cacheKey(hops int) string {
+	in := roleCacheKeyInput{
+		SSOSession: c.Leaf.Name, StartURL: c.Leaf.StartURL, SSORegion: c.Leaf.Region,
+		AccountID: c.Leaf.AccountID, RoleName: c.Leaf.RoleName,
 	}
-	key := leaf.SSOStartURL
+	for _, h := range c.Hops[:hops] {
+		in.Hops = append(in.Hops, roleCacheHop{RoleARN: h.RoleARN, ExternalID: h.ExternalID,
+			RoleSessionName: h.RoleSessionName, DurationSeconds: int(h.Duration / time.Second)})
+	}
+	return roleCacheKey(in)
+}
+
+// mfaRefusal is decision 6: bmcp has no way to ask for an MFA code an agent
+// could answer, so a chain naming one fails before anything calls STS.
+func (c ssoChain) mfaRefusal() error {
+	for _, h := range c.Hops {
+		if h.MFASerial != "" {
+			return fmt.Errorf("profile %s requires an MFA code (mfa_serial), which bmcp does not support; use a profile without mfa_serial", h.Profile)
+		}
+	}
+	return nil
+}
+
+// resolveSSOChain walks profile's source_profile chain the way the SDK's
+// resolveCredsFromProfile does — recurse to the leaf, then assume each node's
+// role_arn on the way back up — and returns it when the leaf resolves through
+// SSO. nil, nil means the SDK keeps the profile; nil and an error means an SSO
+// leaf whose settings are incomplete.
+func resolveSSOChain(ctx context.Context, profile string) (*ssoChain, error) {
+	shared, err := sharedConfigProfile(ctx, profile)
+	if err != nil {
+		return nil, nil
+	}
+	var nodes []*awsconfig.SharedConfig
+	for n := &shared; n != nil; n = n.Source {
+		nodes = append(nodes, n)
+	}
+	leaf := nodes[len(nodes)-1]
+	if !leafUsesSSO(*leaf) {
+		return nil, nil
+	}
+	sess, err := ssoSessionFor(*leaf)
+	if err != nil {
+		return nil, err
+	}
+	chain := &ssoChain{Profile: profile, Leaf: sess}
+	for i := len(nodes) - 1; i >= 0; i-- {
+		n := nodes[i]
+		if n.RoleARN == "" {
+			continue
+		}
+		hop := assumeRoleHop{Profile: n.Profile, RoleARN: n.RoleARN, ExternalID: n.ExternalID,
+			RoleSessionName: n.RoleSessionName, MFASerial: n.MFASerial}
+		if n.RoleDurationSeconds != nil {
+			hop.Duration = *n.RoleDurationSeconds
+		}
+		chain.Hops = append(chain.Hops, hop)
+	}
+	return chain, nil
+}
+
+// ssoSessionFor reads the session a leaf logs in to, from its sso_session
+// section or from the legacy keys on the profile itself.
+func ssoSessionFor(leaf awsconfig.SharedConfig) (ssoSession, error) {
+	sess := ssoSession{Profile: leaf.Profile, StartURL: leaf.SSOStartURL, Region: leaf.SSORegion,
+		AccountID: leaf.SSOAccountID, RoleName: leaf.SSORoleName}
 	if leaf.SSOSession != nil {
-		key = leaf.SSOSession.Name
+		sess.Name, sess.StartURL, sess.Region = leaf.SSOSession.Name, leaf.SSOSession.SSOStartURL, leaf.SSOSession.SSORegion
+		sess.Scopes = ssoRegistrationScopes(sess.Name)
 	}
-	if key == "" {
-		return time.Time{}, fmt.Errorf("profile %s names no SSO session or start URL", profile)
+	var missing []string
+	for _, f := range []struct{ key, val string }{
+		{"sso_start_url", sess.StartURL}, {"sso_region", sess.Region},
+		{"sso_account_id", sess.AccountID}, {"sso_role_name", sess.RoleName},
+	} {
+		if f.val == "" {
+			missing = append(missing, f.key)
+		}
 	}
-	path, err := ssocreds.StandardCachedTokenFilepath(key)
-	if err != nil {
-		return time.Time{}, err
+	if len(missing) > 0 {
+		return sess, fmt.Errorf("profile %s is an SSO profile but is missing %s", leaf.Profile, strings.Join(missing, ", "))
 	}
-	body, err := os.ReadFile(path)
-	if err != nil {
-		return time.Time{}, err
-	}
-	// aws-cli writes this file non-atomically (O_WRONLY|O_CREAT then truncate then
-	// write, botocore/utils.py), so a read racing a concurrent login can land on a
-	// zero-length window — which arrives here as a parse error and is treated as
-	// "expired", the same as absent.
-	var cached struct {
-		AccessToken string `json:"accessToken"`
-		ExpiresAt   string `json:"expiresAt"`
-	}
-	if err := json.Unmarshal(body, &cached); err != nil {
-		return time.Time{}, fmt.Errorf("cached SSO token at %s is not readable JSON: %w", path, err)
-	}
-	// Both fields, because the SDK requires both: loadCachedToken rejects a token
-	// with an empty accessToken outright ("cached SSO token must contain
-	// accessToken and expiresAt fields", ssocreds/sso_cached_token.go). Checking
-	// only the expiry would call such a file valid, and the consequence is the
-	// worst shape this command has: `bmcp login` reports "already valid, nothing
-	// to do", the retry it was run for fails identically, and the agent is told
-	// once more to run the command that just declined to act. The value is read
-	// and immediately dropped — it is never returned, logged or interpolated.
-	if cached.AccessToken == "" || cached.ExpiresAt == "" {
-		return time.Time{}, fmt.Errorf("cached SSO token at %s is missing accessToken or expiresAt", path)
-	}
-	at, err := time.Parse(time.RFC3339, cached.ExpiresAt)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("cached SSO token at %s has an unparseable expiry: %w", path, err)
-	}
-	return at, nil
+	return sess, nil
 }

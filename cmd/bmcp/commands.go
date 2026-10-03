@@ -548,7 +548,7 @@ func (a *app) cmdLogin(flags globalFlags, args []string) int {
 	// And no a.isInteractive() gate, which is the one refusal this command
 	// deliberately does not make. The implicit branch in awsCredentials has one
 	// because it is deciding whether to *interrupt* somebody's tool call with a
-	// browser; here the browser is the entire request. `aws sso login` opens it
+	// browser; here the browser is the entire request. bmcp opens it
 	// through the desktop's own handler and needs no controlling terminal, so a
 	// tty test would refuse the primary case this command exists for — an agent
 	// spawning `bmcp login` with stdin from /dev/null while its operator approves
@@ -582,27 +582,30 @@ func (a *app) cmdLogin(flags globalFlags, args []string) int {
 		return a.fail(flags, exitAuth, "not_sso_profile", fmt.Sprintf(
 			"bmcp login refreshes an AWS SSO session, and this invocation resolves credentials from %s, which is not one.\nName an SSO profile for the login: bmcp --profile <name> login", a.describeCredentialSource(cfg)))
 	}
-	// The guard that keeps this command idempotent. `aws sso login` runs with
-	// force_refresh=True and never short-circuits on a token that is still good,
-	// so without this an agent told to run bmcp login would open a browser on
-	// every failure that reached it, including the ones a login cannot fix.
-	if expiry, err := ssoTokenExpiry(ctx, profile); err == nil && expiry.After(a.now()) {
-		fmt.Fprintf(a.stdout, "The AWS SSO session for %s is already valid, until %s. Nothing to do.\n", profile, formatExpiry(expiry))
-		return 0
-	}
-	// On prose, not stdout: it is what is about to happen rather than the answer.
-	// It says "blocks" because the caller may be an agent with a timeout of its
-	// own, and a browser waiting on a human is the one bmcp operation that can
-	// outlast one.
-	fmt.Fprintf(a.prose(), "Logging in to AWS SSO for profile %s. A browser opens on this machine, and bmcp blocks until the login is approved.\n", profile)
-	if runErr := a.runSSOLogin(ctx, profile); runErr != nil {
+	// Idempotent: a valid stored token, or one a refresh renews, opens nothing,
+	// so an agent told to run bmcp login does not get a browser on every failure
+	// that reached it, including the ones a login cannot fix.
+	res, err := a.ssoLogin(ctx, cfg, profile, false)
+	if err != nil {
 		// sso_login_failed rather than auth_failure, for the reason the refusals
 		// above give: this command's own failures must never wear the name that
 		// sends an agent back to this command.
-		return a.fail(flags, exitAuth, "sso_login_failed", fmt.Sprintf(
-			"the AWS SSO login for profile %s failed: %v", profile, runErr))
+		name := "sso_login_failed"
+		var locked *storeLockedError
+		if errors.As(err, &locked) {
+			name = errNameStoreLocked
+		}
+		return a.fail(flags, exitAuth, name, fmt.Sprintf(
+			"the AWS SSO login for profile %s failed: %v", profile, err))
 	}
-	fmt.Fprintf(a.stdout, "Logged in to AWS SSO for profile %s.%s\n", profile, loginValidity(ctx, profile, a.now()))
+	switch {
+	case res.AlreadyValid:
+		fmt.Fprintf(a.stdout, "The AWS SSO session for %s is already valid, until %s. Nothing to do.\n", profile, formatExpiry(res.ExpiresAt))
+	case res.Refreshed:
+		fmt.Fprintf(a.stdout, "Refreshed the AWS SSO session for profile %s. The session is valid until %s.\n", profile, formatExpiry(res.ExpiresAt))
+	default:
+		fmt.Fprintf(a.stdout, "Logged in to AWS SSO for profile %s. The session is valid until %s.\n", profile, formatExpiry(res.ExpiresAt))
+	}
 	return 0
 }
 
@@ -629,21 +632,6 @@ func loginInvocation(flags globalFlags) string {
 		return "bmcp --profile " + profile + " login"
 	}
 	return "bmcp login"
-}
-
-// loginValidity reports how long the session just obtained lasts, or nothing at
-// all when that cannot be read.
-//
-// Nothing, rather than a warning: the login itself succeeded, and a token bmcp
-// cannot find is far more likely to mean the cache key derivation disagrees with
-// this profile's form than that `aws` wrote nothing. Every call that follows
-// will say so properly if it is really absent.
-func loginValidity(ctx context.Context, profile string, now time.Time) string {
-	expiry, err := ssoTokenExpiry(ctx, profile)
-	if err != nil || !expiry.After(now) {
-		return ""
-	}
-	return " The session is valid until " + formatExpiry(expiry) + "."
 }
 
 // report is false when init calls this, because the contract allows a machine

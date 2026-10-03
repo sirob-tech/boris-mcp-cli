@@ -193,8 +193,7 @@ func (a *app) hasCommand(name string) bool {
 // resolveCommand is hasCommand's other half: the absolute path, for the callers
 // that go on to run what they just looked for. Sharing one lookup is what keeps
 // a detection and the exec that follows it from disagreeing about which binary
-// on PATH they mean — and it is the seam a test needs to put a fake `aws` in
-// front of runSSOLogin.
+// on PATH they mean, and it is the seam a test uses to put a fake in front.
 func (a *app) resolveCommand(name string) (string, error) {
 	lookPath := a.lookPath
 	if lookPath == nil {

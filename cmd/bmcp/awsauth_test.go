@@ -75,6 +75,18 @@ func isolateAWSEnv(t *testing.T) {
 	t.Setenv("BMCP_BACKEND", "aws-cli-cache")
 	t.Setenv("BMCP_FILE_PASSPHRASE", "")
 	t.Setenv("BMCP_SSO_DEVICE_CODE", "")
+	// The native SSO path talks to IAM Identity Center itself. Pointed at a port
+	// nothing listens on, so no test reaches AWS — or opens a real browser on
+	// the strength of a real RegisterClient — unless it starts the fake.
+	for _, name := range []string{"AWS_ENDPOINT_URL_SSO_OIDC", "AWS_ENDPOINT_URL_SSO", "AWS_ENDPOINT_URL_STS"} {
+		t.Setenv(name, "http://127.0.0.1:1")
+	}
+	t.Setenv("AWS_ENDPOINT_URL", "")
+	t.Setenv("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "")
+	t.Setenv("AWS_MAX_ATTEMPTS", "1")
+	for _, name := range []string{"SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"} {
+		t.Setenv(name, "")
+	}
 
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config")
@@ -509,50 +521,35 @@ func TestExpiredEnvironmentCredentialsYieldToTheConfiguredProfile(t *testing.T) 
 	})
 }
 
-// The device-flow budget, from both sides.
+// The browser-login budget, from both sides.
 //
-// exec.CommandContext kills the login subprocess when the deadline lands, so a
-// flow started under a budget it cannot finish in is arranged to be destroyed
-// part-way: the operator approves in the browser and the token is never
-// written. But every production path carries *some* deadline — awsCredentials
-// is reached only through newMCPClient, and both callers wrap the context — so
-// a gate that asked merely whether a deadline existed would refuse every login
-// bmcp could ever make, including a tool call's ten-minute one. Both halves are
-// pinned here because each without the other is a bug that ships.
+// A login started under a budget it cannot finish in is arranged to be
+// destroyed part-way: the operator approves in the browser and the token is
+// never saved. But every production path carries *some* deadline —
+// awsCredentials is reached only through newMCPClient, and both callers wrap
+// the context — so a gate that asked merely whether a deadline existed would
+// refuse every login bmcp could ever make, including a tool call's ten-minute
+// one. Both halves are pinned here because each without the other is a bug
+// that ships.
 //
-// The fake `aws` on PATH is the observation: it exists to record that it ran.
+// The fake Identity Center's registration count is the observation: a login
+// registers a fresh OIDC client before anything else.
 func TestADeviceFlowStartsOnlyWhenItCouldFinish(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		budget    time.Duration
 		wantLogin bool
-		// wantMessage separates the two outcomes by what the operator is told, not
-		// only by whether the subprocess ran: a refusal has to hand over the command
-		// to run by hand, and an attempt has to report that the login itself failed
-		// rather than quietly reporting only the credential error underneath it.
-		wantMessage string
 	}{
 		// SyncTimeout's sixty seconds — what `bmcp sync` and `bmcp doctor` carry.
-		{name: "a sync budget is too short", budget: 60 * time.Second, wantMessage: "bmcp --profile sso-only login"},
-		{name: "just under the budget", budget: ssoLoginBudget - time.Second, wantMessage: "bmcp --profile sso-only login"},
+		{name: "a sync budget is too short", budget: 60 * time.Second},
+		{name: "just under the budget", budget: ssoLoginBudget - time.Second},
 		// CallTimeout's ten minutes — what `bmcp <tool>` carries, and ample.
-		{name: "a call budget is ample", budget: 10 * time.Minute, wantLogin: true, wantMessage: "aws sso login failed"},
+		{name: "a call budget is ample", budget: 10 * time.Minute, wantLogin: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			isolateAWSEnv(t)
-			binDir := t.TempDir()
-			marker := filepath.Join(t.TempDir(), "aws-was-run")
-			script := "#!/bin/sh\ntouch '" + marker + "'\nexit 1\n"
-			if err := os.WriteFile(filepath.Join(binDir, "aws"), []byte(script), 0o700); err != nil {
-				t.Fatalf("write fake aws: %v", err)
-			}
-			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-			a := authTestApp()
-			// Everything the login branch needs except the budget, so the remaining
-			// time is the only thing that decides this.
-			a.machine = false
-			a.interactive = func() bool { return true }
+			f := newFakeIdentityCenter(t)
+			a := ssoTestApp(f)
 			ctx, cancel := context.WithTimeout(context.Background(), tc.budget)
 			defer cancel()
 			_, _, err := a.awsCredentials(ctx, effectiveConfig{
@@ -560,21 +557,19 @@ func TestADeviceFlowStartsOnlyWhenItCouldFinish(t *testing.T) {
 				ProfileSource: profileSourceFile,
 				Region:        "us-east-1",
 			})
-			if err == nil {
-				t.Fatal("an sso-only profile should not have resolved in a test")
+			if regs, _, _, _ := f.counts(); (regs > 0) != tc.wantLogin {
+				t.Fatalf("login ran=%v, want %v, with %v of budget; error was: %v", regs > 0, tc.wantLogin, tc.budget, err)
 			}
-			_, statErr := os.Stat(marker)
-			if ran := statErr == nil; ran != tc.wantLogin {
-				t.Fatalf("aws sso login ran=%v, want %v, with %v of budget; error was: %v",
-					ran, tc.wantLogin, tc.budget, err)
+			if tc.wantLogin {
+				if err != nil {
+					t.Fatalf("the login should have produced credentials: %v", err)
+				}
+				return
 			}
-			if !strings.Contains(err.Error(), tc.wantMessage) {
-				t.Fatalf("message %q should contain %q", err.Error(), tc.wantMessage)
-			}
-			// Either way the cause underneath survives, so a failure no login could
-			// have fixed is never replaced by advice about logging in.
-			if !strings.Contains(err.Error(), "AWS profile sso-only from aws_profile in config.toml") {
-				t.Fatalf("message %q should still name the credential source", err.Error())
+			// A refusal hands over the command to run by hand, and keeps the cause.
+			if err == nil || !strings.Contains(err.Error(), "bmcp --profile sso-only login") ||
+				!strings.Contains(err.Error(), "AWS profile sso-only from aws_profile in config.toml") {
+				t.Fatalf("message %v should name the source and the remedy", err)
 			}
 		})
 	}
@@ -1473,7 +1468,7 @@ func TestSSOFailureStillReportsItsCause(t *testing.T) {
 	// The remedy, the source, and — the part that regressed — the cause the SDK
 	// reported, which the first version of this branch replaced outright.
 	for _, want := range []string{
-		"failed to refresh cached credentials",
+		"there is no AWS SSO token for this session",
 		"AWS profile sso-only from aws_profile in config.toml",
 		"bmcp --profile sso-only login",
 	} {
@@ -3118,8 +3113,10 @@ func writeSSOToken(t *testing.T, key string, expiresAt time.Time) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatalf("mkdir sso cache: %v", err)
 	}
-	body := fmt.Sprintf(`{"accessToken":"not-a-real-token","expiresAt":%q}`,
-		expiresAt.UTC().Format(time.RFC3339))
+	// startUrl and region as the AWS CLI writes them: bmcp counts a token for
+	// another session as none.
+	body := fmt.Sprintf(`{"startUrl":%q,"region":"us-east-1","accessToken":"not-a-real-token","expiresAt":%q}`,
+		fixtureStartURL, expiresAt.UTC().Format(time.RFC3339))
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write cached token: %v", err)
 	}
@@ -3398,7 +3395,7 @@ func TestSSOTokenCacheKeyMatchesWhatTheAWSCLIWrites(t *testing.T) {
 	}
 	expiry := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 	writeSSOToken(t, fixtureStartURL, expiry)
-	got, err := ssoTokenExpiry(authTestContext(t), "sso-only")
+	got, err := storedSSOTokenExpiry(t, "sso-only")
 	if err != nil {
 		t.Fatalf("bmcp could not read the token it and the AWS CLI agree on: %v", err)
 	}
@@ -3568,7 +3565,7 @@ region = us-east-1
 			// would look in the wrong place and find nothing.
 			expiry := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 			writeSSOToken(t, tc.key, expiry)
-			got, err := ssoTokenExpiry(authTestContext(t), tc.profile)
+			got, err := storedSSOTokenExpiry(t, tc.profile)
 			if err != nil {
 				t.Fatalf("profile %s: %v — bmcp looked somewhere the AWS CLI does not write", tc.profile, err)
 			}
@@ -3595,7 +3592,7 @@ func TestACachedTokenWithNoAccessTokenIsNotValid(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"expiresAt":"2099-01-01T00:00:00Z"}`), 0o600); err != nil {
 		t.Fatalf("write cached token: %v", err)
 	}
-	if _, err := ssoTokenExpiry(authTestContext(t), "sso-only"); err == nil {
+	if _, err := storedSSOTokenExpiry(t, "sso-only"); err == nil {
 		t.Fatal("a token the SDK would reject was reported as readable")
 	}
 	var stdout, stderr bytes.Buffer
@@ -3684,14 +3681,9 @@ region = us-east-1
 	}
 }
 
-// The implicit login gets the same leaf-profile fix as the command, because
-// both now go through runSSOLogin.
-//
-// This is the half of the shared-helper claim that nothing else pins.
-// TestADeviceFlowStartsOnlyWhenItCouldFinish records only that the subprocess
-// ran, so reverting awsCredentials to building the command inline —
-// reinstating both the outer-profile and unresolved-path defects on the path a
-// tool call actually takes — would pass every other test in the package.
+// The implicit login logs in to the leaf's session, where the SSO settings
+// live, and the chain above it is then walked with the new token. A login
+// built from the outer profile would find no SSO settings at all.
 func TestTheImplicitLoginAlsoTargetsTheLeafProfile(t *testing.T) {
 	isolateAWSEnv(t)
 	appendSharedConfig(t, `
@@ -3700,36 +3692,25 @@ role_arn = arn:aws:iam::123456789012:role/Chained
 source_profile = sso-only
 region = us-east-1
 `)
-	binDir := t.TempDir()
-	argvFile := filepath.Join(t.TempDir(), "aws-argv")
-	script := "#!/bin/sh\necho \"$@\" > '" + argvFile + "'\nexit 1\n"
-	if err := os.WriteFile(filepath.Join(binDir, "aws"), []byte(script), 0o700); err != nil {
-		t.Fatalf("write fake aws: %v", err)
-	}
-	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	a := authTestApp()
-	// Everything the implicit branch needs: a human format, a terminal, and a
-	// budget a login could finish in.
-	a.machine = false
-	a.interactive = func() bool { return true }
+	f := newFakeIdentityCenter(t)
+	a := ssoTestApp(f)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	_, _, err := a.awsCredentials(ctx, effectiveConfig{
+	creds, _, err := a.awsCredentials(ctx, effectiveConfig{
 		Profile:       "chained-implicit",
 		ProfileSource: profileSourceFile,
 		Region:        "us-east-1",
 	})
-	if err == nil {
-		t.Fatal("a chain onto an sso-only profile should not have resolved in a test")
+	if err != nil {
+		t.Fatalf("the implicit login and the hop should succeed: %v", err)
 	}
-	argv, ran := awsRan(t, argvFile)
-	if !ran {
-		t.Fatalf("the implicit login never ran; error was: %v", err)
+	f.mu.Lock()
+	issuer, calls := f.registrations[0]["issuerUrl"], len(f.stsCalls)
+	f.mu.Unlock()
+	if issuer != fixtureStartURL || calls != 1 || creds.AccessKeyID != "ASIA-HOP-1" {
+		t.Fatalf("issuer %v, STS calls %d, credentials %q", issuer, calls, creds.AccessKeyID)
 	}
-	if argv != "sso login --profile sso-only" {
-		t.Fatalf("aws %s, want the leaf profile: `sso login --profile sso-only` — "+
-			"`aws sso login --profile chained-implicit` reads that profile's own SSO "+
-			"config, which is empty", argv)
+	if !strings.Contains(a.stderr.(*bytes.Buffer).String(), "profile chained-implicit are expired or missing. Logging in.") {
+		t.Fatalf("the login was not announced: %s", a.stderr.(*bytes.Buffer).String())
 	}
 }

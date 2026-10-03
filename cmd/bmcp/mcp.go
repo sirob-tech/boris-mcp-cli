@@ -156,6 +156,10 @@ func existingCatalogDetail(path, url string) string {
 
 type authError struct{ error }
 
+// Unwrap lets errorName find the typed cause, store_locked or
+// sso_login_in_progress, underneath.
+func (e authError) Unwrap() error { return e.error }
+
 func isAuthErr(err error) bool {
 	var ae authError
 	return errors.As(err, &ae)
@@ -221,6 +225,16 @@ func isCredentialFailure(err error) bool {
 }
 
 func errorName(err error) string {
+	// Ahead of auth_failure, which they also are: each names a different next
+	// step — approve the store, wait for the other login — than `bmcp login`.
+	var locked *storeLockedError
+	if errors.As(err, &locked) {
+		return errNameStoreLocked
+	}
+	var busy *ssoLoginInProgressError
+	if errors.As(err, &busy) {
+		return errNameLoginInProgress
+	}
 	if isCredentialFailure(err) {
 		return "auth_failure"
 	}
