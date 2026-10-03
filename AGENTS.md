@@ -71,6 +71,10 @@ Run it if a release has not gone out in a while. Signing depends on an Apple
 agreement, a certificate, and an App Store Connect key — all of which expire
 outside this repository, and none of which anything else notices.
 
+A change to SSO login or the credential stores also needs the manual checks in
+[docs/MANUAL_SSO_TESTS.md](docs/MANUAL_SSO_TESTS.md). They use the preflight's
+signed darwin builds, since Keychain trust follows the code signature.
+
 ### Recovering a broken release
 
 Re-run the release **from the default branch**, passing the tag:
