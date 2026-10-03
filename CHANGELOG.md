@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.11.2...v0.12.0) (2026-10-03)
+
+
+### Features
+
+* native AWS SSO login with OS credential stores ([#92](https://github.com/sirob-tech/boris-mcp-cli/issues/92)) ([ff51ed1](https://github.com/sirob-tech/boris-mcp-cli/commit/ff51ed1ca9441ba094483571caa53667413ef6fb))
+
+
+### Bug Fixes
+
+* centre the graph picture in the widget ([#90](https://github.com/sirob-tech/boris-mcp-cli/issues/90)) ([688204d](https://github.com/sirob-tech/boris-mcp-cli/commit/688204d0fdf4d695dfe6777888bb842d5686a3bf))
+
 ## [0.11.2](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.11.1...v0.11.2) (2026-09-16)
 
 
