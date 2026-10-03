@@ -30,6 +30,28 @@ func init() {
 	}
 }
 
+// Decision 4: only a missing socket means "no bus". A runtime dir bmcp cannot
+// look into fails closed instead of quietly picking the plaintext store.
+func TestAnUncheckableBusSocketFailsClosed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can stat inside a 0000 directory")
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "")
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	if st := probeSecretService(context.Background()); st.State != ssError {
+		t.Fatalf("probe %+v, want an error rather than no bus", st)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	if st := probeSecretService(context.Background()); st.State != ssNoBus {
+		t.Fatalf("probe %+v, want no bus when the socket does not exist", st)
+	}
+}
+
 func TestSecretServiceProbeAndLockedCollection(t *testing.T) {
 	if !secretServiceTestEnabled() {
 		t.Skip("set BMCP_TEST_SECRET_SERVICE=1 with an unlocked keyring on the session bus")
@@ -40,6 +62,21 @@ func TestSecretServiceProbeAndLockedCollection(t *testing.T) {
 	}
 	s, _ := newSecretServiceStore("bmcp-test-"+newGeneration(), storeOptions{AllowUI: false})
 	defer s.ClearAll(nil)
+	// Stores share one connection, so opening one per call leaks nothing.
+	if _, err := s.ReadToken(ssoSessionStoreKey("absent", "")); !errors.Is(err, errStoreItemNotFound) {
+		t.Fatal(err)
+	}
+	ssShared.mu.Lock()
+	first := ssShared.conn
+	ssShared.mu.Unlock()
+	other, _ := newSecretServiceStore("bmcp-test-"+newGeneration(), storeOptions{AllowUI: false})
+	other.ReadToken(ssoSessionStoreKey("absent", ""))
+	ssShared.mu.Lock()
+	second := ssShared.conn
+	ssShared.mu.Unlock()
+	if first == nil || first != second {
+		t.Fatal("a second store opened its own D-Bus connection")
+	}
 	key := ssoSessionStoreKey("ss", "")
 	if err := s.WriteToken(key, sampleToken("g1")); err != nil {
 		t.Fatal(err)
@@ -48,7 +85,7 @@ func TestSecretServiceProbeAndLockedCollection(t *testing.T) {
 	// Lock the default collection, as a screen lock would, and check that a
 	// no-UI store fails closed instead of reading as "not found". Unlocking
 	// needs a prompt, so this leaves it locked: run it after the contract test.
-	addr, _ := sessionBusAddress()
+	addr, _, _ := sessionBusAddress()
 	conn, err := dbus.Connect(addr)
 	if err != nil {
 		t.Fatal(err)

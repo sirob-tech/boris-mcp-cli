@@ -141,7 +141,7 @@ func readJSONFile(path string, v any) error {
 		return err
 	}
 	if err := json.Unmarshal(b, v); err != nil {
-		return fmt.Errorf("%s is not readable JSON: %w", path, err)
+		return fmt.Errorf("%w: %s is not JSON: %w", errStoreItemCorrupt, path, err)
 	}
 	return nil
 }
@@ -220,7 +220,7 @@ func (s *fileStore) read(path string, v any) error {
 		return err
 	}
 	if !bytes.HasPrefix(raw, []byte(fileStoreHeader)) {
-		return fmt.Errorf("%s is not a bmcp credential file (unknown format)", path)
+		return fmt.Errorf("%w: %s is not a bmcp credential file (unknown format)", errStoreItemCorrupt, path)
 	}
 	pass, err := s.pass()
 	if err != nil {
@@ -244,7 +244,10 @@ func (s *fileStore) read(path string, v any) error {
 	if err != nil {
 		return fmt.Errorf("decrypt %s: %w", path, err)
 	}
-	return json.Unmarshal(plain, v)
+	if err := json.Unmarshal(plain, v); err != nil {
+		return fmt.Errorf("%w: %s: %w", errStoreItemCorrupt, path, err)
+	}
+	return nil
 }
 
 func (s *fileStore) write(path string, v any) error {

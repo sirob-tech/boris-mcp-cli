@@ -34,18 +34,23 @@ const (
 
 // sessionBusAddress never autolaunches a bus: dbus-launch on a headless box
 // would start a daemon nobody owns, and then report a Secret Service that is
-// not there.
-func sessionBusAddress() (string, bool) {
+// not there. Only a missing socket means no bus; any other stat failure is an
+// error, so auto fails closed (decision 4).
+func sessionBusAddress() (string, bool, error) {
 	if a := os.Getenv("DBUS_SESSION_BUS_ADDRESS"); a != "" {
-		return a, true
+		return a, true, nil
 	}
 	if d := os.Getenv("XDG_RUNTIME_DIR"); d != "" {
 		p := filepath.Join(d, "bus")
-		if info, err := os.Stat(p); err == nil && info.Mode()&os.ModeSocket != 0 {
-			return "unix:path=" + p, true
+		info, err := os.Stat(p)
+		switch {
+		case err == nil && info.Mode()&os.ModeSocket != 0:
+			return "unix:path=" + p, true, nil
+		case err != nil && !errors.Is(err, os.ErrNotExist):
+			return "", false, fmt.Errorf("check the D-Bus session bus socket: %w", err)
 		}
 	}
-	return "", false
+	return "", false, nil
 }
 
 // dialSessionBus bounds the connect and auth handshake by ctx, which godbus's
@@ -76,7 +81,10 @@ func dialSessionBus(ctx context.Context, addr string) (*dbus.Conn, error) {
 // probeSecretService answers auto resolution without UI: it never unlocks and
 // never creates a collection.
 func probeSecretService(ctx context.Context) secretServiceStatus {
-	addr, ok := sessionBusAddress()
+	addr, ok, err := sessionBusAddress()
+	if err != nil {
+		return secretServiceStatus{State: ssError, Err: err}
+	}
 	if !ok {
 		return secretServiceStatus{State: ssNoBus}
 	}
@@ -155,6 +163,41 @@ type secretServiceBackend struct {
 	coll    dbus.ObjectPath
 }
 
+// ssShared is one session-bus connection per process. serve opens a store per
+// tool call, and a connection each would leak a socket and godbus goroutines.
+var ssShared struct {
+	mu      sync.Mutex
+	addr    string
+	conn    *dbus.Conn
+	session dbus.ObjectPath
+}
+
+// sharedSessionBus returns the process's connection and its plain-transport
+// session, redialling only when the old connection has dropped.
+func sharedSessionBus(ctx context.Context, addr string) (*dbus.Conn, dbus.ObjectPath, error) {
+	ssShared.mu.Lock()
+	defer ssShared.mu.Unlock()
+	if ssShared.conn != nil && ssShared.addr == addr && ssShared.conn.Connected() {
+		return ssShared.conn, ssShared.session, nil
+	}
+	if ssShared.conn != nil {
+		ssShared.conn.Close()
+		ssShared.conn = nil
+	}
+	conn, err := dialSessionBus(ctx, addr)
+	if err != nil {
+		return nil, "", ssFailure("connect", err)
+	}
+	var out dbus.Variant
+	var session dbus.ObjectPath
+	if err := conn.Object(ssBusName, ssServicePath).CallWithContext(ctx, ssServiceIface+".OpenSession", 0, "plain", dbus.MakeVariant("")).Store(&out, &session); err != nil {
+		conn.Close()
+		return nil, "", ssFailure("open session", err)
+	}
+	ssShared.addr, ssShared.conn, ssShared.session = addr, conn, session
+	return conn, session, nil
+}
+
 func newSecretServiceStore(app string, opts storeOptions) (credStore, error) {
 	return keyedStore{b: &secretServiceBackend{app: app, allowUI: opts.AllowUI}}, nil
 }
@@ -187,37 +230,30 @@ func (s *secretServiceBackend) open() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), ssCallTimeout)
 	defer cancel()
-	addr, ok := sessionBusAddress()
+	addr, ok, err := sessionBusAddress()
+	if err != nil {
+		return ssLockedErr("the D-Bus session bus could not be checked", err)
+	}
 	if !ok {
 		return errors.New("the secret-service backend is unavailable: no D-Bus session bus; use --backend aws-cli-cache or file")
 	}
-	conn, err := dialSessionBus(ctx, addr)
+	conn, session, err := sharedSessionBus(ctx, addr)
 	if err != nil {
-		return ssFailure("connect", err)
-	}
-	var out dbus.Variant
-	var session dbus.ObjectPath
-	if err := conn.Object(ssBusName, ssServicePath).CallWithContext(ctx, ssServiceIface+".OpenSession", 0, "plain", dbus.MakeVariant("")).Store(&out, &session); err != nil {
-		conn.Close()
-		return ssFailure("open session", err)
+		return err
 	}
 	coll, err := ssDefaultCollection(ctx, conn)
 	if err != nil {
-		conn.Close()
 		return ssFailure("find the default collection", err)
 	}
 	locked, err := ssLockedProp(ctx, conn, coll)
 	if err != nil {
-		conn.Close()
 		return ssFailure("read the collection state", err)
 	}
 	if locked {
 		if !s.allowUI {
-			conn.Close()
 			return ssLockedErr("the Secret Service collection is locked", nil)
 		}
 		if err := s.unlock(conn, coll); err != nil {
-			conn.Close()
 			return err
 		}
 	}

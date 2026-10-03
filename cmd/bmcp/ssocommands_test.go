@@ -489,3 +489,17 @@ func TestInitPersistsTheBackend(t *testing.T) {
 		t.Fatalf("config %+v %v", cfg, err)
 	}
 }
+
+func TestClearOnALockedStoreNamesTheStoreLockedRemedy(t *testing.T) {
+	f, _, newApp := ssoCommandEnv(t)
+	f.seedToken(t, 8*time.Hour, "gen-1")
+	var stdout, stderr bytes.Buffer
+	a := newApp(&stdout, &stderr)
+	useScriptedStore(a, &scriptedStore{deleteErr: &storeLockedError{Backend: backendKeychain, Reason: "user interaction is not allowed"}})
+	if code := a.run([]string{"clear"}); code != exitAuth {
+		t.Fatalf("exit %d; stderr %s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "credential store needs approval: run bmcp --profile sso-only login") {
+		t.Fatalf("clear should name the store_locked remedy: %s", stderr.String())
+	}
+}

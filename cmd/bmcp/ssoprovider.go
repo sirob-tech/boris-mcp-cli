@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -66,6 +67,13 @@ func (e *ssoLoginError) Unwrap() error { return e.err }
 
 var errSSOLoginDiscarded = errors.New("bmcp clear ran while the browser login was waiting for approval, so its result was discarded")
 
+func loginDiscardedOr(markerErr error) error {
+	if markerErr != nil {
+		return fmt.Errorf("could not confirm that bmcp clear did not discard this login, so its result was not saved: %w", markerErr)
+	}
+	return errSSOLoginDiscarded
+}
+
 // ssoRefreshError is a refresh that did not produce a token. rejected means
 // the refresh token is dead; otherwise the failure was transient and the
 // refresh token was kept for the next attempt.
@@ -119,6 +127,8 @@ type ssoSource struct {
 	deviceCode bool
 	// announce is printed on prose before a browser login starts.
 	announce string
+	// loggedIn records that this process's own browser login produced a token.
+	loggedIn bool
 }
 
 // openSSOStore resolves the backend and opens it. allowUI follows decision 12:
@@ -193,22 +203,23 @@ func (s *ssoSource) matches(rec ssoTokenRecord) bool {
 	return rec.AccessToken != "" && rec.matchesSession(s.chain.Leaf.StartURL, s.chain.Leaf.Region, s.chain.Leaf.scopes())
 }
 
-// readToken returns nil, nil when there is no token for this session; a token
-// for another start URL, region or scope set counts as none. A locked store is
-// an error, and comes before any judgement about the token.
-func (s *ssoSource) readToken() (*ssoTokenRecord, error) {
+// storedToken reads the token with its error classified: absent or
+// unparseable is errStoreItemNotFound, and an unreadable store is an error.
+func (s *ssoSource) storedToken() (ssoTokenRecord, error) {
 	rec, err := s.store.ReadToken(s.sessionKey())
+	return rec, classifyStoreRead(s.store.Backend(), err)
+}
+
+// readToken returns nil, nil when there is no token for this session; a token
+// for another start URL, region or scope set counts as none. A store that
+// cannot be read is an error, and comes before any judgement about the token.
+func (s *ssoSource) readToken() (*ssoTokenRecord, error) {
+	rec, err := s.storedToken()
 	if errors.Is(err, errStoreItemNotFound) {
 		return nil, nil
 	}
 	if err != nil {
-		var locked *storeLockedError
-		if errors.As(err, &locked) {
-			return nil, err
-		}
-		// An unparseable token, e.g. the CLI's non-atomic write caught halfway,
-		// is no token.
-		return nil, nil
+		return nil, err
 	}
 	if !s.matches(rec) {
 		return nil, nil
@@ -233,6 +244,9 @@ func (s *ssoSource) credentials(ctx context.Context) (aws.Credentials, *issuedRo
 	if err != nil {
 		return aws.Credentials{}, nil, err
 	}
+	if tok != nil && tok.Generation == "" {
+		tok = s.stampGeneration(ctx, *tok)
+	}
 	finalKey := s.chain.cacheKey(len(s.chain.Hops))
 	if tok != nil {
 		if rec, ok, err := s.cachedRole(finalKey, tok.Generation); err != nil {
@@ -256,6 +270,28 @@ func (s *ssoSource) credentials(ctx context.Context) (aws.Credentials, *issuedRo
 		SessionToken: final.SessionToken, Expiration: final.Expires, Generation: leaf.Generation}
 	s.saveRole(ctx, finalKey, rec)
 	return rec.credentials(), s.issued(finalKey, rec), nil
+}
+
+// stampGeneration gives a token another program wrote, e.g. the AWS CLI on
+// aws-cli-cache, the generation role-credential caching needs. Best effort:
+// on any failure the token is used as it is, and nothing is cached.
+func (s *ssoSource) stampGeneration(ctx context.Context, tok ssoTokenRecord) *ssoTokenRecord {
+	lock, err := s.locks.lockSession(ctx, s.sessionKey())
+	if err != nil {
+		return &tok
+	}
+	defer lock.Unlock()
+	cur, err := s.storedToken()
+	if err != nil || !s.matches(cur) || cur.AccessToken != tok.AccessToken {
+		return &tok
+	}
+	if cur.Generation == "" {
+		cur.Generation = newGeneration()
+		if err := s.store.WriteToken(s.sessionKey(), cur); err != nil {
+			return &tok
+		}
+	}
+	return &cur
 }
 
 func (s *ssoSource) issued(credKey string, rec roleCredsRecord) *issuedRoleCreds {
@@ -355,11 +391,14 @@ func (s *ssoSource) usableToken(ctx context.Context, tok *ssoTokenRecord, reason
 		}
 		if refreshable(*tok, now) {
 			next, err := s.refresh(ctx, *tok, false)
+			var oidcErr *ssoRefreshError
 			switch {
 			case err == nil:
 				return next, nil
-			case accessUsable(*tok, now):
-				// Decision 8: a failed refresh does not retire a token that still works.
+			case errors.As(err, &oidcErr) && accessUsable(*tok, now):
+				// Decision 8: a failed refresh does not retire a token that still
+				// works. Only an OIDC failure: an unreadable store or a cleared
+				// token is not the refresh failing.
 				return *tok, nil
 			case errors.Is(err, errSSOTokenGone), isRefreshRejected(err):
 				reason = "the AWS SSO token expired and its refresh was rejected"
@@ -389,7 +428,7 @@ func (s *ssoSource) refresh(ctx context.Context, seen ssoTokenRecord, force bool
 		return ssoTokenRecord{}, err
 	}
 	defer lock.Unlock()
-	cur, err := s.store.ReadToken(s.sessionKey())
+	cur, err := s.storedToken()
 	if errors.Is(err, errStoreItemNotFound) || (err == nil && !s.matches(cur)) {
 		return ssoTokenRecord{}, errSSOTokenGone
 	}
@@ -525,7 +564,12 @@ func (s *ssoSource) login(ctx context.Context, reason string) (ssoTokenRecord, e
 	if err != nil {
 		return ssoTokenRecord{}, err
 	}
-	if cur, err := s.store.ReadToken(s.sessionKey()); err == nil && s.matches(cur) && accessUsable(cur, s.a.now()) {
+	cur, err := s.storedToken()
+	if err != nil && !errors.Is(err, errStoreItemNotFound) {
+		lock.Unlock()
+		return ssoTokenRecord{}, err
+	}
+	if err == nil && s.matches(cur) && accessUsable(cur, s.a.now()) {
 		lock.Unlock()
 		return cur, nil
 	}
@@ -558,9 +602,18 @@ func (s *ssoSource) login(ctx context.Context, reason string) (ssoTokenRecord, e
 	defer cancel()
 	lock, err = s.locks.lockSession(saveCtx, s.sessionKey())
 	if err != nil {
+		// Without the lock nothing is saved, but the marker must still go, or
+		// other processes report sso_login_in_progress for up to 15 minutes.
+		m := s.locks.unlockedMarker(s.sessionKey())
+		wanted, werr := m.LoginWanted(mine)
+		m.EndLogin(mine)
 		if loginErr != nil {
 			return ssoTokenRecord{}, &ssoLoginError{loginErr}
 		}
+		if werr != nil || !wanted {
+			return ssoTokenRecord{}, &ssoLoginError{loginDiscardedOr(werr)}
+		}
+		s.loggedIn = true
 		s.persistWarning("the new AWS SSO token", err)
 		return tok, nil
 	}
@@ -572,9 +625,12 @@ func (s *ssoSource) login(ctx context.Context, reason string) (ssoTokenRecord, e
 	if loginErr != nil {
 		return ssoTokenRecord{}, &ssoLoginError{loginErr}
 	}
-	if werr == nil && !wanted {
-		return ssoTokenRecord{}, &ssoLoginError{errSSOLoginDiscarded}
+	// Fail closed: a marker that cannot be read may hide a `bmcp clear`, which
+	// saving would undo.
+	if werr != nil || !wanted {
+		return ssoTokenRecord{}, &ssoLoginError{loginDiscardedOr(werr)}
 	}
+	s.loggedIn = true
 	saved, err := lock.saveNewToken(s.store, tok)
 	if err != nil {
 		s.persistWarning("the new AWS SSO token", err)
@@ -642,6 +698,9 @@ type ssoLoginOutcome struct {
 	AlreadyValid bool
 	Refreshed    bool
 	Refreshable  bool
+	// RefreshErr is a failed refresh of a token that was still usable, so no
+	// browser login ran: set only with AlreadyValid.
+	RefreshErr error
 }
 
 // ssoLogin is `bmcp login`: store prompts allowed, no budget gate (the caller
@@ -681,11 +740,18 @@ func (a *app) ssoLogin(ctx context.Context, cfg effectiveConfig, profile string,
 		out.AlreadyValid = true
 		return finish(*tok), nil
 	}
+	var refreshErr error
 	if tok != nil && refreshable(*tok, now) {
-		if next, err := src.refresh(ctx, *tok, false); err == nil {
+		next, err := src.refresh(ctx, *tok, false)
+		if err == nil {
 			out.Refreshed = true
 			return finish(next), nil
 		}
+		var locked *storeLockedError
+		if errors.As(err, &locked) {
+			return out, err
+		}
+		refreshErr = err
 	}
 	if src.deviceCode, _, err = ssoFlowChoice(cfg, explicitDeviceCode); err != nil {
 		return out, err
@@ -693,6 +759,11 @@ func (a *app) ssoLogin(ctx context.Context, cfg effectiveConfig, profile string,
 	t, err := src.login(ctx, "there was no usable AWS SSO token")
 	if err != nil {
 		return out, err
+	}
+	if !src.loggedIn {
+		// login found a usable token without a browser: the stored one whose
+		// refresh just failed, or one another process's login saved.
+		out.AlreadyValid, out.RefreshErr = true, refreshErr
 	}
 	return finish(t), nil
 }
@@ -784,15 +855,46 @@ func (a *app) ssoClearAll(ctx context.Context, cfg effectiveConfig, allowUI bool
 	return out, errors.Join(errs...)
 }
 
+// ssoIssuedSlot records, per request, the cached role credentials that request
+// signed with. Per request, not per app: serve runs calls concurrently, and a
+// late rejection of one must not evict what a later call signed with.
+type ssoIssuedSlot struct {
+	mu  sync.Mutex
+	iss *issuedRoleCreds
+}
+
+type ssoIssuedKey struct{}
+
+func withSSOIssuedSlot(ctx context.Context) (context.Context, *ssoIssuedSlot) {
+	slot := &ssoIssuedSlot{}
+	return context.WithValue(ctx, ssoIssuedKey{}, slot), slot
+}
+
+// recordSSOIssued fills the request's slot, when the caller made one.
+func recordSSOIssued(ctx context.Context, iss *issuedRoleCreds) {
+	if slot, ok := ctx.Value(ssoIssuedKey{}).(*ssoIssuedSlot); ok {
+		slot.mu.Lock()
+		slot.iss = iss
+		slot.mu.Unlock()
+	}
+}
+
+func (s *ssoIssuedSlot) take() *issuedRoleCreds {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	iss := s.iss
+	s.iss = nil
+	return iss
+}
+
 // evictRejectedSSOCreds is the gateway-rejection hook (decision 14): it drops
-// the cached role credentials this run signed with, so the next invocation
-// re-mints, and leaves the SSO token alone. A no-op when nothing native was
-// issued, and when another process has already replaced the entry.
-func (a *app) evictRejectedSSOCreds(ctx context.Context) error {
-	a.ssoIssuedMu.Lock()
-	iss := a.ssoIssued
-	a.ssoIssued = nil
-	a.ssoIssuedMu.Unlock()
+// the cached role credentials a rejected request signed with, so the next
+// invocation re-mints, and leaves the SSO token alone. A no-op when nothing
+// native was issued, and when another process has already replaced the entry.
+func evictRejectedSSOCreds(ctx context.Context, iss *issuedRoleCreds) error {
 	if iss == nil {
 		return nil
 	}
@@ -832,7 +934,7 @@ type ssoStoreStatus struct {
 
 func (a *app) ssoStoreStatus(ctx context.Context, cfg effectiveConfig) ssoStoreStatus {
 	var st ssoStoreStatus
-	profile, _, _ := a.sharedProfileFor(cfg)
+	profile := a.ssoProfileFor(ctx, cfg)
 	if profile == "" {
 		return st
 	}
@@ -848,6 +950,7 @@ func (a *app) ssoStoreStatus(ctx context.Context, cfg effectiveConfig) ssoStoreS
 	if err == nil {
 		var rec ssoTokenRecord
 		rec, err = store.ReadToken(chain.Leaf.storeKey())
+		err = classifyStoreRead(store.Backend(), err)
 		if err == nil && rec.AccessToken != "" && rec.matchesSession(chain.Leaf.StartURL, chain.Leaf.Region, chain.Leaf.scopes()) {
 			st.HasToken, st.ExpiresAt, st.Refreshable = true, rec.ExpiresAt, refreshable(rec, a.now())
 		}

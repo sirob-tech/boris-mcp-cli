@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -50,6 +51,9 @@ type fakeIdentityCenter struct {
 	roleStatus    int
 	roleRawBody   string
 	rejectAccess  map[string]bool
+	// callbackOpenAtExchange records a PKCE callback listener still accepting
+	// connections when its code was redeemed.
+	callbackOpenAtExchange bool
 	// errorBody rides on every error response, so a test can plant secrets in
 	// what the service says and look for them in what bmcp says.
 	errorBody string
@@ -234,6 +238,16 @@ func (f *fakeIdentityCenter) token(w http.ResponseWriter, body []byte) {
 	in.GrantType, in.Code, in.CodeVerifier = raw["grantType"], raw["code"], raw["codeVerifier"]
 	in.RedirectURI, in.RefreshToken, in.DeviceCode = raw["redirectUri"], raw["refreshToken"], raw["deviceCode"]
 
+	if in.GrantType == grantAuthCode {
+		if u, err := url.Parse(in.RedirectURI); err == nil {
+			if c, err := net.DialTimeout("tcp", u.Host, time.Second); err == nil {
+				c.Close()
+				f.mu.Lock()
+				f.callbackOpenAtExchange = true
+				f.mu.Unlock()
+			}
+		}
+	}
 	f.mu.Lock()
 	f.grants[in.GrantType]++
 	delay := time.Duration(0)

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 )
 
@@ -32,7 +33,10 @@ func (s keyedStore) getJSON(item string, v any) error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(data, v)
+	if err := json.Unmarshal(data, v); err != nil {
+		return fmt.Errorf("%w: %s: %w", errStoreItemCorrupt, item, err)
+	}
+	return nil
 }
 
 func (s keyedStore) setJSON(item, label string, v any) error {

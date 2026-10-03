@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -49,6 +50,27 @@ type storeOptions struct {
 }
 
 var errStoreItemNotFound = errors.New("credential store: item not found")
+
+// errStoreItemCorrupt is an item that was read but does not parse, e.g. the AWS
+// CLI's non-atomic write caught halfway. Readers treat it as absent.
+var errStoreItemCorrupt = errors.New("credential store: item is not readable")
+
+// classifyStoreRead puts a token read failure in decision 12's order: absent or
+// unparseable is errStoreItemNotFound, a store bmcp may not read is
+// store_locked, and anything else is a store error, never "log in".
+func classifyStoreRead(backend backendName, err error) error {
+	var locked *storeLockedError
+	switch {
+	case err == nil, errors.As(err, &locked):
+		return err
+	case errors.Is(err, errStoreItemNotFound), errors.Is(err, errStoreItemCorrupt):
+		return errStoreItemNotFound
+	case errors.Is(err, fs.ErrPermission):
+		return &storeLockedError{Backend: backend, Reason: "permission denied reading the stored token",
+			Hint: "check that bmcp's credential files belong to this user", Err: err}
+	}
+	return fmt.Errorf("reading the %s credential store: %w", backend, err)
+}
 
 // storeLockedError means the store exists but could not be read or written
 // without UI this invocation may not show, or was refused. Kept apart from

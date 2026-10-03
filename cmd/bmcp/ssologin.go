@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -198,6 +199,9 @@ func (l *ssoLoginer) pkceLogin(ctx context.Context) (ssoTokenRecord, error) {
 	case <-wait.Done():
 		return ssoTokenRecord{}, fmt.Errorf("the browser login was not approved in time: %w", wait.Err())
 	}
+	// Decision 7: the listener goes with the first valid callback, before the
+	// code is redeemed, so nothing else can reach it meanwhile.
+	srv.shutdown()
 	if res.err != nil {
 		return ssoTokenRecord{}, res.err
 	}
@@ -344,10 +348,11 @@ type ssoCallbackResult struct {
 // ssoCallbackServer receives the browser's redirect on a random loopback port.
 // Only the first callback carrying the right state counts.
 type ssoCallbackServer struct {
-	ln      net.Listener
-	srv     *http.Server
-	state   string
-	results chan ssoCallbackResult
+	ln       net.Listener
+	srv      *http.Server
+	state    string
+	results  chan ssoCallbackResult
+	shutOnce sync.Once
 }
 
 func newSSOCallbackServer(ctx context.Context) (*ssoCallbackServer, error) {
@@ -424,13 +429,15 @@ func oauthErrorCode(s string) string {
 }
 
 // shutdown waits briefly so the page answering the callback still reaches
-// the browser.
+// the browser. Safe to call more than once.
 func (s *ssoCallbackServer) shutdown() {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if s.srv.Shutdown(ctx) != nil {
-		s.srv.Close()
-	}
+	s.shutOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if s.srv.Shutdown(ctx) != nil {
+			s.srv.Close()
+		}
+	})
 }
 
 // ssoServiceError is how an IAM Identity Center failure reaches a message:

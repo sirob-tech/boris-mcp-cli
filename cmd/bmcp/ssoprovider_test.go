@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -501,12 +502,13 @@ region = eu-west-1
 `)
 	f := newFakeIdentityCenter(t)
 	a := authTestApp()
-	creds, _, err := a.awsCredentials(authTestContext(t), ssoTestConfig("static-hop"))
+	ctx, slot := withSSOIssuedSlot(authTestContext(t))
+	creds, _, err := a.awsCredentials(ctx, ssoTestConfig("static-hop"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if creds.AccessKeyID != "ASIA-HOP-1" || a.ssoIssued != nil {
-		t.Fatalf("credentials %q, issued %v: the SDK should have assumed the role", creds.AccessKeyID, a.ssoIssued)
+	if iss := slot.take(); creds.AccessKeyID != "ASIA-HOP-1" || iss != nil {
+		t.Fatalf("credentials %q, issued %v: the SDK should have assumed the role", creds.AccessKeyID, iss)
 	}
 	if f.stsSigners[0] != profileKey {
 		t.Fatalf("signed with %q, want the static leaf's key", f.stsSigners[0])
@@ -600,11 +602,12 @@ func TestGatewayRejectionEvictsOnlyTheRejectedCredentials(t *testing.T) {
 	f := newFakeIdentityCenter(t)
 	f.seedToken(t, 8*time.Hour, "gen-1")
 	a := authTestApp()
-	if _, _, err := a.awsCredentials(authTestContext(t), ssoTestConfig("sso-only")); err != nil {
+	ctx, slot := withSSOIssuedSlot(authTestContext(t))
+	if _, _, err := a.awsCredentials(ctx, ssoTestConfig("sso-only")); err != nil {
 		t.Fatal(err)
 	}
-	iss := a.ssoIssued
-	if err := a.evictRejectedSSOCreds(authTestContext(t)); err != nil {
+	iss := slot.take()
+	if err := evictRejectedSSOCreds(authTestContext(t), iss); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := testSSOStore(t).ReadRoleCreds(iss.sessionKey, iss.credKey); !errors.Is(err, errStoreItemNotFound) {
@@ -614,17 +617,51 @@ func TestGatewayRejectionEvictsOnlyTheRejectedCredentials(t *testing.T) {
 		t.Fatal("a gateway rejection touched the SSO token")
 	}
 	// A newer entry saved meanwhile by another process survives a late eviction.
-	a.ssoIssued = iss
 	newer := iss.rec
 	newer.AccessKeyID = "ASIA-NEWER"
 	if err := testSSOStore(t).WriteRoleCreds(iss.sessionKey, iss.credKey, newer); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.evictRejectedSSOCreds(authTestContext(t)); err != nil {
+	if err := evictRejectedSSOCreds(authTestContext(t), iss); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := testSSOStore(t).ReadRoleCreds(iss.sessionKey, iss.credKey); err != nil || got.AccessKeyID != "ASIA-NEWER" {
 		t.Fatalf("a late eviction removed newer credentials: %+v %v", got, err)
+	}
+}
+
+// serve runs requests concurrently in one process: a late rejection of an
+// earlier request must not evict what a later request signed with.
+func TestGatewayRejectionEvictsOnlyWhatThatRequestSignedWith(t *testing.T) {
+	isolateAWSEnv(t)
+	f := newFakeIdentityCenter(t)
+	f.seedToken(t, 8*time.Hour, "gen-1")
+	a := authTestApp()
+	ctxA, slotA := withSSOIssuedSlot(authTestContext(t))
+	if _, _, err := a.awsCredentials(ctxA, ssoTestConfig("sso-only")); err != nil {
+		t.Fatal(err)
+	}
+	issA := slotA.take()
+	newer := issA.rec
+	newer.AccessKeyID = "ASIA-NEWER"
+	if err := testSSOStore(t).WriteRoleCreds(issA.sessionKey, issA.credKey, newer); err != nil {
+		t.Fatal(err)
+	}
+	ctxB, slotB := withSSOIssuedSlot(authTestContext(t))
+	if creds, _, err := a.awsCredentials(ctxB, ssoTestConfig("sso-only")); err != nil || creds.AccessKeyID != "ASIA-NEWER" {
+		t.Fatalf("request B: %q %v", creds.AccessKeyID, err)
+	}
+	if err := evictRejectedSSOCreds(authTestContext(t), issA); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := testSSOStore(t).ReadRoleCreds(issA.sessionKey, issA.credKey); err != nil || got.AccessKeyID != "ASIA-NEWER" {
+		t.Fatalf("request A's rejection evicted request B's credentials: %+v %v", got, err)
+	}
+	if err := evictRejectedSSOCreds(authTestContext(t), slotB.take()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testSSOStore(t).ReadRoleCreds(issA.sessionKey, issA.credKey); !errors.Is(err, errStoreItemNotFound) {
+		t.Fatalf("request B's rejection kept its credentials: %v", err)
 	}
 }
 
@@ -687,9 +724,11 @@ func TestClearRemovesTheSessionAndClearAllEverything(t *testing.T) {
 	f := newFakeIdentityCenter(t)
 	f.seedToken(t, 8*time.Hour, "gen-1")
 	a := authTestApp()
-	if _, _, err := a.awsCredentials(authTestContext(t), ssoTestConfig("sso-only")); err != nil {
+	ctx, slot := withSSOIssuedSlot(authTestContext(t))
+	if _, _, err := a.awsCredentials(ctx, ssoTestConfig("sso-only")); err != nil {
 		t.Fatal(err)
 	}
+	iss := slot.take()
 	out, err := a.ssoClear(authTestContext(t), ssoTestConfig("sso-only"), "sso-only", false)
 	if err != nil || !out.SharedWithAWSCLI || len(out.Sessions) != 1 {
 		t.Fatalf("%+v %v", out, err)
@@ -697,7 +736,7 @@ func TestClearRemovesTheSessionAndClearAllEverything(t *testing.T) {
 	if _, ok := readStoredToken(t); ok {
 		t.Fatal("token survived clear")
 	}
-	if _, err := testSSOStore(t).ReadRoleCreds(a.ssoIssued.sessionKey, a.ssoIssued.credKey); !errors.Is(err, errStoreItemNotFound) {
+	if _, err := testSSOStore(t).ReadRoleCreds(iss.sessionKey, iss.credKey); !errors.Is(err, errStoreItemNotFound) {
 		t.Fatal("role credentials survived clear")
 	}
 
@@ -908,5 +947,258 @@ func TestClearDuringABrowserLoginDiscardsItsResult(t *testing.T) {
 	}
 	if _, ok := readStoredToken(t); ok {
 		t.Fatal("a login raced by clear saved its token")
+	}
+}
+
+// scriptedStore wraps a real store and fails chosen operations, putting it in
+// states no real backend reaches on demand. ops records the mutation order.
+type scriptedStore struct {
+	credStore
+	mu sync.Mutex
+	// tokenReadErrFrom fails every token read from that read on (1-based).
+	tokenReadErrFrom int
+	tokenReadErr     error
+	tokenReads       int
+	deleteErr        error
+	ops              []string
+}
+
+func (s *scriptedStore) ReadToken(key string) (ssoTokenRecord, error) {
+	s.mu.Lock()
+	s.tokenReads++
+	fail := s.tokenReadErrFrom > 0 && s.tokenReads >= s.tokenReadErrFrom
+	s.mu.Unlock()
+	if fail {
+		return ssoTokenRecord{}, s.tokenReadErr
+	}
+	return s.credStore.ReadToken(key)
+}
+
+func (s *scriptedStore) record(op string) {
+	s.mu.Lock()
+	s.ops = append(s.ops, op)
+	s.mu.Unlock()
+}
+
+func (s *scriptedStore) WriteToken(key string, rec ssoTokenRecord) error {
+	s.record("write-token")
+	return s.credStore.WriteToken(key, rec)
+}
+
+func (s *scriptedStore) DeleteToken(key string) error {
+	s.record("delete-token")
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+	return s.credStore.DeleteToken(key)
+}
+
+func (s *scriptedStore) DeleteSessionRoleCreds(key string) error {
+	s.record("delete-role-creds")
+	if s.deleteErr != nil {
+		return s.deleteErr
+	}
+	return s.credStore.DeleteSessionRoleCreds(key)
+}
+
+func useScriptedStore(a *app, s *scriptedStore) {
+	a.openStore = func(b resolvedBackend, o storeOptions) (credStore, error) {
+		inner, err := openCredStore(b, o)
+		s.credStore = inner
+		return s, err
+	}
+}
+
+func TestPKCECallbackListenerIsClosedBeforeTheCodeIsRedeemed(t *testing.T) {
+	isolateAWSEnv(t)
+	f := newFakeIdentityCenter(t)
+	if _, _, err := ssoTestApp(f).awsCredentials(loginBudget(t), ssoTestConfig("sso-only")); err != nil {
+		t.Fatal(err)
+	}
+	f.mu.Lock()
+	open := f.callbackOpenAtExchange
+	f.mu.Unlock()
+	if open {
+		t.Fatal("the callback listener still accepted connections while the code was redeemed")
+	}
+}
+
+// With no profile named and no environment credentials, the SDK reads
+// "default"; an SSO default must go through bmcp's store, not the CLI cache.
+func TestAnSSODefaultProfileResolvesNatively(t *testing.T) {
+	isolateAWSEnv(t)
+	appendSharedConfig(t, `
+[default]
+sso_start_url = https://example.awsapps.com/start
+sso_region = us-east-1
+sso_account_id = 123456789012
+sso_role_name = ExampleRole
+region = us-east-1
+`)
+	f := newFakeIdentityCenter(t)
+	f.seedToken(t, 8*time.Hour, "gen-1")
+	cfg := effectiveConfig{Region: "us-east-1"}
+	ctx, slot := withSSOIssuedSlot(authTestContext(t))
+	creds, _, err := authTestApp().awsCredentials(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if iss := slot.take(); iss == nil || !strings.HasPrefix(creds.AccessKeyID, "ASIA-SSO-") {
+		t.Fatalf("credentials %q, issued %v: the default SSO profile bypassed the native path", creds.AccessKeyID, iss)
+	}
+	if st := authTestApp().ssoStoreStatus(authTestContext(t), cfg); st.Profile != "default" || !st.HasToken {
+		t.Fatalf("doctor should report the default profile's store: %+v", st)
+	}
+	setEnvCredentials(t)
+	if p := authTestApp().ssoProfileFor(authTestContext(t), cfg); p != "" {
+		t.Fatalf("environment credentials outrank the default profile, got %q", p)
+	}
+}
+
+// Decision 12: an unreadable store is store_locked, never "no token, log in".
+func TestAnUnreadableTokenFileIsStoreLockedNotALogin(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a 0000 file")
+	}
+	isolateAWSEnv(t)
+	f := newFakeIdentityCenter(t)
+	f.seedToken(t, 8*time.Hour, "gen-1")
+	home, _ := os.UserHomeDir()
+	path := home + "/.aws/sso/cache/" + fixtureSessionKey() + ".json"
+	if err := os.Chmod(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(path, 0o600) })
+	_, _, err := ssoTestApp(f).awsCredentials(loginBudget(t), ssoTestConfig("sso-only"))
+	if errorName(err) != errNameStoreLocked {
+		t.Fatalf("error %v named %q, want %s", err, errorName(err), errNameStoreLocked)
+	}
+	if regs, _, _, _ := f.counts(); regs != 0 {
+		t.Fatal("an unreadable store started a browser login")
+	}
+}
+
+// Decision 8's fallback is for a failed refresh, not for a store that turned
+// unreadable under the lock.
+func TestALockedStoreDuringRefreshIsNotMaskedByTheOldToken(t *testing.T) {
+	isolateAWSEnv(t)
+	f := newFakeIdentityCenter(t)
+	f.seedToken(t, 10*time.Minute, "gen-1")
+	a := authTestApp()
+	useScriptedStore(a, &scriptedStore{tokenReadErrFrom: 2,
+		tokenReadErr: &storeLockedError{Backend: backendKeychain, Reason: "user interaction is not allowed"}})
+	_, _, err := a.awsCredentials(authTestContext(t), ssoTestConfig("sso-only"))
+	if errorName(err) != errNameStoreLocked {
+		t.Fatalf("error %v named %q, want %s", err, errorName(err), errNameStoreLocked)
+	}
+}
+
+// The AWS CLI writes tokens with no bmcp generation; one is stamped on first
+// use so role credentials minted from it can be cached.
+func TestACLIWrittenTokenIsStampedSoRoleCredentialsCache(t *testing.T) {
+	isolateAWSEnv(t)
+	f := newFakeIdentityCenter(t)
+	f.seedToken(t, 8*time.Hour, "")
+	for i := 0; i < 2; i++ {
+		if _, _, err := authTestApp().awsCredentials(authTestContext(t), ssoTestConfig("sso-only")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if tok, _ := readStoredToken(t); tok.Generation == "" {
+		t.Fatal("the CLI-written token was not stamped")
+	}
+	if _, _, roleCalls, _ := f.counts(); roleCalls != 1 {
+		t.Fatalf("GetRoleCredentials ran %d times; the second call should have used the cache", roleCalls)
+	}
+}
+
+// A lock-free reader that sees the new token must not find role credentials
+// the old one minted, so they go before the token is written.
+func TestANewTokenDropsRoleCredentialsBeforeItIsWritten(t *testing.T) {
+	isolateAWSEnv(t)
+	locks, err := newCredLocks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := locks.lockSession(authTestContext(t), fixtureSessionKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Unlock()
+	s := &scriptedStore{credStore: testSSOStore(t)}
+	if _, err := lock.saveNewToken(s, sampleToken("")); err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.clearSession(s); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"delete-role-creds", "write-token", "delete-role-creds", "delete-token"}
+	if !reflect.DeepEqual(s.ops, want) {
+		t.Fatalf("store operations %v, want %v", s.ops, want)
+	}
+}
+
+// A marker that cannot be read may hide a `bmcp clear`, so the login fails
+// closed rather than saving a token clear meant to discard.
+func TestAnUnreadableLoginMarkerDiscardsTheLogin(t *testing.T) {
+	isolateAWSEnv(t)
+	f := newFakeIdentityCenter(t)
+	f.gate()
+	login := startSSOHelper(t, "interactive", 10*time.Minute)
+	waitForLoginMarker(t)
+	locks, _ := newCredLocks()
+	path := locks.markerPath(fixtureSessionKey())
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f.release()
+	if out := login.result(t); !strings.Contains(out["error"], "could not confirm") {
+		t.Fatalf("login %v should fail closed on an unreadable marker", out)
+	}
+	if _, ok := readStoredToken(t); ok {
+		t.Fatal("a login that could not read its marker saved its token")
+	}
+}
+
+// A login that cannot re-take the lock still removes its marker, or every
+// other process reports sso_login_in_progress for up to 15 minutes.
+func TestALoginThatCannotRelockStillRemovesItsMarker(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root opens a 0000 file")
+	}
+	isolateAWSEnv(t)
+	f := newFakeIdentityCenter(t)
+	f.gate()
+	login := startSSOHelper(t, "interactive", 10*time.Minute)
+	waitForLoginMarker(t)
+	locks, _ := newCredLocks()
+	global := locks.dir + "/global.lock"
+	if err := os.Chmod(global, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(global, 0o600) })
+	f.release()
+	if out := login.result(t); out["error"] != "" {
+		t.Fatalf("login %v: an approved login should still serve this call", out)
+	}
+	if _, err := os.Stat(locks.markerPath(fixtureSessionKey())); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the login marker survived: %v", err)
+	}
+}
+
+func TestExplicitLoginReportsAFailedRefreshOfAStillValidToken(t *testing.T) {
+	isolateAWSEnv(t)
+	f := newFakeIdentityCenter(t)
+	f.refreshErr, f.refreshStatus = "InternalServerException", 500
+	f.seedToken(t, 10*time.Minute, "gen-1")
+	res, err := ssoTestApp(f).ssoLogin(loginBudget(t), ssoTestConfig("sso-only"), "sso-only", false)
+	if err != nil || !res.AlreadyValid || res.RefreshErr == nil {
+		t.Fatalf("%+v %v: want an already-valid session with its refresh failure", res, err)
+	}
+	if regs, _, _, _ := f.counts(); regs != 0 {
+		t.Fatal("a still-valid token opened a browser")
 	}
 }

@@ -64,6 +64,20 @@ static OSStatus bmcp_kc_get(const char *service, const char *account, int noUI, 
 	return errSecSuccess;
 }
 
+// The login keychain, for adds (decision 2): the default keychain is whatever
+// the user last made default. NULL when it cannot be opened, so the add falls
+// back to the default rather than failing.
+static SecKeychainRef bmcp_login_keychain(void) {
+	SecKeychainRef kc = NULL;
+	SecKeychainStatus status;
+	if (SecKeychainOpen("login.keychain", &kc) != errSecSuccess) return NULL;
+	if (SecKeychainGetStatus(kc, &status) != errSecSuccess) {
+		CFRelease(kc);
+		return NULL;
+	}
+	return kc;
+}
+
 // Update first, add only when absent: an update keeps the item's existing ACL,
 // which is what lets a re-signed bmcp keep reading without a prompt.
 static OSStatus bmcp_kc_set(const char *service, const char *account, const char *label, const void *data, size_t len, int noUI) {
@@ -79,7 +93,10 @@ static OSStatus bmcp_kc_set(const char *service, const char *account, const char
 		CFStringRef l = bmcp_str(label);
 		CFDictionarySetValue(q, kSecAttrLabel, l);
 		CFRelease(l);
+		SecKeychainRef login = bmcp_login_keychain();
+		if (login != NULL) CFDictionarySetValue(q, kSecUseKeychain, login);
 		st = SecItemAdd(q, NULL);
+		if (login != NULL) CFRelease(login);
 	}
 	bmcp_end(prev);
 	CFRelease(attrs);
@@ -153,15 +170,12 @@ import (
 // whether the whole process may show keychain UI.
 var keychainMu sync.Mutex
 
-const keychainSupported = true
-
 type keychainBackend struct {
 	service string
 	noUI    bool
 }
 
-// newKeychainStore keeps items in the default (login) keychain as generic
-// passwords. No ACL is set explicitly: the default trusts the creating app by
+// newKeychainStore keeps items in the login keychain as generic passwords. No ACL is set explicitly: the default trusts the creating app by
 // its designated requirement, which for a Developer ID build survives updates.
 func newKeychainStore(service string, opts storeOptions) (credStore, error) {
 	return keyedStore{b: &keychainBackend{service: service, noUI: !opts.AllowUI}}, nil

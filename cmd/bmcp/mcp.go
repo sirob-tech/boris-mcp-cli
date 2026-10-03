@@ -250,6 +250,7 @@ func errorName(err error) string {
 func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, error) {
 	ctx, cancel := context.WithTimeout(ctx, cfg.SyncTimeout)
 	defer cancel()
+	ctx, issued := withSSOIssuedSlot(ctx)
 	fmt.Fprintln(a.prose(), "Syncing tools...")
 	client, err := a.newMCPClient(ctx, cfg, cfg.SyncTimeout)
 	if err != nil {
@@ -257,11 +258,11 @@ func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, e
 	}
 	server, err := client.initialize(ctx)
 	if err != nil {
-		return nil, a.afterGatewayRejection(err)
+		return nil, a.afterGatewayRejection(issued, err)
 	}
 	tools, err := client.listTools(ctx)
 	if err != nil {
-		return nil, a.afterGatewayRejection(err)
+		return nil, a.afterGatewayRejection(issued, err)
 	}
 	for i := range tools {
 		tools[i].SchemaHash = schemaHash(tools[i].InputSchema)
@@ -298,29 +299,30 @@ func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, e
 func (a *app) callTool(ctx context.Context, cfg effectiveConfig, name string, input map[string]any) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, cfg.CallTimeout)
 	defer cancel()
+	ctx, issued := withSSOIssuedSlot(ctx)
 	client, err := a.newMCPClient(ctx, cfg, cfg.CallTimeout)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := client.initialize(ctx); err != nil {
-		return nil, a.afterGatewayRejection(err)
+		return nil, a.afterGatewayRejection(issued, err)
 	}
 	result, err := client.callTool(ctx, name, input)
-	return result, a.afterGatewayRejection(err)
+	return result, a.afterGatewayRejection(issued, err)
 }
 
 // afterGatewayRejection evicts the cached role credentials a rejected request
 // was signed with, so the next invocation mints fresh ones. No replay, the SSO
 // token is left alone, and err is returned unchanged with no login remedy: a
 // 401 also covers a wrong signing region, which no login repairs.
-func (a *app) afterGatewayRejection(err error) error {
+func (a *app) afterGatewayRejection(issued *ssoIssuedSlot, err error) error {
 	if !isGatewayAuthRejection(err) {
 		return err
 	}
 	// Its own budget: the request's context may be what just ran out.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if evictErr := a.evictRejectedSSOCreds(ctx); evictErr != nil {
+	if evictErr := evictRejectedSSOCreds(ctx, issued.take()); evictErr != nil {
 		fmt.Fprintf(a.prose(), "bmcp could not drop the cached role credentials the gateway rejected: %v\n", evictErr)
 	}
 	return err

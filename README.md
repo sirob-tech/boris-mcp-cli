@@ -349,9 +349,9 @@ that failed.
 `bmcp` runs the IAM Identity Center login itself, following `source_profile`
 to the leaf, which is where the SSO configuration lives; the AWS CLI is not
 needed. A browser opens on this machine and `bmcp` blocks until the login is
-approved, for up to ten minutes. If the stored session is still valid, or a
-refresh renews it, it exits 0 and opens nothing, so it is safe to run on a
-failure it turns out not to fix. The output says which store holds the session
+approved: the browser wait ends after ten minutes, the command after eleven. If
+the stored session is still valid, or a refresh renews it, it exits 0 and opens
+nothing, so it is safe to run on a failure it turns out not to fix. The output says which store holds the session
 and whether it can be refreshed without a browser.
 
 `bmcp login --device-code` shows a code to approve in a browser on any machine
@@ -370,9 +370,9 @@ an agent running it while its operator approves in a window already open. Run it
 on its own in the human format, then retry the call that failed, once.
 
 A tool call on a *fresh* catalog will also start this login by itself, without
-being asked, when it is running interactively in a human format and has enough
-of its ten-minute budget left. That is a convenience, not something to rely on:
-a stale catalog puts the credential load inside a sixty-second sync budget,
+being asked, when it is running interactively in a human format and at least
+three minutes of its budget remain. That is a convenience, not something to rely
+on: a stale catalog puts the credential load inside a sixty-second sync budget,
 which is shorter than a login, so the implicit one declines and the message
 naming `bmcp login` is what you get. An expired session and a stale catalog
 usually arrive together, which is why the command exists.

@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	"golang.org/x/term"
@@ -151,11 +150,6 @@ type app struct {
 	// openURL opens a login URL in a browser; nil means the platform opener.
 	// Tests drive the PKCE callback through it.
 	openURL func(string) error
-	// ssoIssued is the cached role-credential entry this run last signed with,
-	// for evictRejectedSSOCreds after a gateway rejection. Guarded because
-	// serve resolves credentials for concurrent tool calls.
-	ssoIssuedMu sync.Mutex
-	ssoIssued   *issuedRoleCreds
 	// passphrasePrompt replaces the file backend's terminal prompt; tests use
 	// it to observe whether a store prompt was allowed at all.
 	passphrasePrompt func(prompt string) (string, error)

@@ -100,6 +100,17 @@ func (a *app) sharedProfileFor(cfg effectiveConfig) (profile, outrankedBy string
 	return cfg.Profile, "", time.Time{}
 }
 
+// ssoProfileFor is the profile whose SSO chain bmcp resolves natively: the one
+// sharedProfileFor hands the SDK or, when none is named and the environment has
+// no credentials, the SDK's own "default", if that one is SSO (decision 3).
+func (a *app) ssoProfileFor(ctx context.Context, cfg effectiveConfig) string {
+	profile, outrankedBy, _ := a.sharedProfileFor(cfg)
+	if profile == "" && outrankedBy == "" && envCredentialSource() == "" && profileUsesSSO(ctx, "default") {
+		return "default"
+	}
+	return profile
+}
+
 // envCarriesWebIdentity reports whether the environment names a web identity
 // token file — the one other credential source resolveCredentialChain places
 // above every profile, and therefore the one a demotion would step over.
@@ -400,7 +411,8 @@ func (a *app) awsCredentials(ctx context.Context, cfg effectiveConfig) (aws.Cred
 	// less useful, error.
 	var chain *ssoChain
 	var chainErr error
-	if profile != "" {
+	if ssoProfile := a.ssoProfileFor(ctx, cfg); ssoProfile != "" {
+		profile = ssoProfile
 		chain, chainErr = resolveSSOChain(ctx, profile)
 		if chain != nil {
 			if err := chain.mfaRefusal(); err != nil {
@@ -461,9 +473,7 @@ func (a *app) ssoCredentials(ctx context.Context, cfg effectiveConfig, profile s
 	if err != nil {
 		return aws.Credentials{}, "", a.ssoFailure(cfg, profile, src.backend, err)
 	}
-	a.ssoIssuedMu.Lock()
-	a.ssoIssued = issued
-	a.ssoIssuedMu.Unlock()
+	recordSSOIssued(ctx, issued)
 	return creds, awsCfg.Region, nil
 }
 

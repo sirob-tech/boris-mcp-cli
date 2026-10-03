@@ -499,26 +499,12 @@ func (a *app) cmdSync(flags globalFlags, args []string) int {
 	return a.cmdSyncWithRefresh(flags, true, true)
 }
 
-// cmdLogin refreshes the AWS SSO session bmcp's own calls resolve through.
+// cmdLogin refreshes the AWS SSO session bmcp's own calls resolve through. It
+// has its own budget (ssoLoginTimeout) because the implicit login cannot run
+// under sync's or doctor's sixty seconds; see ssoCredentials.
 //
-// It exists because the implicit login in awsCredentials cannot be reached when
-// it is most needed. That branch needs a fresh catalog to get anywhere near a
-// browser: a stale one sends both documented call forms through
-// cacheForCatalog's sixty-second SyncTimeout, and deviceFlowFits declines a
-// device flow under any budget shorter than ssoLoginBudget — before the output
-// format or the terminal is ever consulted. An expired SSO session usually
-// means the machine has been idle, which is also how the catalog went stale, so
-// the two arrive together. `bmcp login` carries no sync budget at all, which is
-// the whole point of it being a command rather than a wording change.
-//
-// It is also the one remedy this binary can name to an agent: a message that
-// said `aws sso login` would send one outside bmcp's profile resolution, and
-// operators whose instructions forbid running the AWS CLI directly had no
-// sanctioned step left at all.
-//
-// Deliberately not on the autoUpdate list. A binary swap underneath a recovery
-// is the wrong moment for one, and it would put a download between the operator
-// and the browser they are waiting for.
+// Not on the autoUpdate list: a binary swap underneath a recovery would put a
+// download between the operator and the browser they are waiting for.
 func (a *app) cmdLogin(flags globalFlags, args []string) int {
 	if len(args) != 0 {
 		return a.fail(flags, exitValidation, "usage", "usage: bmcp login [--device-code]")
@@ -568,12 +554,10 @@ func (a *app) cmdLogin(flags globalFlags, args []string) int {
 	// happened to leave. See ssoLoginTimeout.
 	ctx, cancel := context.WithTimeout(context.Background(), ssoLoginTimeout)
 	defer cancel()
-	// sharedProfileFor, so that --profile and BMCP_PROFILE name the profile to log
-	// into, and so that an ambient profile yields to environment credentials here
-	// exactly as it does for a call. When it yields there is nothing to log in
-	// to — which is the case describeCredentialSource is here to explain rather
-	// than leave as a silent refusal.
-	profile, _, _ := a.sharedProfileFor(cfg)
+	// The profile a call would resolve through natively, so --profile and
+	// BMCP_PROFILE win, an ambient profile yields to environment credentials,
+	// and an SSO "default" counts when nothing is named.
+	profile := a.ssoProfileFor(ctx, cfg)
 	// The shared config is read before the SSO predicate, so that a profile which
 	// cannot be parsed is reported as what it is. profileUsesSSO answers false for
 	// an unreadable profile on purpose — everywhere it is used, the SDK failure
@@ -608,6 +592,8 @@ func (a *app) cmdLogin(flags globalFlags, args []string) int {
 			"the AWS SSO login for profile %s failed: %v", profile, err))
 	}
 	switch {
+	case res.AlreadyValid && res.RefreshErr != nil:
+		fmt.Fprintf(a.stdout, "The AWS SSO session for %s is still valid, until %s, so no browser login was started, but refreshing it failed: %v\n", profile, formatExpiry(res.ExpiresAt), res.RefreshErr)
 	case res.AlreadyValid:
 		fmt.Fprintf(a.stdout, "The AWS SSO session for %s is already valid, until %s. Nothing to do.\n", profile, formatExpiry(res.ExpiresAt))
 	case res.Refreshed:
@@ -652,7 +638,7 @@ func (a *app) cmdClear(flags globalFlags, args []string) int {
 	if flags.clearAll {
 		out, err = a.ssoClearAll(ctx, cfg, allowUI)
 	} else {
-		profile, _, _ = a.sharedProfileFor(cfg)
+		profile = a.ssoProfileFor(ctx, cfg)
 		if profile != "" {
 			if _, perr := sharedConfigProfile(ctx, profile); perr != nil {
 				return a.fail(flags, exitConfig, "profile_invalid", fmt.Sprintf(
@@ -668,7 +654,8 @@ func (a *app) cmdClear(flags globalFlags, args []string) int {
 	if err != nil {
 		var locked *storeLockedError
 		if errors.As(err, &locked) {
-			return a.fail(flags, exitAuth, errNameStoreLocked, fmt.Sprintf("bmcp clear could not open the credential store: %v", err))
+			return a.fail(flags, exitAuth, errNameStoreLocked, fmt.Sprintf("bmcp clear could not open the credential store. %s (%s store: %s)",
+				locked.Remedy(profile, out.Backend), locked.Backend, locked.Reason))
 		}
 		return a.fail(flags, exitGeneric, "clear_failed", fmt.Sprintf("bmcp clear failed on the %s credential store: %v", out.Backend.Name, err))
 	}

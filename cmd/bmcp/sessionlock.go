@@ -216,6 +216,13 @@ func (h *sessionLock) EndLogin(m *loginMarker) error {
 	return removeIfExists(h.locks.markerPath(h.sessionKey))
 }
 
+// unlockedMarker is for a login that could not re-take the lock to finish. It
+// may read and remove only its own marker: while that marker is live no other
+// login begins, and `clear` only rewrites it in place with Discard set.
+func (l *credLocks) unlockedMarker(sessionKey string) *sessionLock {
+	return &sessionLock{locks: l, sessionKey: sessionKey}
+}
+
 // DiscardLogin marks any in-flight login so its result is thrown away. `clear`
 // calls it instead of waiting for the browser.
 func (h *sessionLock) DiscardLogin() error {
@@ -311,22 +318,24 @@ func (h *sessionLock) evictRoleCredsIfSame(store credStore, credKey string, reje
 
 // saveNewToken stamps a fresh generation, for a login or a refresh that
 // rotated the refresh token, and drops role credentials the old token minted.
+// Role credentials go first: a lock-free reader that sees the new token then
+// finds none of the old ones, and a crash in between leaves only a re-mint.
 // Requires the session lock.
 func (h *sessionLock) saveNewToken(store credStore, rec ssoTokenRecord) (ssoTokenRecord, error) {
 	rec.Generation = newGeneration()
-	if err := store.WriteToken(h.sessionKey, rec); err != nil {
-		return rec, err
-	}
-	return rec, store.DeleteSessionRoleCreds(h.sessionKey)
+	delErr := store.DeleteSessionRoleCreds(h.sessionKey)
+	return rec, errors.Join(store.WriteToken(h.sessionKey, rec), delErr)
 }
 
 // clearSession is `bmcp clear` for one session: token, client registration
 // (stored with the token) and role credentials, plus any in-flight login.
 // Requires the session lock.
 func (h *sessionLock) clearSession(store credStore) error {
+	// Role credentials before the token, for the same lock-free readers as
+	// saveNewToken.
 	return errors.Join(
 		h.DiscardLogin(),
-		store.DeleteToken(h.sessionKey),
 		store.DeleteSessionRoleCreds(h.sessionKey),
+		store.DeleteToken(h.sessionKey),
 	)
 }
