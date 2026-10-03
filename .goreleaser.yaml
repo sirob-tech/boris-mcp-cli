@@ -5,22 +5,37 @@ before:
   hooks:
     - go mod tidy
 
+# Darwin needs cgo: Keychain items trust bmcp's signature only when bmcp calls
+# the Security framework itself. Linux stays static. The macOS release runner's
+# clang builds both darwin arches; Go passes -arch and the minimum macOS itself.
 builds:
-  - main: ./cmd/bmcp
+  - id: bmcp-darwin
+    main: ./cmd/bmcp
     binary: bmcp
     env:
-      - CGO_ENABLED=0
+      - CGO_ENABLED=1
     goos:
       - darwin
-      - linux
     goarch:
       - amd64
       - arm64
-    ldflags:
+    ldflags: &ldflags
       - -s -w
       - -X main.version={{.Version}}
       - -X main.buildCommit={{.Commit}}
       - -X main.buildDate={{.Date}}
+
+  - id: bmcp-linux
+    main: ./cmd/bmcp
+    binary: bmcp
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags: *ldflags
 
 archives:
   - formats:
@@ -42,6 +57,10 @@ checksum:
 notarize:
   macos:
     - enabled: true
+      # Without ids GoReleaser matches builds named after the project, which
+      # neither build is — and nothing would be signed.
+      ids:
+        - bmcp-darwin
       sign:
         certificate: "{{.Env.MACOS_SIGN_P12}}"
         password: "{{.Env.MACOS_SIGN_PASSWORD}}"
