@@ -291,6 +291,8 @@ func TestConfigRoundTrip(t *testing.T) {
 		AWSProfile:     "customer-dev",
 		Region:         "us-east-1",
 		Service:        "bedrock-agentcore",
+		Backend:        "file",
+		SSOFlow:        "device-code",
 		SyncTTL:        2 * time.Hour,
 		ConnectTimeout: 3 * time.Second,
 		SyncTimeout:    4 * time.Second,

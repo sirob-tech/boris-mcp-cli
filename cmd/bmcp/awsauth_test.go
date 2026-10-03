@@ -65,7 +65,16 @@ func isolateAWSEnv(t *testing.T) {
 		t.Setenv(name, "")
 	}
 	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
-	t.Setenv("HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	// bmcp's own credential store, locks and role-cred cache follow XDG, and the
+	// backend is pinned to the one that lives under the temp HOME: the keychain
+	// and Secret Service are shared, real stores no test may reach by default.
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	t.Setenv("BMCP_BACKEND", "aws-cli-cache")
+	t.Setenv("BMCP_FILE_PASSPHRASE", "")
+	t.Setenv("BMCP_SSO_DEVICE_CODE", "")
 
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config")

@@ -1439,6 +1439,10 @@ Global flags:
   --url, -u <url>              Override BORIS MCP URL
   --profile, -p <profile>      Use this AWS profile, ahead of any credentials
                                the environment carries
+  --backend <name>             Credential store for SSO tokens and role
+                               credentials: auto, keychain, secret-service,
+                               file or aws-cli-cache (plaintext). Also
+                               BMCP_BACKEND, or backend in config.toml
   --region <region>            Override SigV4 region
   --service <service>          Override SigV4 service
   --format <human|json|ndjson> Answer under the machine-output contract. json is
