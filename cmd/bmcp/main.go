@@ -76,7 +76,7 @@ type app struct {
 	// read — and /dev/null is itself a character device, so an isInteractive()
 	// that kept reading the global would answer "a person is typing at this"
 	// about the sink. That is the SSO device flow started with nothing able to
-	// answer it, and `aws sso login` handed /dev/null for its own stdin.
+	// answer it, and the file backend's passphrase prompt reading /dev/null.
 	realStdin *os.File
 	// stderrSunk latches when a retrieval was abandoned with the /dev/null sink
 	// still installed. An SDK goroutine outliving that call can still read
@@ -147,6 +147,15 @@ type app struct {
 	// due. Two handshakes per call against an already-degraded server, and the
 	// warning printed twice.
 	refusedEmptyCatalog bool
+	// openURL opens a login URL in a browser; nil means the platform opener.
+	// Tests drive the PKCE callback through it.
+	openURL func(string) error
+	// passphrasePrompt replaces the file backend's terminal prompt; tests use
+	// it to observe whether a store prompt was allowed at all.
+	passphrasePrompt func(prompt string) (string, error)
+	// openStore replaces openCredStore, so a test can stand in a store whose
+	// approval state it controls.
+	openStore func(resolvedBackend, storeOptions) (credStore, error)
 }
 
 func main() {
@@ -229,7 +238,7 @@ func isInteractive(f *os.File) bool {
 // the value os.Stderr held at startup, never whatever retrieveCredentials may
 // have left in the variable since. Handing a subprocess the live global is how a
 // sink installed for a *helper* ends up swallowing the output of an unrelated
-// command — `aws sso login`'s verification URL, for one.
+// command.
 //
 // The fallback exists for tests, which build an app directly. Production pins it
 // in run().
@@ -242,8 +251,8 @@ func (a *app) subprocessStderr() *os.File {
 
 // subprocessStdin is subprocessStderr for fd 0: the descriptor a child of bmcp
 // should be given, which is os.Stdin's value from startup and never a sink
-// retrieveCredentials installed. `aws sso login` is the child that needs it —
-// handing it the global after a helper's stdin was sunk gives the login
+// retrieveCredentials installed. The passphrase prompt reads it too —
+// the global after a helper's stdin was sunk would give the prompt
 // /dev/null to read.
 //
 // The fallback exists for tests, which build an app directly. Production pins it

@@ -156,6 +156,10 @@ func existingCatalogDetail(path, url string) string {
 
 type authError struct{ error }
 
+// Unwrap lets errorName find the typed cause, store_locked or
+// sso_login_in_progress, underneath.
+func (e authError) Unwrap() error { return e.error }
+
 func isAuthErr(err error) bool {
 	var ae authError
 	return errors.As(err, &ae)
@@ -221,6 +225,16 @@ func isCredentialFailure(err error) bool {
 }
 
 func errorName(err error) string {
+	// Ahead of auth_failure, which they also are: each names a different next
+	// step — approve the store, wait for the other login — than `bmcp login`.
+	var locked *storeLockedError
+	if errors.As(err, &locked) {
+		return errNameStoreLocked
+	}
+	var busy *ssoLoginInProgressError
+	if errors.As(err, &busy) {
+		return errNameLoginInProgress
+	}
 	if isCredentialFailure(err) {
 		return "auth_failure"
 	}
@@ -236,6 +250,7 @@ func errorName(err error) string {
 func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, error) {
 	ctx, cancel := context.WithTimeout(ctx, cfg.SyncTimeout)
 	defer cancel()
+	ctx, issued := withSSOIssuedSlot(ctx)
 	fmt.Fprintln(a.prose(), "Syncing tools...")
 	client, err := a.newMCPClient(ctx, cfg, cfg.SyncTimeout)
 	if err != nil {
@@ -243,11 +258,11 @@ func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, e
 	}
 	server, err := client.initialize(ctx)
 	if err != nil {
-		return nil, err
+		return nil, a.afterGatewayRejection(issued, err)
 	}
 	tools, err := client.listTools(ctx)
 	if err != nil {
-		return nil, err
+		return nil, a.afterGatewayRejection(issued, err)
 	}
 	for i := range tools {
 		tools[i].SchemaHash = schemaHash(tools[i].InputSchema)
@@ -284,14 +299,33 @@ func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, e
 func (a *app) callTool(ctx context.Context, cfg effectiveConfig, name string, input map[string]any) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, cfg.CallTimeout)
 	defer cancel()
+	ctx, issued := withSSOIssuedSlot(ctx)
 	client, err := a.newMCPClient(ctx, cfg, cfg.CallTimeout)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := client.initialize(ctx); err != nil {
-		return nil, err
+		return nil, a.afterGatewayRejection(issued, err)
 	}
-	return client.callTool(ctx, name, input)
+	result, err := client.callTool(ctx, name, input)
+	return result, a.afterGatewayRejection(issued, err)
+}
+
+// afterGatewayRejection evicts the cached role credentials a rejected request
+// was signed with, so the next invocation mints fresh ones. No replay, the SSO
+// token is left alone, and err is returned unchanged with no login remedy: a
+// 401 also covers a wrong signing region, which no login repairs.
+func (a *app) afterGatewayRejection(issued *ssoIssuedSlot, err error) error {
+	if !isGatewayAuthRejection(err) {
+		return err
+	}
+	// Its own budget: the request's context may be what just ran out.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if evictErr := evictRejectedSSOCreds(ctx, issued.take()); evictErr != nil {
+		fmt.Fprintf(a.prose(), "bmcp could not drop the cached role credentials the gateway rejected: %v\n", evictErr)
+	}
+	return err
 }
 
 func (a *app) newMCPClient(ctx context.Context, cfg effectiveConfig, timeout time.Duration) (*mcpClient, error) {

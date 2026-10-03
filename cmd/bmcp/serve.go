@@ -71,10 +71,14 @@ func (a *app) cmdServe(flags globalFlags, args []string) int {
 			fmt.Sprintf("serve takes no arguments, got %q", args[0]))
 	}
 	// stdin is the transport from here on. All three gates are needed: the
-	// first-run wizard is refused on a non-interactive app, `aws sso login` on a
-	// machine one, and a credential_process helper on one that owns stdin — no
-	// flag covers the others, and each of the three would otherwise read the
-	// frames the client is sending.
+	// first-run wizard is refused on a non-interactive app, an SSO browser login
+	// and every credential-store prompt on a machine one, and a
+	// credential_process helper on one that owns stdin — no flag covers the
+	// others, and each of the three would otherwise read the frames the client
+	// is sending.
+	//
+	// Every tools/call resolves credentials afresh, so each one re-reads the
+	// store without UI and sees a login, refresh or clear made since startup.
 	//
 	// The helper is the one that had no gate before. `serve` resolves credentials
 	// per tools/call, so a helper spawned mid-session inherited the live protocol

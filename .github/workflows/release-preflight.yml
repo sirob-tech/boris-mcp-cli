@@ -30,6 +30,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PREFLIGHT_TAG: v0.0.0-preflight.${{ github.run_number }}.${{ github.run_attempt }}
+
 concurrency:
   group: release-preflight-${{ github.ref }}
   cancel-in-progress: true
@@ -74,10 +77,12 @@ jobs:
       # real tags first keeps it from picking up a tag that already points at
       # this commit — on a release-please PR that is exactly the situation.
       # Nothing is pushed; these tags exist only in the runner's clone.
+      # The run number makes two runs on one commit distinct builds, so copying
+      # one over the other tests that Keychain trust follows the signature.
       - name: Tag a throwaway version
         run: |
           git tag -d $(git tag -l) >/dev/null 2>&1 || true
-          git tag v0.0.0-preflight
+          git tag "$PREFLIGHT_TAG"
 
       # `--skip=publish,announce` stops after the artifacts are built, signed and
       # notarized. Nothing reaches GitHub, and no tag or release is created.
@@ -120,6 +125,16 @@ jobs:
           fi
           echo "Verified $found darwin binaries"
 
+      # For testing on a real Mac what CI cannot: Keychain prompts and trust
+      # across builds. Tarballs, because a zipped artifact drops the exec bit.
+      - name: Upload the signed darwin binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: bmcp-darwin-${{ env.PREFLIGHT_TAG }}
+          path: dist/bmcp-darwin-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Summarize
         if: always()
         run: |
@@ -127,6 +142,8 @@ jobs:
             echo "### Signing preflight passed" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"
             echo "Apple accepted a notarization submission and the artifacts satisfy the \`bmcp update\` signing requirement. A release tagged now should publish." >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Signed darwin binaries ($PREFLIGHT_TAG): \`gh run download $GITHUB_RUN_ID -R $GITHUB_REPOSITORY -n bmcp-darwin-$PREFLIGHT_TAG\`. Version 0.0.0 is older than any release, so set \`BMCP_AUTO_UPDATE=false\` while testing, or the next \`bmcp doctor\` replaces it." >> "$GITHUB_STEP_SUMMARY"
           else
             echo "### Signing preflight failed" >> "$GITHUB_STEP_SUMMARY"
             echo "" >> "$GITHUB_STEP_SUMMARY"

@@ -20,7 +20,11 @@ type configFile struct {
 	// "false", or writeConfig would stamp today's default into every config it
 	// rewrites and silently pin the user to it. Parsed at use by
 	// parseStrictBool, which keeps configFile comparable for the round-trip test.
-	AutoUpdate     string
+	AutoUpdate string
+	// Backend and SSOFlow are raw for the same reason AutoUpdate is: absent
+	// must stay absent through a rewrite, so the compiled-in default applies.
+	Backend        string
+	SSOFlow        string
 	SyncTTL        time.Duration
 	ConnectTimeout time.Duration
 	SyncTimeout    time.Duration
@@ -83,6 +87,13 @@ type effectiveConfig struct {
 	// silently downgrading a binary nobody asked to downgrade is worse than
 	// reporting the gap and letting an explicit `bmcp update` close it.
 	PinnedVersion string
+	// BackendRaw is the unvalidated credential store setting and BackendSource
+	// where it came from; see effectiveConfig.backend.
+	BackendRaw    string
+	BackendSource backendSource
+	// SSODeviceCodeEnv and SSOFlowFile feed effectiveConfig.ssoFlow.
+	SSODeviceCodeEnv string
+	SSOFlowFile      string
 }
 
 func defaultEffective(flags globalFlags) effectiveConfig {
@@ -164,6 +175,9 @@ func (a *app) loadEffective(flags globalFlags, require bool) (effectiveConfig, b
 		cfg.Service = firstNonEmpty(os.Getenv("BMCP_SERVICE"), fileCfg.Service)
 	}
 	cfg.AutoUpdate = a.resolveAutoUpdate(flags, fileCfg.AutoUpdate)
+	cfg.BackendRaw, cfg.BackendSource = chooseBackendSetting(flags.backend, os.Getenv("BMCP_BACKEND"), fileCfg.Backend)
+	cfg.SSODeviceCodeEnv = os.Getenv("BMCP_SSO_DEVICE_CODE")
+	cfg.SSOFlowFile = fileCfg.SSOFlow
 	cfg.SyncTTL = durationFromEnv("BMCP_SYNC_TTL", fileCfg.SyncTTL)
 	cfg.ConnectTimeout = durationFromEnv("BMCP_CONNECT_TIMEOUT", fileCfg.ConnectTimeout)
 	cfg.SyncTimeout = durationFromEnv("BMCP_SYNC_TIMEOUT", fileCfg.SyncTimeout)
@@ -237,6 +251,10 @@ func readConfig(path string) (configFile, error) {
 			cfg.Service = val
 		case "auto_update":
 			cfg.AutoUpdate = val
+		case "backend":
+			cfg.Backend = val
+		case "sso_flow":
+			cfg.SSOFlow = val
 		case "sync_ttl":
 			if d, err := time.ParseDuration(val); err == nil {
 				cfg.SyncTTL = d
@@ -277,6 +295,8 @@ func writeConfig(path string, cfg configFile) error {
 	// Deliberately only written when already present: an unset auto_update must
 	// stay unset so the compiled-in default keeps applying.
 	writeKV("auto_update", cfg.AutoUpdate)
+	writeKV("backend", cfg.Backend)
+	writeKV("sso_flow", cfg.SSOFlow)
 	fmt.Fprintf(&b, "sync_ttl = %q\n", cfg.SyncTTL.String())
 	fmt.Fprintf(&b, "connect_timeout = %q\n", cfg.ConnectTimeout.String())
 	fmt.Fprintf(&b, "sync_timeout = %q\n", cfg.SyncTimeout.String())

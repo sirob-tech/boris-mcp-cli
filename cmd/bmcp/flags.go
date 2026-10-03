@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -83,6 +84,14 @@ type globalFlags struct {
 	// every schema in it arrive in one local invocation instead of a list followed
 	// by a describe per tool.
 	listSchemas bool
+	// loginDeviceCode is `bmcp login --device-code`: approve the login in a
+	// browser on another machine.
+	loginDeviceCode bool
+	// clearAll is `bmcp clear --all`: every session, not the profile's own.
+	clearAll bool
+	// backend is --backend, the credential store. Global like --profile: the
+	// store has to be the same one whichever command reads it.
+	backend string
 }
 
 // normalizeContractFormat resolves --format to a canonical value. The three are
@@ -169,6 +178,9 @@ const (
 	scopeDoctor
 	// scopeList is scopePostCommand plus `--schemas`.
 	scopeList
+	// scopeLogin admits `--device-code`, scopeClear `--all`.
+	scopeLogin
+	scopeClear
 )
 
 func parseGlobalFlags(args []string) (globalFlags, []string, error) {
@@ -251,6 +263,10 @@ func parseFlags(flags globalFlags, args []string, scope flagScope) (globalFlags,
 			flags.doctorDeep = true
 		case arg == "--schemas" && scope == scopeList:
 			flags.listSchemas = true
+		case arg == "--device-code" && scope == scopeLogin:
+			flags.loginDeviceCode = true
+		case arg == "--all" && scope == scopeClear:
+			flags.clearAll = true
 		case arg == "--check" && scope == scopeUpdate:
 			flags.updateCheck = true
 		case arg == "--rollback" && scope == scopeUpdate:
@@ -279,6 +295,20 @@ func parseFlags(flags globalFlags, args []string, scope flagScope) (globalFlags,
 			flags.profile = v
 		case strings.HasPrefix(arg, "--profile="):
 			flags.profile = strings.TrimPrefix(arg, "--profile=")
+		case arg == "--backend":
+			v, err := next(arg)
+			if err != nil {
+				return flags, nil, err
+			}
+			if v == "" {
+				return flags, nil, fmt.Errorf("%s requires a value", arg)
+			}
+			flags.backend = v
+		case strings.HasPrefix(arg, "--backend="):
+			// Empty would read as unset and quietly fall through to BMCP_BACKEND.
+			if flags.backend = strings.TrimPrefix(arg, "--backend="); flags.backend == "" {
+				return flags, nil, errors.New("--backend requires a value")
+			}
 		case arg == "--region":
 			v, err := next(arg)
 			if err != nil {
@@ -340,7 +370,7 @@ func parseFlags(flags globalFlags, args []string, scope flagScope) (globalFlags,
 var valueTakingFlags = map[string]bool{
 	"--url": true, "-u": true, "--profile": true, "-p": true,
 	"--region": true, "--service": true, "--output": true,
-	"--max-bytes": true, "--to": true,
+	"--max-bytes": true, "--to": true, "--backend": true,
 }
 
 // formatForReport finds a valid --format anywhere the parser would legitimately
