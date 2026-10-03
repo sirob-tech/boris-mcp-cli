@@ -6617,52 +6617,7 @@ func TestPipedInputStillReachesTheHelperWhenThePayloadCameFromArgv(t *testing.T)
 // shorter than ssoLoginBudget, so deviceFlowFits declines before the output
 // format is ever consulted. A walk on a fresh catalog would prove much less.
 func TestExpiredSSORecoveryLoopIsWalkable(t *testing.T) {
-	argvFile := loginTestEnv(t, 0)
-	t.Chdir(t.TempDir())
-	tools := []tool{{Name: "tools___search_aws", Description: "Search."}}
-	borisHome := setupInstallCatalog(t, os.Getenv("HOME"), tools)
-	// config.toml naming the SSO profile, as `bmcp init --profile` leaves it —
-	// so the remedy has a profile to carry and the walk has one to log into.
-	cfgPath := filepath.Join(borisHome, "config.toml")
-	fileCfg, err := readConfig(cfgPath)
-	if err != nil {
-		t.Fatalf("read config: %v", err)
-	}
-	fileCfg.AWSProfile = "sso-only"
-	if err := writeConfig(cfgPath, fileCfg); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	cachePath := filepath.Join(borisHome, "tools.json")
-	cache, err := readCache(cachePath)
-	if err != nil {
-		t.Fatalf("read cache: %v", err)
-	}
-	cache.LastSync = time.Now().Add(-233 * time.Hour)
-	if err := writeCache(cachePath, cache); err != nil {
-		t.Fatalf("write cache: %v", err)
-	}
-
-	// The whole walk turns on one fact changing underneath it: credentials fail
-	// until the login has run, and work afterwards. Before it, the real
-	// awsCredentials answers, so every message the walk reads is the one
-	// production produces rather than a fixture's idea of it; after it, static
-	// credentials stand in for the token `aws sso login` would have written,
-	// which no offline test can mint for itself.
-	loggedIn := func() bool {
-		_, ran := awsRan(t, argvFile)
-		return ran
-	}
-	newApp := func(stdout, stderr *bytes.Buffer) *app {
-		a := loginTestApp(t, stdout, stderr)
-		a.httpClient = &fakeMCP{tools: tools, callResult: []byte(`{"nodes":[]}`)}
-		a.credentials = func(ctx context.Context, cfg effectiveConfig) (aws.Credentials, string, error) {
-			if loggedIn() {
-				return staticCreds()(ctx, cfg)
-			}
-			return a.awsCredentials(ctx, cfg)
-		}
-		return a
-	}
+	f, newApp := recoveryWalkEnv(t)
 	const remedy = "bmcp --profile sso-only login"
 
 	// 1. The command BORIS.md tells an agent to run first. On a stale catalog it
@@ -6680,24 +6635,8 @@ func TestExpiredSSORecoveryLoopIsWalkable(t *testing.T) {
 	// 2. The tool call itself, in the format the instructions tell agents to
 	//    prefer. One parseable document on stderr, nothing on stdout, and the
 	//    remedy inside the message rather than in prose the format suppresses.
-	call := []string{"--format", "json", "tools___search_aws"}
-	stdout.Reset()
-	stderr.Reset()
-	if code := newApp(&stdout, &stderr).run(call); code != exitAuth {
-		t.Fatalf("tool call exit %d, want %d; stderr:\n%s", code, exitAuth, stderr.String())
-	}
-	if stdout.Len() != 0 {
-		t.Fatalf("a failure must leave stdout empty, got:\n%s", stdout.String())
-	}
-	var failure struct {
-		OK      bool   `json:"ok"`
-		Error   string `json:"error"`
-		Message string `json:"message"`
-	}
-	if err := json.Unmarshal(stderr.Bytes(), &failure); err != nil {
-		t.Fatalf("stderr is not one JSON document (%v):\n%s", err, stderr.String())
-	}
-	if failure.OK || !strings.Contains(failure.Message, remedy) {
+	failure := walkCallFails(t, newApp, "auth_failure")
+	if !strings.Contains(failure.Message, remedy) {
 		t.Fatalf("the failure should carry the remedy in its message, got: %+v", failure)
 	}
 
@@ -6719,7 +6658,7 @@ func TestExpiredSSORecoveryLoopIsWalkable(t *testing.T) {
 	if !strings.Contains(failure.Message, remedy) {
 		t.Fatalf("the refusal should hand back the runnable form, got: %q", failure.Message)
 	}
-	if loggedIn() {
+	if loginStarted(f) {
 		t.Fatal("a machine-format login opened a browser")
 	}
 
@@ -6729,14 +6668,156 @@ func TestExpiredSSORecoveryLoopIsWalkable(t *testing.T) {
 	if code := newApp(&stdout, &stderr).run([]string{"--profile", "sso-only", "login"}); code != 0 {
 		t.Fatalf("login exit %d, want 0; stderr: %s", code, stderr.String())
 	}
-	if argv, ran := awsRan(t, argvFile); !ran || argv != "sso login --profile sso-only" {
-		t.Fatalf("the login ran %q, want `sso login --profile sso-only`", argv)
+	if !loginStarted(f) {
+		t.Fatal("the login opened no browser")
 	}
 
 	// 5. The original call, retried once, as the instructions say to.
-	stdout.Reset()
-	stderr.Reset()
-	if code := newApp(&stdout, &stderr).run(call); code != 0 {
+	walkRetrySucceeds(t, newApp)
+}
+
+// The same walk for a credential store that needs approval: the call names
+// store_locked and `bmcp --profile X login`, the login may show the store's
+// dialog and approves it, and the retry reads the store without UI.
+func TestLockedStoreRecoveryLoopIsWalkable(t *testing.T) {
+	f, newApp := recoveryWalkEnv(t)
+	f.seedToken(t, 8*time.Hour, "gen-1")
+	approved := false
+	var uiOpens int
+	open := func(b resolvedBackend, opts storeOptions) (credStore, error) {
+		if opts.AllowUI {
+			uiOpens++
+			approved = true
+		}
+		inner, err := openCredStore(b, opts)
+		return &approvalStore{credStore: inner, approved: func() bool { return approved }}, err
+	}
+	withStore := func(stdout, stderr *bytes.Buffer) *app {
+		a := newApp(stdout, stderr)
+		a.openStore = open
+		return a
+	}
+
+	failure := walkCallFails(t, withStore, errNameStoreLocked)
+	const remedy = "credential store needs approval: run bmcp --profile sso-only login"
+	if !strings.Contains(failure.Message, remedy) || strings.Contains(failure.Message, "If the AWS SSO session") {
+		t.Fatalf("a locked store should name its own remedy only, got: %q", failure.Message)
+	}
+	if uiOpens != 0 {
+		t.Fatal("a machine-format call asked for store approval")
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := withStore(&stdout, &stderr).run([]string{"--profile", "sso-only", "login"}); code != 0 {
+		t.Fatalf("login exit %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if uiOpens != 1 || loginStarted(f) {
+		t.Fatalf("store approvals %d, browser %v; want the store approved and no browser for a valid token", uiOpens, loginStarted(f))
+	}
+	if !strings.Contains(stdout.String(), "already valid") {
+		t.Fatalf("the login should report the session it found, got: %s", stdout.String())
+	}
+
+	walkRetrySucceeds(t, withStore)
+	if uiOpens != 1 {
+		t.Fatal("the retry asked for store approval")
+	}
+}
+
+// approvalStore stands in for a keychain: unreadable without UI until a run
+// that may show UI has approved it.
+type approvalStore struct {
+	credStore
+	approved func() bool
+}
+
+func (s *approvalStore) check() error {
+	if s.approved() {
+		return nil
+	}
+	return &storeLockedError{Backend: backendKeychain, Reason: "user interaction is not allowed"}
+}
+
+func (s *approvalStore) ReadToken(k string) (ssoTokenRecord, error) {
+	if err := s.check(); err != nil {
+		return ssoTokenRecord{}, err
+	}
+	return s.credStore.ReadToken(k)
+}
+
+func (s *approvalStore) ReadRoleCreds(k, c string) (roleCredsRecord, error) {
+	if err := s.check(); err != nil {
+		return roleCredsRecord{}, err
+	}
+	return s.credStore.ReadRoleCreds(k, c)
+}
+
+type walkFailure struct {
+	OK      bool   `json:"ok"`
+	Error   string `json:"error"`
+	Message string `json:"message"`
+}
+
+// recoveryWalkEnv is the state 6268dc30 was in: config.toml naming an SSO
+// profile, and a catalog 233h old against the 168h default TTL.
+func recoveryWalkEnv(t *testing.T) (*fakeIdentityCenter, func(stdout, stderr *bytes.Buffer) *app) {
+	t.Helper()
+	f := loginTestEnv(t)
+	t.Chdir(t.TempDir())
+	tools := []tool{{Name: "tools___search_aws", Description: "Search."}}
+	borisHome := setupInstallCatalog(t, os.Getenv("HOME"), tools)
+	cfgPath := filepath.Join(borisHome, "config.toml")
+	fileCfg, err := readConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	fileCfg.AWSProfile = "sso-only"
+	if err := writeConfig(cfgPath, fileCfg); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cachePath := filepath.Join(borisHome, "tools.json")
+	cache, err := readCache(cachePath)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+	cache.LastSync = time.Now().Add(-233 * time.Hour)
+	if err := writeCache(cachePath, cache); err != nil {
+		t.Fatalf("write cache: %v", err)
+	}
+	// Real credential resolution throughout, against the fake IAM Identity
+	// Center: every message the walk reads is the one production produces.
+	return f, func(stdout, stderr *bytes.Buffer) *app {
+		a := loginTestApp(t, f, stdout, stderr)
+		a.httpClient = &fakeMCP{tools: tools, callResult: []byte(`{"nodes":[]}`)}
+		return a
+	}
+}
+
+var walkCall = []string{"--format", "json", "tools___search_aws"}
+
+func walkCallFails(t *testing.T, newApp func(stdout, stderr *bytes.Buffer) *app, name string) walkFailure {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	if code := newApp(&stdout, &stderr).run(walkCall); code != exitAuth {
+		t.Fatalf("tool call exit %d, want %d; stderr:\n%s", code, exitAuth, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("a failure must leave stdout empty, got:\n%s", stdout.String())
+	}
+	var failure walkFailure
+	if err := json.Unmarshal(stderr.Bytes(), &failure); err != nil {
+		t.Fatalf("stderr is not one JSON document (%v):\n%s", err, stderr.String())
+	}
+	if failure.OK || failure.Error != name {
+		t.Fatalf("failure %+v, want error %s", failure, name)
+	}
+	return failure
+}
+
+func walkRetrySucceeds(t *testing.T, newApp func(stdout, stderr *bytes.Buffer) *app) {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	if code := newApp(&stdout, &stderr).run(walkCall); code != 0 {
 		t.Fatalf("the retry exit %d, want 0; stderr:\n%s", code, stderr.String())
 	}
 	var answer struct {

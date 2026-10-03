@@ -461,7 +461,9 @@ func (a *app) ssoCredentials(ctx context.Context, cfg effectiveConfig, profile s
 	if err != nil {
 		return aws.Credentials{}, "", a.ssoFailure(cfg, profile, src.backend, err)
 	}
+	a.ssoIssuedMu.Lock()
 	a.ssoIssued = issued
+	a.ssoIssuedMu.Unlock()
 	return creds, awsCfg.Region, nil
 }
 

@@ -257,11 +257,11 @@ func (a *app) syncTools(ctx context.Context, cfg effectiveConfig) (*toolCache, e
 	}
 	server, err := client.initialize(ctx)
 	if err != nil {
-		return nil, err
+		return nil, a.afterGatewayRejection(err)
 	}
 	tools, err := client.listTools(ctx)
 	if err != nil {
-		return nil, err
+		return nil, a.afterGatewayRejection(err)
 	}
 	for i := range tools {
 		tools[i].SchemaHash = schemaHash(tools[i].InputSchema)
@@ -303,9 +303,27 @@ func (a *app) callTool(ctx context.Context, cfg effectiveConfig, name string, in
 		return nil, err
 	}
 	if _, err := client.initialize(ctx); err != nil {
-		return nil, err
+		return nil, a.afterGatewayRejection(err)
 	}
-	return client.callTool(ctx, name, input)
+	result, err := client.callTool(ctx, name, input)
+	return result, a.afterGatewayRejection(err)
+}
+
+// afterGatewayRejection evicts the cached role credentials a rejected request
+// was signed with, so the next invocation mints fresh ones. No replay, the SSO
+// token is left alone, and err is returned unchanged with no login remedy: a
+// 401 also covers a wrong signing region, which no login repairs.
+func (a *app) afterGatewayRejection(err error) error {
+	if !isGatewayAuthRejection(err) {
+		return err
+	}
+	// Its own budget: the request's context may be what just ran out.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if evictErr := a.evictRejectedSSOCreds(ctx); evictErr != nil {
+		fmt.Fprintf(a.prose(), "bmcp could not drop the cached role credentials the gateway rejected: %v\n", evictErr)
+	}
+	return err
 }
 
 func (a *app) newMCPClient(ctx context.Context, cfg effectiveConfig, timeout time.Duration) (*mcpClient, error) {

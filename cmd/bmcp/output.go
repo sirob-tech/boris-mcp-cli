@@ -217,6 +217,17 @@ type updatedFrom struct {
 // initDoc reports what init decided, not what the sync it triggers found: the
 // tool catalog is `sync`'s document to emit, and one invocation writes one.
 // The URL is sanitized for the same reason doctor sanitizes it.
+// clearDoc is `bmcp clear` in a machine format. LoggedOutAWSCLI is set on
+// aws-cli-cache, whose token files the AWS CLI reads too.
+type clearDoc struct {
+	OK              bool     `json:"ok"`
+	Command         string   `json:"command"`
+	All             bool     `json:"all"`
+	Backend         string   `json:"backend"`
+	Sessions        []string `json:"sessions"`
+	LoggedOutAWSCLI bool     `json:"logged_out_aws_cli"`
+}
+
 type initDoc struct {
 	OK         bool     `json:"ok"`
 	Command    string   `json:"command"`

@@ -84,6 +84,11 @@ type globalFlags struct {
 	// every schema in it arrive in one local invocation instead of a list followed
 	// by a describe per tool.
 	listSchemas bool
+	// loginDeviceCode is `bmcp login --device-code`: approve the login in a
+	// browser on another machine.
+	loginDeviceCode bool
+	// clearAll is `bmcp clear --all`: every session, not the profile's own.
+	clearAll bool
 	// backend is --backend, the credential store. Global like --profile: the
 	// store has to be the same one whichever command reads it.
 	backend string
@@ -173,6 +178,9 @@ const (
 	scopeDoctor
 	// scopeList is scopePostCommand plus `--schemas`.
 	scopeList
+	// scopeLogin admits `--device-code`, scopeClear `--all`.
+	scopeLogin
+	scopeClear
 )
 
 func parseGlobalFlags(args []string) (globalFlags, []string, error) {
@@ -255,6 +263,10 @@ func parseFlags(flags globalFlags, args []string, scope flagScope) (globalFlags,
 			flags.doctorDeep = true
 		case arg == "--schemas" && scope == scopeList:
 			flags.listSchemas = true
+		case arg == "--device-code" && scope == scopeLogin:
+			flags.loginDeviceCode = true
+		case arg == "--all" && scope == scopeClear:
+			flags.clearAll = true
 		case arg == "--check" && scope == scopeUpdate:
 			flags.updateCheck = true
 		case arg == "--rollback" && scope == scopeUpdate:

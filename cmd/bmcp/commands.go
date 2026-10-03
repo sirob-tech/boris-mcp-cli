@@ -61,7 +61,10 @@ var commands = []command{
 	// reach it. No BORIS tool is plausibly named that.
 	//
 	// No autoUpdate either: see cmdLogin.
-	{names: []string{"login"}, run: (*app).cmdLogin},
+	{names: []string{"login"}, scope: scopeLogin, run: (*app).cmdLogin},
+	// Shadows a remote tool named `clear` exactly as `login` does, and has no
+	// autoUpdate for the same reason: it is part of recovering a login.
+	{names: []string{"clear"}, scope: scopeClear, run: (*app).cmdClear},
 	{names: []string{"update"}, scope: scopeUpdate, run: (*app).cmdUpdate},
 	// `tools` is here because it is what agents typed. It was the single most
 	// common wrong first token in the transcript audit, ahead of every
@@ -334,7 +337,7 @@ func (a *app) selectFormat(flags *globalFlags) {
 
 func (a *app) cmdInit(flags globalFlags, args []string) int {
 	if len(args) != 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: bmcp init [--url <url>] [--profile <profile>]")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp init [--url <url>] [--profile <profile>] [--backend <name>]")
 	}
 	cfg, exists, err := a.loadEffective(flags, false)
 	if err != nil {
@@ -389,6 +392,12 @@ func (a *app) cmdInit(flags globalFlags, args []string) int {
 	}
 	if flags.service != "" {
 		fileCfg.Service = flags.service
+	}
+	if flags.backend != "" {
+		if _, err := parseBackendName(flags.backend); err != nil {
+			return a.fail(flags, exitValidation, "invalid_backend", "--backend: "+err.Error())
+		}
+		fileCfg.Backend = flags.backend
 	}
 	if !exists {
 		applyDefaults(&fileCfg)
@@ -512,7 +521,7 @@ func (a *app) cmdSync(flags globalFlags, args []string) int {
 // and the browser they are waiting for.
 func (a *app) cmdLogin(flags globalFlags, args []string) int {
 	if len(args) != 0 {
-		return a.fail(flags, exitValidation, "usage", "usage: bmcp login")
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp login [--device-code]")
 	}
 	invocation := loginInvocation(flags)
 	// Ahead of anything that reads config or disk: this refusal is about the
@@ -585,7 +594,7 @@ func (a *app) cmdLogin(flags globalFlags, args []string) int {
 	// Idempotent: a valid stored token, or one a refresh renews, opens nothing,
 	// so an agent told to run bmcp login does not get a browser on every failure
 	// that reached it, including the ones a login cannot fix.
-	res, err := a.ssoLogin(ctx, cfg, profile, false)
+	res, err := a.ssoLogin(ctx, cfg, profile, flags.loginDeviceCode)
 	if err != nil {
 		// sso_login_failed rather than auth_failure, for the reason the refusals
 		// above give: this command's own failures must never wear the name that
@@ -605,6 +614,96 @@ func (a *app) cmdLogin(flags globalFlags, args []string) int {
 		fmt.Fprintf(a.stdout, "Refreshed the AWS SSO session for profile %s. The session is valid until %s.\n", profile, formatExpiry(res.ExpiresAt))
 	default:
 		fmt.Fprintf(a.stdout, "Logged in to AWS SSO for profile %s. The session is valid until %s.\n", profile, formatExpiry(res.ExpiresAt))
+	}
+	refresh := "yes"
+	if !res.Refreshable {
+		refresh = "no, so a browser login is needed again when it expires"
+	}
+	fmt.Fprintf(a.stdout, "Stored in the %s credential store; refreshable: %s.\n", backendLabel(res.Backend.Name), refresh)
+	return 0
+}
+
+// backendLabel names a store, flagging the one that keeps tokens in plaintext.
+func backendLabel(name backendName) string {
+	if name == backendAWSCLICache {
+		return string(name) + " (plaintext)"
+	}
+	return string(name)
+}
+
+// cmdClear deletes stored SSO sessions locally; nothing is revoked
+// server-side. It never waits for a browser login: one in flight is marked so
+// its result is discarded rather than saved.
+func (a *app) cmdClear(flags globalFlags, args []string) int {
+	if len(args) != 0 {
+		return a.fail(flags, exitValidation, "usage", "usage: bmcp clear [--all]")
+	}
+	cfg, _, err := a.loadEffective(flags, false)
+	if err != nil {
+		return a.fail(flags, exitConfig, "config_invalid", err.Error())
+	}
+	// The implicit-login gate: only a human-format interactive run may show a
+	// store prompt.
+	allowUI := !flags.machine() && !flags.legacyJSON() && !cfg.NonInteractive && a.isInteractive()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	var out ssoClearOutcome
+	profile := ""
+	if flags.clearAll {
+		out, err = a.ssoClearAll(ctx, cfg, allowUI)
+	} else {
+		profile, _, _ = a.sharedProfileFor(cfg)
+		if profile != "" {
+			if _, perr := sharedConfigProfile(ctx, profile); perr != nil {
+				return a.fail(flags, exitConfig, "profile_invalid", fmt.Sprintf(
+					"AWS profile %s could not be read, so bmcp cannot tell which SSO session to clear: %v", profile, perr))
+			}
+		}
+		if profile == "" || !profileUsesSSO(ctx, profile) {
+			return a.fail(flags, exitValidation, "not_sso_profile", fmt.Sprintf(
+				"bmcp clear removes a stored AWS SSO session, and this invocation resolves credentials from %s, which is not one.\nName an SSO profile: bmcp --profile <name> clear, or clear every session: bmcp clear --all", a.describeCredentialSource(cfg)))
+		}
+		out, err = a.ssoClear(ctx, cfg, profile, allowUI)
+	}
+	if err != nil {
+		var locked *storeLockedError
+		if errors.As(err, &locked) {
+			return a.fail(flags, exitAuth, errNameStoreLocked, fmt.Sprintf("bmcp clear could not open the credential store: %v", err))
+		}
+		return a.fail(flags, exitGeneric, "clear_failed", fmt.Sprintf("bmcp clear failed on the %s credential store: %v", out.Backend.Name, err))
+	}
+	loggedOutCLI := out.SharedWithAWSCLI && len(out.Sessions) > 0
+	if flags.machine() {
+		// Under --all only aws-cli-cache deletes per session; other stores
+		// drop every bmcp item whatever the AWS config names.
+		sessions := out.Sessions
+		if sessions == nil || (flags.clearAll && !out.SharedWithAWSCLI) {
+			sessions = []string{}
+		}
+		if err := encodeMachineDoc(a.stdout, flags.contract(), clearDoc{
+			OK: true, Command: "clear", All: flags.clearAll, Backend: string(out.Backend.Name),
+			Sessions: sessions, LoggedOutAWSCLI: loggedOutCLI,
+		}); err != nil {
+			return a.fail(flags, exitGeneric, "output_failed", err.Error())
+		}
+		return 0
+	}
+	store := backendLabel(out.Backend.Name)
+	switch {
+	case !flags.clearAll:
+		fmt.Fprintf(a.stdout, "Cleared AWS SSO session %s (profile %s) from the %s credential store: its token, client registration and cached role credentials.\n",
+			strings.Join(out.Sessions, ", "), profile, store)
+	case out.SharedWithAWSCLI:
+		fmt.Fprintf(a.stdout, "Cleared bmcp's cached role credentials, and the %s token files of every SSO session in your AWS config", store)
+		if len(out.Sessions) > 0 {
+			fmt.Fprintf(a.stdout, ": %s", strings.Join(out.Sessions, ", "))
+		}
+		fmt.Fprintln(a.stdout, ".")
+	default:
+		fmt.Fprintf(a.stdout, "Cleared every bmcp item from the %s credential store, and bmcp's cached role credentials.\n", store)
+	}
+	if loggedOutCLI {
+		fmt.Fprintln(a.stdout, "The AWS CLI reads the same aws-cli-cache token files, so this also logs the AWS CLI out of those sessions.")
 	}
 	return 0
 }
@@ -1054,6 +1153,9 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 		return a.fail(flags, exitValidation, "usage", "usage: bmcp doctor [--deep]")
 	}
 	cfg, exists, err := a.loadEffective(flags, false)
+	// Doctor never prompts, on any path: this closes the SSO browser login and
+	// every store prompt, both of which are gated on isInteractive.
+	a.interactive = func() bool { return false }
 	checks := []map[string]any{}
 	// nil when no refresh was attempted — no config, or no readable catalog to
 	// render from — which is a different state from "attempted and wrote nothing".
@@ -1102,6 +1204,7 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 		// verified)` on every auth failure, which is nonsense on an error path.
 		source := a.describeCredentialSource(cfg)
 		add("credentials", true, source+" — found, not verified")
+		a.addSSOStoreRows(cfg, add)
 		disk, diskErr := readCache(cfg.ToolsPath)
 		deep = flags.doctorDeep || !a.catalogIsFresh(cfg, disk, diskErr)
 		if deep {
@@ -1129,7 +1232,13 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 				// SigV4 signing did. Not "never produced credentials" — signing runs
 				// after retrieval succeeds, and both are bmcp's own failures, decided
 				// before anything left the machine.
-				add("auth", false, messageOrOK(syncErr))
+				msg := messageOrOK(syncErr)
+				// Named, because a locked store is not an expired session and its
+				// remedy differs; both still exit 1 here, never 3.
+				if name := errorName(syncErr); name == errNameStoreLocked || name == errNameLoginInProgress {
+					msg = name + ": " + msg
+				}
+				add("auth", false, msg)
 			case isGatewayAuthRejection(syncErr):
 				// The gateway saw a signed request and refused the identity in it. Both
 				// rows fail, together, from the same fact — which is the pairing #66
@@ -1267,6 +1376,69 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 	return 0
 }
 
+// addSSOStoreRows reports the SSO credential store without UI and without the
+// network. Statements, like the credentials row: only a backend no SSO call
+// could open fails.
+func (a *app) addSSOStoreRows(cfg effectiveConfig, add func(string, bool, string)) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	st := a.ssoStoreStatus(ctx, cfg)
+	if st.Profile == "" {
+		return
+	}
+	if st.OpenFailed {
+		add("backend", false, fmt.Sprintf("credential store: %v", st.Err))
+		return
+	}
+	add("backend", true, describeBackend(st.Backend))
+	add("sso token", true, a.describeSSOToken(st))
+	if st.LeftoverCLITokenPath != "" {
+		add("aws cli token", true, fmt.Sprintf(
+			"a plaintext AWS CLI token for session %s is at %s; bmcp does not read it with the %s backend, so delete it unless the AWS CLI still uses it",
+			st.Session, st.LeftoverCLITokenPath, st.Backend.Name))
+	}
+}
+
+func describeBackend(b resolvedBackend) string {
+	var notes []string
+	if b.Name == backendAWSCLICache {
+		notes = append(notes, "plaintext")
+	}
+	if b.Auto {
+		notes = append(notes, "auto")
+	}
+	if b.Source != backendSourceDefault {
+		notes = append(notes, "from "+string(b.Source))
+	}
+	if len(notes) == 0 {
+		return string(b.Name)
+	}
+	return fmt.Sprintf("%s (%s)", b.Name, strings.Join(notes, ", "))
+}
+
+func (a *app) describeSSOToken(st ssoStoreStatus) string {
+	name := st.Backend.Name
+	switch {
+	case st.Locked != nil && st.Locked.Backend == backendFile:
+		return "not inspected (file store needs BMCP_FILE_PASSPHRASE)"
+	case st.Locked != nil:
+		return fmt.Sprintf("not inspected (%s needs approval)", st.Locked.Backend)
+	case st.Err != nil:
+		return fmt.Sprintf("%s, unreadable: %v", name, st.Err)
+	case !st.HasToken:
+		return fmt.Sprintf("%s, readable, no token for session %s", name, st.Session)
+	}
+	refresh := "no"
+	if st.Refreshable {
+		refresh = "yes"
+	}
+	when := "expires"
+	if !st.ExpiresAt.After(a.now()) {
+		when = "expired"
+	}
+	return fmt.Sprintf("%s, readable, %s %s, refreshable: %s", name, when, formatExpiry(st.ExpiresAt), refresh)
+}
+
 func doctorMode(deep bool) string {
 	if deep {
 		return "deep"
@@ -1377,11 +1549,12 @@ func (a *app) cmdInstall(flags globalFlags, args []string) int {
 
 func usage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
-  bmcp init [--url <url>] [--profile <profile>]
+  bmcp init [--url <url>] [--profile <profile>] [--backend <name>]
   bmcp install <claude-code|codex|opencode|cursor|kiro|all> [--scope user|project]
   bmcp sync
   bmcp doctor [--deep]
-  bmcp login
+  bmcp login [--device-code]
+  bmcp clear [--all]
   bmcp list|ls|tools [--schemas] [--format human|json|ndjson]
   bmcp describe|d <tool>
   bmcp call <tool> ['{"arg":"value"}']
@@ -1394,10 +1567,22 @@ Flags for bmcp login:
   (none)                       Refresh the AWS SSO session bmcp resolves through,
                                for the profile this invocation would use. Opens a
                                browser and blocks until the login is approved.
-                               Exits 0 without opening anything when the cached
-                               session is still valid. Not available under
-                               --format json, --format ndjson, --json or
+                               Exits 0 without opening anything when the stored
+                               session is still valid or refreshes. Not available
+                               under --format json, --format ndjson, --json or
                                --non-interactive
+  --device-code                Approve with a code in a browser on any machine,
+                               instead of a redirect to this one. The default
+                               over SSH; also BMCP_SSO_DEVICE_CODE=1, or
+                               sso_flow = "device-code" in config.toml
+
+Flags for bmcp clear:
+  (none)                       Delete the stored AWS SSO session for the profile
+                               this invocation would use: token, client
+                               registration and cached role credentials. Local
+                               only; nothing is revoked
+  --all                        Delete every bmcp item in the credential store and
+                               all cached role credentials
 
 Flags for bmcp serve:
   (none)                       Speak MCP over stdin and stdout, re-exporting the

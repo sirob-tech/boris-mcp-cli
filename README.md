@@ -308,6 +308,8 @@ prompts.
 
 Additional configuration flags:
 
+- `--backend <name>`: where SSO tokens and role credentials are stored; see
+  [SSO login and credential stores](#sso-login-and-credential-stores).
 - `--region <region>`: override the SigV4 region.
 - `--service <service>`: override the SigV4 service.
 - `--allow-http`: allow non-localhost `http://` BORIS URLs.
@@ -344,12 +346,19 @@ Run it exactly as the message spells it. It carries `--profile` whenever a
 profile is in play, and dropping it logs into a different profile than the one
 that failed.
 
-It shells out to `aws sso login`, following `source_profile` to the leaf, which
-is where the SSO configuration lives. A browser opens on this machine and `bmcp`
-blocks until the login is approved — the AWS CLI allows ten minutes for that,
-and `bmcp` allows a minute more so it is never the one to cut the window short.
-If the cached session is still valid it exits 0 and opens nothing, so it is safe
-to run on a failure it turns out not to fix.
+`bmcp` runs the IAM Identity Center login itself, following `source_profile`
+to the leaf, which is where the SSO configuration lives; the AWS CLI is not
+needed. A browser opens on this machine and `bmcp` blocks until the login is
+approved, for up to ten minutes. If the stored session is still valid, or a
+refresh renews it, it exits 0 and opens nothing, so it is safe to run on a
+failure it turns out not to fix. The output says which store holds the session
+and whether it can be refreshed without a browser.
+
+`bmcp login --device-code` shows a code to approve in a browser on any machine
+instead of redirecting back to this one. It is the default over SSH; set
+`BMCP_SSO_DEVICE_CODE=1`, or `sso_flow = "device-code"` in `config.toml`, to
+always use it (`sso_flow = "pkce"` keeps the redirect even over SSH, for a
+forwarded port).
 
 It refuses, with an actionable `interactive_login_required` error and no prompt,
 under `--format json`, `--format ndjson` and `--json` — see
@@ -367,6 +376,62 @@ a stale catalog puts the credential load inside a sixty-second sync budget,
 which is shorter than a login, so the implicit one declines and the message
 naming `bmcp login` is what you get. An expired session and a stale catalog
 usually arrive together, which is why the command exists.
+
+Two other errors have their own names. `store_locked` (exit 3): the credential
+store could not be read without an approval this invocation may not ask for;
+its message names the command that can ask, usually the same
+`bmcp --profile <name> login`, or `BMCP_FILE_PASSPHRASE` for the file store.
+`sso_login_in_progress` (exit 3): another `bmcp` process is waiting for a
+browser login for the same session; retry once it completes. Parallel calls
+share that one login rather than opening a tab each.
+
+### SSO login and credential stores
+
+Every login asks for a refresh token, including for legacy `sso_start_url`
+profiles, so `bmcp` renews the session silently until the refresh token
+expires. Role credentials are cached too, and retired when the session is
+logged in again, refreshed with a new refresh token, or cleared.
+
+Both live in a credential store chosen by `--backend`, then `BMCP_BACKEND`,
+then `backend` in `config.toml`:
+
+| Backend | Where |
+| --- | --- |
+| `auto` (default) | `keychain` on macOS. On Linux `secret-service`, falling back to `aws-cli-cache` only when there is no D-Bus session bus or no Secret Service on it; a locked or unresponsive one is an error, never a silent downgrade |
+| `keychain` | macOS login keychain, readable without a prompt only by the signed `bmcp` binary |
+| `secret-service` | Linux Secret Service (GNOME Keyring, KeePassXC) |
+| `file` | encrypted files under `~/.config/bmcp/keys/`; the passphrase comes from `BMCP_FILE_PASSPHRASE` or a prompt |
+| `aws-cli-cache` | **plaintext**, in the AWS CLI's own `~/.aws/sso/cache`, shared with the CLI |
+
+`auto` is decided on every run, so the same Linux machine can pick a different
+store from a desktop session than over SSH. Machine formats,
+`--non-interactive`, `serve` and `doctor` never show a store prompt; they fail
+with `store_locked` instead. With the `file` backend, set
+`BMCP_FILE_PASSPHRASE` for those, since a typed passphrase does not carry to
+the next process. A lost passphrase means `bmcp clear` and a new login.
+
+`bmcp clear` deletes the stored session for the profile in play — token, client
+registration and cached role credentials — and `bmcp clear --all` every `bmcp`
+item in the store. Nothing is revoked server-side. On `aws-cli-cache` this logs
+the AWS CLI out of the same sessions, and `--all` there deletes only the token
+files of sessions named in your AWS config. A login waiting for approval when
+`clear` runs has its result discarded.
+
+`bmcp doctor` reports the store and the session without prompting: a `backend`
+row (marked `(plaintext)` for `aws-cli-cache`) and an `sso token` row with the
+expiry and whether it is refreshable, or `not inspected` when the store needs
+approval. It also notes a leftover plaintext AWS CLI token for the session when
+the backend is not `aws-cli-cache`.
+
+Coming from a release that used `aws sso login`: only `aws-cli-cache` reads
+`~/.aws/sso/cache`, so with any other store the first call after upgrading
+logs in once. Going back
+to such a release, it cannot read tokens in the Keychain or Secret Service and
+uses `aws sso login` again.
+
+Logins and store writes are coordinated across processes with `flock` on files
+under `~/.config/bmcp/locks/`. On a network home directory (NFS) `flock` may
+not exclude other machines, so parallel logins there may open more than one tab.
 
 ## Install Agent Instructions
 
@@ -547,6 +612,7 @@ bmcp describe <tool>
 bmcp <tool> --arg value
 bmcp call <tool> '{"arg":"value"}'
 bmcp login
+bmcp clear
 bmcp update
 ```
 
@@ -607,7 +673,8 @@ Under `--format json` or `--format ndjson`, three rules hold for every command:
 - **Success documents carry `ok` and `command`**, then whatever that command
   answers with.
 - **Nothing prompts.** No first-run wizard, no URL or profile question, no SSO
-  login shell-out — each returns an actionable error instead. `bmcp login`,
+  browser login, no credential store prompt — each returns an actionable error
+  instead. `bmcp login`,
   whose whole job is to open a browser and block, refuses outright under both
   machine formats and under the legacy `--json`, with
   `error: "interactive_login_required"` and exit 3. The name is deliberately

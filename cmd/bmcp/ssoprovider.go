@@ -140,10 +140,18 @@ func (a *app) openSSOStore(ctx context.Context, cfg effectiveConfig, allowUI boo
 		return nil, backend, err
 	}
 	opts := storeOptions{AllowUI: allowUI}
-	if allowUI && a.isInteractive() {
+	switch {
+	case !allowUI:
+	case a.passphrasePrompt != nil:
+		opts.Passphrase = a.passphrasePrompt
+	case a.isInteractive():
 		opts.Passphrase = a.promptPassphrase
 	}
-	store, err := openCredStore(backend, opts)
+	open := openCredStore
+	if a.openStore != nil {
+		open = a.openStore
+	}
+	store, err := open(backend, opts)
 	return store, backend, err
 }
 
@@ -781,11 +789,13 @@ func (a *app) ssoClearAll(ctx context.Context, cfg effectiveConfig, allowUI bool
 // re-mints, and leaves the SSO token alone. A no-op when nothing native was
 // issued, and when another process has already replaced the entry.
 func (a *app) evictRejectedSSOCreds(ctx context.Context) error {
+	a.ssoIssuedMu.Lock()
 	iss := a.ssoIssued
+	a.ssoIssued = nil
+	a.ssoIssuedMu.Unlock()
 	if iss == nil {
 		return nil
 	}
-	a.ssoIssued = nil
 	lock, err := iss.locks.lockSession(ctx, iss.sessionKey)
 	if err != nil {
 		return err
@@ -808,7 +818,10 @@ type ssoStoreStatus struct {
 	// Locked is set when the store needs approval this run may not ask for.
 	Locked *storeLockedError
 	// Err is any other failure: backend resolution, an unreadable profile.
-	Err         error
+	Err error
+	// OpenFailed marks an Err from resolving or opening the store, which
+	// fails every SSO call, as opposed to one unreadable token.
+	OpenFailed  bool
 	HasToken    bool
 	ExpiresAt   time.Time
 	Refreshable bool
@@ -831,6 +844,7 @@ func (a *app) ssoStoreStatus(ctx context.Context, cfg effectiveConfig) ssoStoreS
 	st.Profile, st.Session = chain.Leaf.Profile, firstNonEmpty(chain.Leaf.Name, chain.Leaf.StartURL)
 	store, backend, err := a.openSSOStore(ctx, cfg, false)
 	st.Backend = backend
+	st.OpenFailed = err != nil
 	if err == nil {
 		var rec ssoTokenRecord
 		rec, err = store.ReadToken(chain.Leaf.storeKey())
@@ -841,7 +855,9 @@ func (a *app) ssoStoreStatus(ctx context.Context, cfg effectiveConfig) ssoStoreS
 			err = nil
 		}
 	}
-	if !errors.As(err, &st.Locked) {
+	if errors.As(err, &st.Locked) {
+		st.OpenFailed = false
+	} else {
 		st.Err = err
 	}
 	if backend.Name != backendAWSCLICache {
