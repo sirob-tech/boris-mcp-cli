@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.12.0...v0.12.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* **deps:** build with Go 1.27.3 for stdlib security fixes ([#95](https://github.com/sirob-tech/boris-mcp-cli/issues/95)) ([f2dcac3](https://github.com/sirob-tech/boris-mcp-cli/commit/f2dcac3f477017af33773da7659029d96884db7e))
+
 ## [0.12.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.11.2...v0.12.0) (2026-10-03)
 
 
