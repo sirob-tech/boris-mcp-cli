@@ -2,6 +2,8 @@ module github.com/sirob-tech/boris-mcp-cli
 
 go 1.24.0
 
+toolchain go1.27.3
+
 require (
 	filippo.io/age v1.2.1
 	github.com/aws/aws-sdk-go-v2 v1.38.3
