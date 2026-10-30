@@ -505,6 +505,17 @@ the tool list agents read stays current without anyone running `sync` by hand.
 Like `sync`, it installs no new harnesses — it only rewrites files that already
 exist.
 
+A second home pointed at another BORIS deployment shares those user-scope
+files, so each of its syncs would swap in its own tool list. Set
+`user_instructions = "false"` in that home's `config.toml` to keep its syncs
+out of user scope; `sync` still refreshes project scope there. Unset, or any
+other value, keeps the default.
+
+```toml
+# $BMCP_HOME/config.toml of the second home
+user_instructions = "false"
+```
+
 Project-scope files stay `sync`'s job. A project file is claimed by filename
 alone — nothing inside a `BORIS.md` marks it as generated — and `doctor` is what
 agents run every session from whatever repository they happen to be working in.

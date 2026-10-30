@@ -2032,6 +2032,51 @@ func TestSyncRefreshesExistingInstructions(t *testing.T) {
 	}
 }
 
+// A home configured with user_instructions = "false" (say, a second home
+// pointed at another deployment) must leave the user-scope files alone.
+func TestSyncLeavesUserInstructionsAloneWhenDisabled(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	borisHome := setupInstallCatalog(t, home, []tool{{Name: "tools___old_tool", Description: "Old description."}})
+	cfg := configFile{URL: "http://localhost:8787/mcp", UserInstructions: "false"}
+	applyDefaults(&cfg)
+	if err := writeConfig(filepath.Join(borisHome, "config.toml"), cfg); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	path := filepath.Join(claudeDir, "BORIS.md")
+	if err := os.WriteFile(path, []byte("old instructions\n"), 0o644); err != nil {
+		t.Fatalf("write old instructions: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:  strings.NewReader(""),
+		stdout: &stdout,
+		stderr: &stderr,
+		now:    time.Now,
+		httpClient: &fakeMCP{tools: []tool{
+			{Name: "tools___new_tool", Description: "Newly synced infrastructure context."},
+		}},
+		credentials: staticCreds(),
+	}
+	if code := a.run([]string{"sync"}); code != 0 {
+		t.Fatalf("sync exit code %d, stderr: %s", code, stderr.String())
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read instructions: %v", err)
+	}
+	if string(got) != "old instructions\n" {
+		t.Fatalf("user-scope instructions were rewritten: %s", got)
+	}
+	if matches, _ := filepath.Glob(path + ".bak-*"); len(matches) != 0 {
+		t.Fatalf("no backup should have been written: %v", matches)
+	}
+}
+
 // A tools/list that succeeds at the transport level and returns nothing used to
 // replace a known-good catalog with an empty one stamped LastSync: now, then
 // rewrite every installed instruction file with the "no tools available"
@@ -3179,7 +3224,7 @@ func TestRefreshExistingInstructionsIgnoresAnEmptyCache(t *testing.T) {
 		t.Fatalf("write instructions: %v", err)
 	}
 	for _, cache := range []*toolCache{nil, {Version: 1, Tools: []tool{}}} {
-		if results := refreshExistingInstructions(cache, true, ""); len(results) != 0 {
+		if results := refreshExistingInstructions(cache, true, true, ""); len(results) != 0 {
 			t.Fatalf("expected no refresh for an empty cache, got %+v", results)
 		}
 	}

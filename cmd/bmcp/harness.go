@@ -776,6 +776,8 @@ func printRefreshResult(w io.Writer, result installResult) {
 
 // refreshExistingInstructions rewrites instruction files that already exist.
 //
+// includeUser is false for a home whose config sets user_instructions = "false".
+//
 // includeProject decides whether the current working directory is in scope, and
 // the two callers answer differently on purpose. `bmcp sync` is typed by a human
 // who knows which directory they are standing in, so it refreshes what it finds
@@ -791,7 +793,7 @@ func printRefreshResult(w io.Writer, result installResult) {
 // user who ran the wrong command in the wrong directory one file and leaves a
 // .bak- beside it. Under `doctor` it would be every agent session, unattended,
 // everywhere.
-func refreshExistingInstructions(cache *toolCache, includeProject bool, executable string) []installResult {
+func refreshExistingInstructions(cache *toolCache, includeUser, includeProject bool, executable string) []installResult {
 	// Belt and braces behind the syncTools guard. With no tools to render, every
 	// managed file would be rewritten with renderInstructionToolList's "no tools
 	// available" placeholder in place of the catalog, spending a backup
@@ -811,7 +813,7 @@ func refreshExistingInstructions(cache *toolCache, includeProject bool, executab
 		base func(h harness) string
 	}{
 		{"user", func(h harness) string {
-			if home == "" {
+			if home == "" || !includeUser {
 				return ""
 			}
 			return filepath.Join(home, h.userDir)
