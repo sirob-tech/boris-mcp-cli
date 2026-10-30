@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.12.1...v0.13.0) (2026-10-30)
+
+
+### Features
+
+* user_instructions option to keep a home out of user-scope instruction files ([#98](https://github.com/sirob-tech/boris-mcp-cli/issues/98)) ([746922f](https://github.com/sirob-tech/boris-mcp-cli/commit/746922f612ada54a802e5afb4e2be45ac59f8b28))
+
 ## [0.12.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.12.0...v0.12.1) (2026-10-29)
 
 
