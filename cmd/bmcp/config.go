@@ -96,6 +96,19 @@ type effectiveConfig struct {
 	SSOFlowFile      string
 }
 
+// bmcpHomeIsDefault reports whether BMCP_HOME is unset or names ~/.bmcp.
+func bmcpHomeIsDefault() bool {
+	home := os.Getenv("BMCP_HOME")
+	if home == "" {
+		return true
+	}
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	return filepath.Clean(home) == filepath.Join(userHome, ".bmcp")
+}
+
 func defaultEffective(flags globalFlags) effectiveConfig {
 	home := os.Getenv("BMCP_HOME")
 	if home == "" {

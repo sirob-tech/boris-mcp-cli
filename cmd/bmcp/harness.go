@@ -811,7 +811,9 @@ func refreshExistingInstructions(cache *toolCache, includeProject bool, executab
 		base func(h harness) string
 	}{
 		{"user", func(h harness) string {
-			if home == "" {
+			// User-scope files belong to the default home: a second BMCP_HOME pointed
+			// at another deployment must not rewrite them with its own catalog.
+			if home == "" || !bmcpHomeIsDefault() {
 				return ""
 			}
 			return filepath.Join(home, h.userDir)

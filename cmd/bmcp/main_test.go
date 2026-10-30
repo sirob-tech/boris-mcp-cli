@@ -2032,6 +2032,51 @@ func TestSyncRefreshesExistingInstructions(t *testing.T) {
 	}
 }
 
+// A second BMCP_HOME pointed at another deployment must not rewrite the
+// user-scope instructions that the default home's sessions read.
+func TestSyncLeavesUserInstructionsAloneUnderAnotherHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	defaultHome := setupInstallCatalog(t, home, []tool{{Name: "tools___old_tool", Description: "Old description."}})
+	otherHome := filepath.Join(t.TempDir(), "prod")
+	if err := os.Rename(defaultHome, otherHome); err != nil {
+		t.Fatalf("move boris home: %v", err)
+	}
+	t.Setenv("BMCP_HOME", otherHome)
+	claudeDir := filepath.Join(home, ".claude")
+	if err := os.MkdirAll(claudeDir, 0o700); err != nil {
+		t.Fatalf("mkdir claude: %v", err)
+	}
+	path := filepath.Join(claudeDir, "BORIS.md")
+	if err := os.WriteFile(path, []byte("old instructions\n"), 0o644); err != nil {
+		t.Fatalf("write old instructions: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	a := &app{
+		stdin:  strings.NewReader(""),
+		stdout: &stdout,
+		stderr: &stderr,
+		now:    time.Now,
+		httpClient: &fakeMCP{tools: []tool{
+			{Name: "tools___new_tool", Description: "Newly synced infrastructure context."},
+		}},
+		credentials: staticCreds(),
+	}
+	if code := a.run([]string{"sync"}); code != 0 {
+		t.Fatalf("sync exit code %d, stderr: %s", code, stderr.String())
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read instructions: %v", err)
+	}
+	if string(got) != "old instructions\n" {
+		t.Fatalf("user-scope instructions were rewritten: %s", got)
+	}
+	if matches, _ := filepath.Glob(path + ".bak-*"); len(matches) != 0 {
+		t.Fatalf("no backup should have been written: %v", matches)
+	}
+}
+
 // A tools/list that succeeds at the transport level and returns nothing used to
 // replace a known-good catalog with an empty one stamped LastSync: now, then
 // rewrite every installed instruction file with the "no tools available"

@@ -505,6 +505,12 @@ the tool list agents read stays current without anyone running `sync` by hand.
 Like `sync`, it installs no new harnesses — it only rewrites files that already
 exist.
 
+User-scope files belong to the default home, `~/.bmcp`. Under any other
+`BMCP_HOME` — say, a second home pointed at another BORIS deployment — neither
+`doctor` nor `sync` touches them, so that deployment's catalog never reaches
+the instructions every other session reads. `sync` still refreshes project
+scope there.
+
 Project-scope files stay `sync`'s job. A project file is claimed by filename
 alone — nothing inside a `BORIS.md` marks it as generated — and `doctor` is what
 agents run every session from whatever repository they happen to be working in.
