@@ -133,7 +133,7 @@ func (a *app) cacheForCatalog(flags globalFlags, cfg effectiveConfig, allowStale
 		// path runs unattended from whatever directory an agent is working in, and
 		// a project-scope file is claimed by filename alone. An unchanged catalog
 		// renders byte-identical and is not written at all.
-		a.refreshInstructions(newCache, false)
+		a.refreshInstructions(newCache, cfg.UserInstructions, false)
 		return newCache, nil
 	}
 	return cache, nil

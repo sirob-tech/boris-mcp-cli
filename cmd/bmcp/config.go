@@ -29,6 +29,10 @@ type configFile struct {
 	ConnectTimeout time.Duration
 	SyncTimeout    time.Duration
 	CallTimeout    time.Duration
+
+	// UserInstructions is raw for the same reason: "false" keeps this home's
+	// catalog out of the user-scope instruction files other homes rely on.
+	UserInstructions string
 }
 
 // profileSource is where effectiveConfig.Profile came from. It matters to
@@ -81,6 +85,8 @@ type effectiveConfig struct {
 	CallTimeout    time.Duration
 	NonInteractive bool
 	AutoUpdate     bool
+	// UserInstructions decides whether syncs refresh user-scope instruction files.
+	UserInstructions bool
 	// PinnedVersion is BMCP_VERSION. It names the version `bmcp update` should
 	// converge to, downgrading if needed, so a machine carrying a bad release
 	// can be healed rather than frozen on it. Auto-update never acts on it:
@@ -114,6 +120,8 @@ func defaultEffective(flags globalFlags) effectiveConfig {
 		NonInteractive: flags.nonInteractive || truthy(os.Getenv("BMCP_NON_INTERACTIVE")),
 		AutoUpdate:     true,
 		PinnedVersion:  strings.TrimSpace(os.Getenv("BMCP_VERSION")),
+
+		UserInstructions: true,
 	}
 }
 
@@ -175,6 +183,9 @@ func (a *app) loadEffective(flags globalFlags, require bool) (effectiveConfig, b
 		cfg.Service = firstNonEmpty(os.Getenv("BMCP_SERVICE"), fileCfg.Service)
 	}
 	cfg.AutoUpdate = a.resolveAutoUpdate(flags, fileCfg.AutoUpdate)
+	if v, ok := parseStrictBool(fileCfg.UserInstructions); ok {
+		cfg.UserInstructions = v
+	}
 	cfg.BackendRaw, cfg.BackendSource = chooseBackendSetting(flags.backend, os.Getenv("BMCP_BACKEND"), fileCfg.Backend)
 	cfg.SSODeviceCodeEnv = os.Getenv("BMCP_SSO_DEVICE_CODE")
 	cfg.SSOFlowFile = fileCfg.SSOFlow
@@ -255,6 +266,8 @@ func readConfig(path string) (configFile, error) {
 			cfg.Backend = val
 		case "sso_flow":
 			cfg.SSOFlow = val
+		case "user_instructions":
+			cfg.UserInstructions = val
 		case "sync_ttl":
 			if d, err := time.ParseDuration(val); err == nil {
 				cfg.SyncTTL = d
@@ -297,6 +310,7 @@ func writeConfig(path string, cfg configFile) error {
 	writeKV("auto_update", cfg.AutoUpdate)
 	writeKV("backend", cfg.Backend)
 	writeKV("sso_flow", cfg.SSOFlow)
+	writeKV("user_instructions", cfg.UserInstructions)
 	fmt.Fprintf(&b, "sync_ttl = %q\n", cfg.SyncTTL.String())
 	fmt.Fprintf(&b, "connect_timeout = %q\n", cfg.ConnectTimeout.String())
 	fmt.Fprintf(&b, "sync_timeout = %q\n", cfg.SyncTimeout.String())

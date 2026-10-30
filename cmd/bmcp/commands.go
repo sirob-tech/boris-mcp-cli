@@ -741,7 +741,7 @@ func (a *app) cmdSyncWithRefresh(flags globalFlags, refreshInstructions, report 
 	var instructions *refreshSummary
 	if refreshInstructions {
 		// True: a human typed `bmcp sync` in a directory they chose.
-		summary := a.refreshInstructions(cache, true)
+		summary := a.refreshInstructions(cache, cfg.UserInstructions, true)
 		instructions = &summary
 	}
 	if report && flags.machine() {
@@ -770,7 +770,7 @@ type refreshSummary struct {
 // Output goes through a.prose() and nothing here reaches an exit code. This runs inside
 // doctor, and BORIS.md tells agents to read a failing doctor as "BORIS is
 // broken" and stop using it — an unwritable ~/.claude is not that.
-func (a *app) refreshInstructions(cache *toolCache, includeProject bool) refreshSummary {
+func (a *app) refreshInstructions(cache *toolCache, includeUser, includeProject bool) refreshSummary {
 	var summary refreshSummary
 	// Unresolved on purpose: the stable path the user invokes survives a package
 	// manager moving the real file, which a symlink-resolved one does not.
@@ -782,7 +782,7 @@ func (a *app) refreshInstructions(cache *toolCache, includeProject bool) refresh
 	if path, err := fn(); err == nil {
 		executable = path
 	}
-	for _, result := range refreshExistingInstructions(cache, includeProject, executable) {
+	for _, result := range refreshExistingInstructions(cache, includeUser, includeProject, executable) {
 		for _, file := range result.Files {
 			switch {
 			case file.Path == "":
@@ -1296,7 +1296,7 @@ func (a *app) cmdDoctor(flags globalFlags, args []string) int {
 			// User scope only. doctor runs unattended from whatever directory an
 			// agent is working in, and a project-scope file is claimed by filename
 			// alone — see refreshExistingInstructions.
-			summary := a.refreshInstructions(disk, false)
+			summary := a.refreshInstructions(disk, cfg.UserInstructions, false)
 			instructions = &summary
 		}
 	}
