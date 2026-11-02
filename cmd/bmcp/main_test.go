@@ -27,6 +27,8 @@ type fakeMCP struct {
 	mu         sync.Mutex
 	tools      []tool
 	callResult []byte
+	// instructions is the server's own guidance, sent in its initialize result.
+	instructions string
 	// perQuery answers a tools/call by its "query" argument, so one session can
 	// serve two calls different bodies. Falls back to callResult.
 	perQuery map[string][]byte
@@ -97,7 +99,12 @@ func (m *fakeMCP) Do(req *http.Request) (*http.Response, error) {
 	}
 	switch rpc.Method {
 	case "initialize":
-		return respond(`{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","serverInfo":{"name":"test","version":"0"}}}`)
+		result := map[string]any{"protocolVersion": "2025-06-18", "serverInfo": map[string]any{"name": "test", "version": "0"}}
+		if m.instructions != "" {
+			result["instructions"] = m.instructions
+		}
+		encoded, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "result": result})
+		return respond(string(encoded))
 	case "notifications/initialized":
 		return respond("")
 	case "tools/list":
