@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.13.0...v0.14.0) (2026-11-02)
+
+
+### Features
+
+* serve forwards the gateway's MCP instructions ([#100](https://github.com/sirob-tech/boris-mcp-cli/issues/100)) ([43a357b](https://github.com/sirob-tech/boris-mcp-cli/commit/43a357b3c945e95c02ab783064b5cc43d98bbf9c))
+
 ## [0.13.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.12.1...v0.13.0) (2026-10-30)
 
 
