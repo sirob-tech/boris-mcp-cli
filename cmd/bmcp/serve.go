@@ -193,11 +193,15 @@ func (s *server) handle(req serveRequest) (any, *rpcError) {
 		if s.appsOn() {
 			capabilities["resources"] = map[string]any{}
 		}
-		return map[string]any{
+		result := map[string]any{
 			"protocolVersion": params.ProtocolVersion,
 			"capabilities":    capabilities,
 			"serverInfo":      map[string]any{"name": "bmcp", "version": version},
-		}, nil
+		}
+		if s.cache.Server.Instructions != "" {
+			result["instructions"] = s.cache.Server.Instructions
+		}
+		return result, nil
 
 	case "ping":
 		return map[string]any{}, nil

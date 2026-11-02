@@ -283,6 +283,30 @@ func TestServeOffersNoPictureWithoutMCPApps(t *testing.T) {
 	assertNoMarkup(t, "plain client", lines[2])
 }
 
+func TestServeForwardsTheServerInstructions(t *testing.T) {
+	const guidance = "Ask the description search first."
+	for _, tc := range []struct {
+		name, sent string
+	}{{"sent", guidance}, {"none", ""}} {
+		t.Run(tc.name, func(t *testing.T) {
+			doer := &callRecorder{fakeMCP: &fakeMCP{tools: finderCatalog(), instructions: tc.sent}}
+			serveConfiguredHome(t, doer)
+			lines := serveLines(t, doer, initPlainRPC)
+			var reply map[string]any
+			if err := json.Unmarshal([]byte(lines[0]), &reply); err != nil {
+				t.Fatal(err)
+			}
+			got, present := resultOf(t, reply)["instructions"]
+			if tc.sent == "" && present {
+				t.Errorf("no instructions were sent, yet serve announced %q", got)
+			}
+			if tc.sent != "" && got != tc.sent {
+				t.Errorf("instructions = %v, want the server's %q", got, tc.sent)
+			}
+		})
+	}
+}
+
 func TestServeDoesNotListTheWidgetResource(t *testing.T) {
 	doer := &callRecorder{fakeMCP: &fakeMCP{tools: finderCatalog()}}
 	replies, _ := serveFrames(t, doer, `{"jsonrpc":"2.0","id":1,"method":"resources/list"}`)
