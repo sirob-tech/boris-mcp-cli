@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.14.0...v0.14.1) (2026-11-22)
+
+
+### Bug Fixes
+
+* **deps:** build with Go 1.27.4 for GO-2026-6859 (net/http) ([#102](https://github.com/sirob-tech/boris-mcp-cli/issues/102)) ([d03a048](https://github.com/sirob-tech/boris-mcp-cli/commit/d03a0481961c532730b6ca12874d153743ae6d3c))
+
 ## [0.14.0](https://github.com/sirob-tech/boris-mcp-cli/compare/v0.13.0...v0.14.0) (2026-11-02)
 
 
