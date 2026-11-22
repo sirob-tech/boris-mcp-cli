@@ -2,7 +2,7 @@ module github.com/sirob-tech/boris-mcp-cli
 
 go 1.24.0
 
-toolchain go1.27.3
+toolchain go1.27.4
 
 require (
 	filippo.io/age v1.2.1
